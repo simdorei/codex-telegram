@@ -16,14 +16,21 @@ It works by combining:
 
 No third-party Python packages are required.
 
-## Files
+## Repository Layout
 
-- `codex_desktop_bridge.py`
-- `codex_telegram_bot.py`
-- `codex-bridge.cmd`
-- `codex-telegram-bot.cmd`
+- `codex_desktop_bridge.py`: local thread discovery, window activation, ask/watch flow
+- `codex_telegram_bot.py`: Telegram adapter that runs the bridge in-process
+- `codex-bridge.cmd`: main launcher
+- `codex-telegram-bot.cmd`: Telegram-only launcher
+- `.env.example`: local environment template
 
-## Start
+## Quick Start
+
+1. Clone the repository.
+2. Copy `.env.example` to `.env`.
+3. Fill in `TELEGRAM_BOT_TOKEN` if you want Telegram control.
+4. Start the Codex Desktop app and sign in.
+5. Run:
 
 ```powershell
 .\codex-bridge.cmd
@@ -36,11 +43,9 @@ Optional launcher flags:
 - `.\codex-bridge.cmd --no-bot`
 - `.\codex-bridge.cmd --bot-only`
 
-## .env
+## Environment Variables
 
-Create a local `.env` file next to the scripts.
-
-Example:
+Example `.env`:
 
 ```env
 TELEGRAM_BOT_TOKEN=
@@ -50,14 +55,26 @@ PYTHON_EXE=
 CODEX_BRIDGE_AUTO_START_TELEGRAM=1
 ```
 
-`TELEGRAM_ALLOWED_CHAT_IDS` is optional but recommended.
+Important variables:
 
-To find your chat ID:
+- `TELEGRAM_BOT_TOKEN`: required for Telegram mode
+- `TELEGRAM_ALLOWED_CHAT_IDS`: optional allowlist of Telegram chat IDs
+- `CODEX_HOME`: override default Codex state directory if needed
+- `PYTHON_EXE`: force a specific Python interpreter
+- `CODEX_BRIDGE_AUTO_START_TELEGRAM`: set `0` to disable bot auto-start
 
-1. Send any message to your bot
-2. Open:
-   `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
-3. Read `message.chat.id`
+Advanced overrides used by the bridge:
+
+- `CODEX_STATE_DB`
+- `CODEX_GLOBAL_STATE`
+- `CODEX_SESSION_INDEX`
+- `CODEX_BRIDGE_STATE`
+
+To find your Telegram chat ID:
+
+1. Send any message to your bot.
+2. Open `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`.
+3. Read `message.chat.id`.
 
 ## Main REPL Commands
 
@@ -102,6 +119,22 @@ list
 open ai:2
 ask "Test"
 ```
+
+## Public Repo Notes
+
+- `.env` is ignored by Git.
+- `*.log` is ignored by Git.
+- `requirements.txt` is intentionally empty of packages because the project uses only the Python standard library.
+
+## Troubleshooting
+
+If an old folder such as `codex-desktop-bridge` still appears in the Codex app after you removed it from the workspace list, the usual causes are:
+
+- the physical folder still exists on disk
+- old threads still have that folder saved as their `cwd`
+- Codex keeps recent workspace roots and recent thread history separately
+
+Removing a workspace root in the app does not necessarily delete old thread metadata.
 
 ## Known Limits
 
