@@ -40,10 +40,11 @@ SINGLE_INSTANCE_MUTEX = None
 ERROR_ALREADY_EXISTS = 183
 
 
-def acquire_single_instance_mutex() -> bool:
+def acquire_single_instance_mutex(token: str | None = None) -> bool:
     global SINGLE_INSTANCE_MUTEX
 
-    mutex_key = hashlib.sha1(str(SCRIPT_DIR).encode("utf-8")).hexdigest()
+    mutex_source = (token or "").strip() or str(SCRIPT_DIR)
+    mutex_key = hashlib.sha1(mutex_source.encode("utf-8")).hexdigest()
     mutex_name = f"Local\\CodexTelegramBot_{mutex_key}"
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW.argtypes = [wt.LPVOID, wt.BOOL, wt.LPCWSTR]
@@ -502,6 +503,7 @@ def run_ask_job(token: str, chat_id: int, prompt: str, reply_to_message_id: int 
             [
                 "ask",
                 "--no-switch-thread",
+                "--click",
                 "--foreground",
                 "--stream",
                 "--include-commentary",
@@ -791,7 +793,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     load_local_env(ENV_PATH)
-    if not acquire_single_instance_mutex():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not acquire_single_instance_mutex(token=token):
         log_line("main existing_instance")
         print("Telegram bot is already running.")
         return 0

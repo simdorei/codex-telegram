@@ -274,6 +274,25 @@ def get_active_workspace_roots() -> list[str]:
     return [str(Path(root)) for root in roots]
 
 
+def strip_windows_extended_prefix(path: str) -> str:
+    value = str(path or "").strip()
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
+def normalize_workspace_path(path: str) -> str:
+    value = strip_windows_extended_prefix(path)
+    if not value:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(value))
+    except Exception:
+        return value.lower()
+
+
 def load_session_thread_names() -> dict[str, str]:
     mapping: dict[str, str] = {}
     if not SESSION_INDEX_PATH.exists():
@@ -295,8 +314,70 @@ def load_session_thread_names() -> dict[str, str]:
     return mapping
 
 
-def get_thread_ui_name(thread_id: str) -> str | None:
-    return load_session_thread_names().get(thread_id)
+def normalize_ui_match_text(text: str) -> str:
+    raw = str(text or "").replace("\r", "\n")
+    for line in raw.split("\n"):
+        normalized = " ".join(line.split()).strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+def build_ui_name_prefixes(text: str) -> list[str]:
+    text = normalize_ui_match_text(text)
+    if not text:
+        return []
+
+    candidates = [text]
+    for limit in (120, 96, 72, 56, 40):
+        if len(text) > limit:
+            candidate = text[:limit].rstrip(" .,;:!?-")
+            if candidate:
+                candidates.append(candidate)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        lowered = candidate.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(candidate)
+    return deduped
+
+
+def get_thread_ui_name_candidates(thread: ThreadInfo) -> list[str]:
+    candidates: list[str] = []
+
+    session_name = normalize_ui_match_text(load_session_thread_names().get(thread.id, ""))
+    if session_name:
+        candidates.append(session_name)
+
+    title_name = normalize_ui_match_text(thread.title)
+    if title_name:
+        candidates.extend(build_ui_name_prefixes(title_name))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        lowered = candidate.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(candidate)
+    return deduped
+
+
+def get_thread_ui_name(thread_id: str, thread: ThreadInfo | None = None) -> str | None:
+    if thread is None:
+        try:
+            thread = get_thread_by_id(thread_id)
+        except RuntimeError:
+            session_name = normalize_ui_match_text(load_session_thread_names().get(thread_id, ""))
+            return session_name or None
+
+    candidates = get_thread_ui_name_candidates(thread)
+    return candidates[0] if candidates else None
 
 
 def load_recent_threads(limit: int = 20) -> list[ThreadInfo]:
@@ -311,10 +392,13 @@ def load_recent_threads(limit: int = 20) -> list[ThreadInfo]:
         FROM threads
         WHERE archived = 0
         ORDER BY updated_at DESC
-        LIMIT ?
     """
+    params: tuple[object, ...] = ()
+    if limit > 0:
+        query += "\n        LIMIT ?"
+        params = (limit,)
     with connect_readonly(STATE_DB_PATH) as conn:
-        rows = conn.execute(query, (limit,)).fetchall()
+        rows = conn.execute(query, params).fetchall()
 
     threads = []
     for row in rows:
@@ -342,7 +426,7 @@ def get_thread_by_id(thread_id: str, threads: list[ThreadInfo] | None = None) ->
 
 
 def get_thread_workspace_name(thread: ThreadInfo) -> str:
-    cwd = (thread.cwd or "").strip()
+    cwd = strip_windows_extended_prefix((thread.cwd or "").strip())
     if not cwd:
         return "-"
     try:
@@ -403,7 +487,7 @@ def resolve_thread_ref(thread_ref: str, limit: int = 50) -> ThreadInfo:
             return thread
 
     for thread in threads:
-        if str(Path(thread.cwd or "")).lower() == normalized:
+        if normalize_workspace_path(thread.cwd) == normalize_workspace_path(thread_ref):
             return thread
 
     workspace_matches = [thread for thread in threads if get_thread_workspace_name(thread).lower() == normalized]
@@ -416,7 +500,7 @@ def resolve_thread_ref(thread_ref: str, limit: int = 50) -> ThreadInfo:
         if get_thread_workspace_name(thread).lower() == normalized:
             return thread
 
-    return get_thread_by_id(thread_ref, threads=threads)
+    return get_thread_by_id(thread_ref, threads=load_recent_threads(limit=0))
 
 
 def get_thread_slot(thread: ThreadInfo, limit: int = 9) -> int | None:
@@ -439,9 +523,9 @@ def choose_thread(thread_id: str | None, cwd: str | None) -> ThreadInfo:
         raise RuntimeError(f"Thread not found: {thread_id}")
 
     if cwd:
-        target = str(Path(cwd))
+        target = normalize_workspace_path(cwd)
         for thread in threads:
-            if str(Path(thread.cwd)) == target:
+            if normalize_workspace_path(thread.cwd) == target:
                 return thread
 
     selected_thread_id = get_selected_thread_id()
@@ -452,9 +536,9 @@ def choose_thread(thread_id: str | None, cwd: str | None) -> ThreadInfo:
 
     active_roots = get_active_workspace_roots()
     if active_roots:
-        active_set = {str(Path(root)) for root in active_roots}
+        active_set = {normalize_workspace_path(root) for root in active_roots}
         for thread in threads:
-            if str(Path(thread.cwd)) in active_set:
+            if normalize_workspace_path(thread.cwd) in active_set:
                 return thread
 
     return threads[0]
@@ -648,6 +732,8 @@ def watch_for_final_answer(
                 continue
 
             if event.get("type") == "event_msg" and payload.get("type") == "agent_message":
+                if str(payload.get("phase", "") or "") == "final_answer":
+                    continue
                 message = str(payload.get("message", "")).strip()
                 if include_commentary and message:
                     if message not in seen_agent_messages:
@@ -1729,30 +1815,45 @@ exit 5
 
 
 def activate_thread_in_ui(thread: ThreadInfo) -> str:
-    thread_name = get_thread_ui_name(thread.id) or ""
-    header_verified = verify_active_thread_by_header(thread_name)
-    if header_verified:
-        return f"already-open [{header_verified}]"
+    ui_name_candidates = get_thread_ui_name_candidates(thread)
+    for thread_name in ui_name_candidates:
+        header_verified = verify_active_thread_by_header(thread_name)
+        if header_verified:
+            return f"already-open [{header_verified}]"
 
     verified_by = verify_active_thread(thread.id)
-    if verified_by and not thread_name:
+    if verified_by:
         return f"already-open [{verified_by}]"
 
-    if thread_name:
-        matched_label = activate_thread_by_sidebar_v2(thread_name, Path(thread.cwd).name if thread.cwd else None)
+    last_error = ""
+    for thread_name in ui_name_candidates:
+        try:
+            matched_label = activate_thread_by_sidebar_v2(
+                thread_name,
+                Path(thread.cwd).name if thread.cwd else None,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
         time.sleep(0.35)
         header_verified = verify_active_thread_by_header(thread_name)
         if header_verified:
             return f"sidebar:{matched_label} [{header_verified}]"
+
         verified_by = verify_active_thread(thread.id)
-        if verified_by and not thread_name:
+        if verified_by:
             return f"sidebar:{matched_label} [{verified_by}]"
-        raise RuntimeError(
+
+        last_error = (
             "Clicked the sidebar thread item, but the main Codex conversation header did not switch."
         )
 
+    if ui_name_candidates:
+        raise RuntimeError(last_error or "Unable to activate the target thread in the Codex UI sidebar.")
+
     raise RuntimeError(
-        "Unable to activate the target thread in the Codex UI sidebar."
+        "Unable to activate the target thread in the Codex UI sidebar because no usable UI label was found."
     )
 
 
@@ -1874,7 +1975,7 @@ def print_thread_list(threads: list[ThreadInfo]) -> None:
     workspace_refs = build_workspace_ref_map(threads)
     for index, thread in enumerate(threads, start=1):
         marker = "*" if thread.id == selected_thread_id else " "
-        ui_name = get_thread_ui_name(thread.id)
+        ui_name = get_thread_ui_name(thread.id, thread)
         summary = ui_name or thread.title[:70]
         workspace = workspace_refs.get(thread.id, get_thread_workspace_name(thread))
         busy = is_thread_busy(Path(thread.rollout_path))
@@ -1896,7 +1997,7 @@ def command_status(args: argparse.Namespace) -> int:
     last_user, last_assistant = get_last_user_and_assistant_messages(session_path)
     busy = is_thread_busy(session_path)
     slot = get_thread_slot(thread)
-    ui_name = get_thread_ui_name(thread.id)
+    ui_name = get_thread_ui_name(thread.id, thread)
     print(f"thread_id: {thread.id}")
     print(f"thread_ref: {get_thread_workspace_ref(thread)}")
     print(f"title: {thread.title}")
@@ -2001,7 +2102,7 @@ def command_use(args: argparse.Namespace) -> int:
     set_selected_thread_id(thread.id)
     print(f"selected_thread: {thread.id}")
     print(f"title: {thread.title}")
-    print(f"ui_name: {get_thread_ui_name(thread.id) or '-'}")
+    print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
     print(f"cwd: {thread.cwd}")
     return 0
 
@@ -2024,6 +2125,8 @@ def command_tail(args: argparse.Namespace) -> int:
                 continue
 
             if event.get("type") == "event_msg" and payload.get("type") == "agent_message":
+                if str(payload.get("phase", "") or "") == "final_answer":
+                    continue
                 print(f"[commentary] {payload.get('message', '').strip()}")
                 continue
 
@@ -2070,7 +2173,7 @@ def command_open(args: argparse.Namespace) -> int:
     print(f"selected_thread: {thread.id}")
     print(f"target_thread: {thread.id}")
     print(f"title: {thread.title}")
-    print(f"ui_name: {get_thread_ui_name(thread.id) or '-'}")
+    print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
     print(f"cwd: {thread.cwd}")
     if cancelled_labels:
         print(f"reply_abort_requested: {', '.join(cancelled_labels)}")
@@ -2099,7 +2202,7 @@ def command_ask(args: argparse.Namespace) -> int:
     prompt = args.prompt
     print(f"target_thread: {thread.id}")
     print(f"title: {thread.title}")
-    print(f"ui_name: {get_thread_ui_name(thread.id) or '-'}")
+    print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
     print(f"cwd: {thread.cwd}")
     print("")
 
@@ -2132,7 +2235,7 @@ def command_ask(args: argparse.Namespace) -> int:
             activation_method = "best-effort-switch (unverified)"
             activation_warning = str(exc)
     else:
-        verified_by = verify_active_thread_by_header(get_thread_ui_name(thread.id) or "")
+        verified_by = verify_active_thread_by_header(get_thread_ui_name(thread.id, thread) or "")
         if not verified_by:
             activation_method = "best-effort-current-ui (unverified)"
             activation_warning = (
