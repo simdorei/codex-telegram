@@ -675,9 +675,19 @@ def normalize_prompt_text(text: str) -> str:
     return " ".join(str(text).replace("\r", " ").replace("\n", " ").split()).strip()
 
 
-def snapshot_recent_session_offsets(limit: int = 10) -> dict[str, tuple[ThreadInfo, Path, int]]:
+def snapshot_recent_session_offsets(
+    limit: int = 10,
+    include_threads: list[ThreadInfo] | None = None,
+) -> dict[str, tuple[ThreadInfo, Path, int]]:
     snapshot: dict[str, tuple[ThreadInfo, Path, int]] = {}
-    for thread in load_recent_threads(limit=limit):
+    threads = load_recent_threads(limit=limit)
+    if include_threads:
+        seen_ids = {thread.id for thread in threads}
+        for thread in include_threads:
+            if thread.id not in seen_ids:
+                threads.append(thread)
+                seen_ids.add(thread.id)
+    for thread in threads:
         session_path = Path(thread.rollout_path)
         if not session_path.exists():
             continue
@@ -723,6 +733,7 @@ def watch_for_final_answer(
     commentary: list[str] = []
     final_answer = ""
     seen_agent_messages: set[str] = set()
+    did_stream_live = False
 
     while deadline is None or time.time() < deadline:
         events, cursor = read_new_session_events(session_path, cursor)
@@ -740,6 +751,7 @@ def watch_for_final_answer(
                         seen_agent_messages.add(message)
                         commentary.append(message)
                         if stream_live:
+                            did_stream_live = True
                             with PRINT_LOCK:
                                 prefix = f"{stream_label} " if stream_label else ""
                                 print(f"{prefix}[commentary]")
@@ -752,7 +764,7 @@ def watch_for_final_answer(
                     "status": "aborted",
                     "commentary": commentary,
                     "final_answer": final_answer,
-                    "streamed_live": stream_live,
+                    "streamed_live": did_stream_live,
                 }
 
             if event.get("type") != "response_item":
@@ -772,6 +784,7 @@ def watch_for_final_answer(
             if phase == "final_answer":
                 final_answer = text
                 if stream_live:
+                    did_stream_live = True
                     with PRINT_LOCK:
                         prefix = f"{stream_label} " if stream_label else ""
                         print(f"{prefix}[final_answer]")
@@ -781,13 +794,14 @@ def watch_for_final_answer(
                     "status": "final",
                     "commentary": commentary,
                     "final_answer": final_answer,
-                    "streamed_live": stream_live,
+                    "streamed_live": did_stream_live,
                 }
 
             if include_commentary and phase == "commentary":
                 if not commentary or commentary[-1] != text:
                     commentary.append(text)
                     if stream_live:
+                        did_stream_live = True
                         with PRINT_LOCK:
                             prefix = f"{stream_label} " if stream_label else ""
                             print(f"{prefix}[commentary]")
@@ -800,7 +814,7 @@ def watch_for_final_answer(
         "status": "timeout",
         "commentary": commentary,
         "final_answer": final_answer,
-        "streamed_live": False,
+        "streamed_live": did_stream_live,
     }
 
 
@@ -999,42 +1013,6 @@ def ensure_codex_composer_focus(attempts: int = 4) -> bool:
             return True
 
     return False
-
-
-def activate_thread_by_shortcut(slot: int) -> bool:
-    if not (1 <= slot <= 9):
-        return False
-    focus_window(find_codex_window())
-    send_hotkey(VK_CONTROL, 0x30 + slot)
-    time.sleep(0.8)
-    return True
-
-
-def build_thread_search_query(thread: ThreadInfo, max_len: int = 80) -> str:
-    raw = thread.title or ""
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    base = lines[0] if lines else raw.strip()
-    query = " ".join(base.split())
-    return query[:max_len].strip()
-
-
-def activate_thread_by_command_menu(query: str) -> bool:
-    if not query.strip():
-        return False
-    focus_window(find_codex_window())
-    send_hotkey(VK_CONTROL, VK_SHIFT, 0x50)
-    time.sleep(0.45)
-    send_hotkey(VK_CONTROL, 0x41)
-    send_key_event(VK_BACK, keyup=False)
-    send_key_event(VK_BACK, keyup=True)
-    time.sleep(0.08)
-    set_clipboard_text(query[:220])
-    send_hotkey(VK_CONTROL, VK_V)
-    time.sleep(0.6)
-    send_key_event(VK_RETURN, keyup=False)
-    send_key_event(VK_RETURN, keyup=True)
-    time.sleep(0.9)
-    return True
 
 
 def activate_thread_by_sidebar(thread_name: str, project_name: str | None = None) -> str:
@@ -2116,6 +2094,7 @@ def command_tail(args: argparse.Namespace) -> int:
     start_offset = session_path.stat().st_size if args.only_new else 0
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     cursor = start_offset
+    seen_agent_messages: set[str] = set()
 
     while True:
         events, cursor = read_new_session_events(session_path, cursor)
@@ -2127,7 +2106,11 @@ def command_tail(args: argparse.Namespace) -> int:
             if event.get("type") == "event_msg" and payload.get("type") == "agent_message":
                 if str(payload.get("phase", "") or "") == "final_answer":
                     continue
-                print(f"[commentary] {payload.get('message', '').strip()}")
+                message = str(payload.get("message", "")).strip()
+                if not message:
+                    continue
+                seen_agent_messages.add(message)
+                print(f"[commentary] {message}")
                 continue
 
             if event.get("type") == "response_item" and payload.get("type") == "message":
@@ -2135,6 +2118,8 @@ def command_tail(args: argparse.Namespace) -> int:
                 role = payload.get("role", "?")
                 phase = payload.get("phase", "")
                 if text:
+                    if role == "assistant" and phase == "commentary" and text in seen_agent_messages:
+                        continue
                     print(f"[{role}:{phase}]")
                     print(text)
                     print("")
@@ -2226,7 +2211,7 @@ def command_ask(args: argparse.Namespace) -> int:
         )
 
     start_offset = session_path.stat().st_size
-    recent_offsets = snapshot_recent_session_offsets(limit=10)
+    recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
     activation_warning = ""
     if args.switch_thread:
         try:

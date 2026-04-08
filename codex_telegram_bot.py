@@ -235,6 +235,11 @@ class TelegramAskRelay:
             return
         if line.startswith("[waiting_for_final_answer]") or line.startswith("Use Ctrl+C"):
             return
+
+        if self.mode in {"commentary", "final", "timeout"}:
+            self.block_lines.append(line)
+            return
+
         if line.startswith("target_thread:") or line.startswith("title:") or line.startswith("ui_name:") or line.startswith("cwd:"):
             return
         if line.startswith("ui_activation:") or line.startswith("sent_to_window:") or line.startswith("[delivery_verified]"):
@@ -243,9 +248,6 @@ class TelegramAskRelay:
             return
         if line.startswith("[wait_cancelled]"):
             return
-
-        if self.mode in {"commentary", "final", "timeout"}:
-            self.block_lines.append(line)
 
     def finish(self) -> None:
         self._send_block()
@@ -516,7 +518,7 @@ def run_ask_job(token: str, chat_id: int, prompt: str, reply_to_message_id: int 
         log_line(f"ask_job_finish chat_id={chat_id} exit_code={exit_code}")
         relay.finish()
         if relay.sent_live:
-            if exit_code == 0:
+            if exit_code == 0 and not relay.saw_aborted:
                 send_text(token, chat_id, "완료.", reply_to_message_id=reply_to_message_id)
             elif not relay.saw_aborted and not relay.saw_timeout:
                 send_text(
