@@ -584,6 +584,22 @@ def handle_open_command(token: str, chat_id: int, ref: str, abort: bool, reply_t
     )
 
 
+def handle_new_command(token: str, chat_id: int, ref: str | None, abort: bool, reply_to_message_id: int | None) -> None:
+    argv = ["new"]
+    if abort:
+        argv.append("--abort")
+    if ref:
+        argv.append(ref)
+    exit_code, output = run_bridge_command(argv)
+    prefix = "New ok" if exit_code == 0 else f"New failed (exit {exit_code})"
+    send_text(
+        token,
+        chat_id,
+        f"{prefix}\n\n{output or '(no output)'}",
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
 def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> None:
     chat = message.get("chat") or {}
     chat_id = int(chat.get("id"))
@@ -629,6 +645,8 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 [
                     "Commands:",
                     "/list [limit]",
+                    "/new [ref]",
+                    "/new_abort [ref]",
                     "/open <ref>",
                     "/open_abort <ref>",
                     "/status [ref]",
@@ -706,6 +724,14 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             send_text(token, chat_id, "Usage: /open_abort <ref>", reply_to_message_id=reply_to_message_id)
             return
         handle_open_command(token, chat_id, arg, abort=True, reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/new":
+        handle_new_command(token, chat_id, arg or None, abort=False, reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/new_abort":
+        handle_new_command(token, chat_id, arg or None, abort=True, reply_to_message_id=reply_to_message_id)
         return
 
     if command == "/ask":

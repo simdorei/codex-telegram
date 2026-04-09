@@ -503,6 +503,19 @@ def resolve_thread_ref(thread_ref: str, limit: int = 50) -> ThreadInfo:
     return get_thread_by_id(thread_ref, threads=load_recent_threads(limit=0))
 
 
+def resolve_new_thread_source(thread_ref: str | None, thread_id: str | None, cwd: str | None) -> ThreadInfo:
+    if not thread_ref:
+        return choose_thread(thread_id, cwd)
+
+    threads = load_recent_threads(limit=50)
+    normalized = thread_ref.strip().lower()
+    for thread in threads:
+        if get_thread_workspace_name(thread).lower() == normalized:
+            return thread
+
+    return resolve_thread_ref(thread_ref, limit=50)
+
+
 def get_thread_slot(thread: ThreadInfo, limit: int = 9) -> int | None:
     threads = load_recent_threads(limit=max(limit, 9))
     for index, item in enumerate(threads, start=1):
@@ -1948,6 +1961,229 @@ def send_prompt_to_codex(
     return window
 
 
+def build_workspace_new_thread_button_name(workspace_name: str) -> str:
+    normalized = " ".join(str(workspace_name or "").split()).strip()
+    if not normalized:
+        raise RuntimeError("Missing workspace name for new-thread button lookup.")
+    return f"{normalized}에서 새 스레드 시작"
+
+
+def start_new_thread_in_workspace(workspace_name: str) -> str:
+    target_button = build_workspace_new_thread_button_name(workspace_name)
+    script = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$targetButton = $env:CODEX_NEW_THREAD_BUTTON
+$targetButton = if ($targetButton) { $targetButton.Trim() } else { '' }
+if (-not $targetButton) { Write-Output 'NO_TARGET_BUTTON'; exit 2 }
+
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+public static class Native {
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
+}
+'@
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type $code
+
+function Normalize-Name {
+  param([string]$Name)
+  return (($Name -replace "`r|`n", ' ') -replace '\s+', ' ').Trim()
+}
+
+function Get-CodexWindowHandle {
+  $script:result = [IntPtr]::Zero
+  $cb = [Native+EnumWindowsProc]{
+    param($hWnd, $lParam)
+    if (-not [Native]::IsWindowVisible($hWnd)) { return $true }
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][Native]::GetWindowText($hWnd, $sb, $sb.Capacity)
+    if ($sb.ToString() -like '*Codex*') { $script:result = $hWnd; return $false }
+    return $true
+  }
+  [void][Native]::EnumWindows($cb, [IntPtr]::Zero)
+  return $script:result
+}
+
+function Find-CodexAutomationWindow {
+  param([IntPtr]$Handle)
+  $cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty,
+    [int]$Handle
+  )
+  return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    $cond
+  )
+}
+
+function Get-AllElements {
+  param($Root)
+  return $Root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition
+  )
+}
+
+function Invoke-Or-Click {
+  param($Element)
+  $pattern = $null
+  if ($Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+    try { $pattern.Invoke(); return $true } catch {}
+  }
+  try {
+    $point = $Element.GetClickablePoint()
+    [void][Native]::SetCursorPos([int]$point.X, [int]$point.Y)
+    Start-Sleep -Milliseconds 80
+    [Native]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    [Native]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    return $true
+  } catch {}
+  try {
+    $rect = $Element.Current.BoundingRectangle
+    if ($rect.Width -gt 1 -and $rect.Height -gt 1) {
+      $x = [int]($rect.Left + ($rect.Width / 2))
+      $y = [int]($rect.Top + ($rect.Height / 2))
+      [void][Native]::SetCursorPos($x, $y)
+      Start-Sleep -Milliseconds 80
+      [Native]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+      [Native]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+      return $true
+    }
+  } catch {}
+  return $false
+}
+
+function Get-SidebarRightBoundary {
+  param($WindowRect)
+  return [double]($WindowRect.Left + [Math]::Max(420, [Math]::Floor($WindowRect.Width * 0.28)))
+}
+
+function Find-VisibleSidebarButtonByExactName {
+  param($Elements, $WindowRect, [string]$Needle)
+  $sidebarRight = Get-SidebarRightBoundary $WindowRect
+  foreach ($el in $Elements) {
+    $type = $el.Current.ControlType.ProgrammaticName
+    if ($type -ne 'ControlType.Button') { continue }
+    $name = Normalize-Name $el.Current.Name
+    if ($name -ne $Needle) { continue }
+    $rect = $el.Current.BoundingRectangle
+    if ($rect.Width -le 1 -or $rect.Height -le 1) { continue }
+    if ($rect.Left -lt ($WindowRect.Left + 8)) { continue }
+    if ($rect.Right -gt $sidebarRight) { continue }
+    if ($rect.Top -lt ($WindowRect.Top + 20)) { continue }
+    if ($rect.Bottom -gt ($WindowRect.Bottom - 20)) { continue }
+    return $el
+  }
+  return $null
+}
+
+function Get-VisibleSidebarButtonNames {
+  param($Elements, $WindowRect)
+  $sidebarRight = Get-SidebarRightBoundary $WindowRect
+  $names = New-Object System.Collections.Generic.List[string]
+  foreach ($el in $Elements) {
+    $type = $el.Current.ControlType.ProgrammaticName
+    if ($type -ne 'ControlType.Button') { continue }
+    $name = Normalize-Name $el.Current.Name
+    if (-not $name) { continue }
+    $rect = $el.Current.BoundingRectangle
+    if ($rect.Width -le 1 -or $rect.Height -le 1) { continue }
+    if ($rect.Left -lt ($WindowRect.Left + 8)) { continue }
+    if ($rect.Right -gt $sidebarRight) { continue }
+    if ($rect.Top -lt ($WindowRect.Top + 20)) { continue }
+    if ($rect.Bottom -gt ($WindowRect.Bottom - 20)) { continue }
+    if ($name -like '*새 스레드*' -or $name -like '*사이드바*') {
+      if (-not $names.Contains($name)) { [void]$names.Add($name) }
+    }
+  }
+  return ($names -join ' | ')
+}
+
+$handle = Get-CodexWindowHandle
+if ($handle -eq [IntPtr]::Zero) { Write-Output 'NO_CODEX_WINDOW'; exit 3 }
+[void][Native]::SetForegroundWindow($handle)
+Start-Sleep -Milliseconds 180
+$win = Find-CodexAutomationWindow $handle
+if (-not $win) { Write-Output 'NO_AUTOMATION_WINDOW'; exit 4 }
+$windowRect = $win.Current.BoundingRectangle
+$all = Get-AllElements $win
+
+$hideSidebar = Find-VisibleSidebarButtonByExactName $all $windowRect '사이드바 숨기기'
+if (-not $hideSidebar) {
+  $showSidebar = Find-VisibleSidebarButtonByExactName $all $windowRect '사이드바 표시'
+  if ($showSidebar) {
+    if (-not (Invoke-Or-Click $showSidebar)) { Write-Output 'SIDEBAR_TOGGLE_FAILED'; exit 5 }
+    Start-Sleep -Milliseconds 250
+    $all = Get-AllElements $win
+  }
+}
+
+$target = Find-VisibleSidebarButtonByExactName $all $windowRect $targetButton
+if (-not $target) {
+  $visible = Get-VisibleSidebarButtonNames $all $windowRect
+  if (-not $visible) { $visible = 'NONE' }
+  Write-Output "NOT_FOUND:$targetButton || VISIBLE:$visible"
+  exit 6
+}
+
+if (-not (Invoke-Or-Click $target)) {
+  Write-Output "ACTIVATE_FAILED:$targetButton"
+  exit 7
+}
+
+Start-Sleep -Milliseconds 700
+Write-Output ("OK:" + (Normalize-Name $target.Current.Name))
+"""
+    env = os.environ.copy()
+    env["CODEX_NEW_THREAD_BUTTON"] = target_button
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+            env=env,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"New-thread button subprocess failed: {exc}") from exc
+
+    output = (result.stdout or "").strip()
+    error = (result.stderr or "").strip()
+    if result.returncode != 0 or not output.startswith("OK:"):
+        detail = output or error or f"exit={result.returncode}"
+        raise RuntimeError(f"Workspace new-thread activation failed: {detail}")
+    return output[3:].strip()
+
+
+def wait_for_new_thread_in_workspace(
+    existing_thread_ids: set[str],
+    workspace_cwd: str,
+    timeout_sec: float = 6.0,
+) -> ThreadInfo | None:
+    target_cwd = normalize_workspace_path(workspace_cwd)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for thread in load_recent_threads(limit=0):
+            if thread.id in existing_thread_ids:
+                continue
+            if normalize_workspace_path(thread.cwd) != target_cwd:
+                continue
+            return thread
+        time.sleep(0.2)
+    return None
+
+
 def print_thread_list(threads: list[ThreadInfo]) -> None:
     selected_thread_id = get_selected_thread_id()
     workspace_refs = build_workspace_ref_map(threads)
@@ -2127,6 +2363,58 @@ def command_tail(args: argparse.Namespace) -> int:
         if deadline is not None and time.time() >= deadline:
             return 0
         time.sleep(0.35)
+
+
+def command_new(args: argparse.Namespace) -> int:
+    source_thread = resolve_new_thread_source(getattr(args, "thread_ref", None), args.thread_id, args.cwd)
+    workspace_name = get_thread_workspace_name(source_thread)
+    if workspace_name == "-" or not normalize_workspace_path(source_thread.cwd):
+        raise RuntimeError("Unable to determine the workspace for the requested new thread.")
+
+    cancelled_labels: list[str] = []
+    cancel_remaining: list[str] = []
+    busy_now = get_busy_threads(limit=50)
+    if busy_now:
+        labels = ", ".join(get_thread_label(item) for item in busy_now[:3])
+        if not args.abort:
+            raise RuntimeError(
+                "A Codex reply is still in progress. Creating a new thread can stop the current reply. "
+                f"Busy thread(s): {labels}. Wait for `[ready]` or rerun with `new --abort ...`."
+            )
+        cancelled_labels, cancel_remaining = cancel_codex_reply_if_busy(timeout_sec=3.0)
+
+    before_threads = load_recent_threads(limit=0)
+    before_ids = {thread.id for thread in before_threads}
+    source_activation = activate_thread_in_ui(source_thread)
+    clicked_button = start_new_thread_in_workspace(workspace_name)
+    new_thread = wait_for_new_thread_in_workspace(before_ids, source_thread.cwd, timeout_sec=6.0)
+    if new_thread is None:
+        raise RuntimeError(
+            "The workspace new-thread button was clicked, but no new thread was recorded in the local Codex state."
+        )
+
+    set_selected_thread_id(new_thread.id)
+    verified_by = verify_active_thread(new_thread.id)
+    ui_activation = (
+        f"workspace-new:{clicked_button} [{verified_by}]"
+        if verified_by
+        else f"workspace-new:{clicked_button} [unverified]"
+    )
+
+    print(f"selected_thread: {new_thread.id}")
+    print(f"target_thread: {new_thread.id}")
+    print(f"source_thread: {source_thread.id}")
+    print(f"source_workspace: {workspace_name}")
+    print(f"source_activation: {source_activation}")
+    print(f"title: {new_thread.title or '-'}")
+    print(f"ui_name: {get_thread_ui_name(new_thread.id, new_thread) or '-'}")
+    print(f"cwd: {new_thread.cwd}")
+    if cancelled_labels:
+        print(f"reply_abort_requested: {', '.join(cancelled_labels)}")
+        if cancel_remaining:
+            print(f"reply_abort_pending: {', '.join(cancel_remaining)}")
+    print(f"ui_activation: {ui_activation}")
+    return 0
 
 
 def command_open(args: argparse.Namespace) -> int:
@@ -2368,6 +2656,23 @@ def build_parser() -> argparse.ArgumentParser:
     tail_parser.add_argument("--only-new", action="store_true")
     tail_parser.set_defaults(func=command_tail)
 
+    new_parser = subparsers.add_parser(
+        "new",
+        help="Create a new thread inside an existing workspace.",
+        parents=[common_parser],
+    )
+    new_parser.add_argument(
+        "thread_ref",
+        nargs="?",
+        help="Optional workspace or thread reference. Bare workspace names use the newest thread in that workspace.",
+    )
+    new_parser.add_argument(
+        "--abort",
+        action="store_true",
+        help="Abort the currently running Codex reply before creating a new thread.",
+    )
+    new_parser.set_defaults(func=command_new)
+
     open_parser = subparsers.add_parser(
         "open",
         help="Select and open a thread in Codex Desktop without sending a prompt.",
@@ -2457,11 +2762,12 @@ def split_repl_command(line: str) -> list[str]:
 
 
 def run_repl() -> int:
-    known_commands = {"list", "use", "status", "doctor", "focus", "tail", "open", "ask", "help", "exit", "quit"}
+    known_commands = {"list", "use", "status", "doctor", "focus", "tail", "new", "open", "ask", "help", "exit", "quit"}
     print("Codex bridge shell")
-    print("Commands: list, open, ask, status, doctor, tail, focus, use, help, exit")
+    print("Commands: list, new, open, ask, status, doctor, tail, focus, use, help, exit")
     print("Primary flow: list -> open ai -> ask \"...\"")
     print("Example: open ai")
+    print("Example: new ai")
     print("Example: open --abort ai")
     print("Example: open other")
     print("Example: doctor")
