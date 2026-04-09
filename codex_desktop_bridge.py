@@ -2615,7 +2615,7 @@ def command_ask(args: argparse.Namespace) -> int:
         f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
     )
 
-    delivery_timeout_sec = 10.0 if pending_new else 4.0
+    delivery_timeout_sec = 15.0 if pending_new else 4.0
     delivered_thread = wait_for_prompt_delivery(
         recent_offsets,
         prompt,
@@ -2640,10 +2640,21 @@ def command_ask(args: argparse.Namespace) -> int:
         clear_pending_new_thread_request()
         set_selected_thread_id(thread.id)
     elif delivered_thread.id != thread.id:
-        raise RuntimeError(
-            "Prompt landed in a different thread. "
-            f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
-        )
+        if activation_method.startswith("best-effort"):
+            expected_label = get_thread_label(thread)
+            thread = delivered_thread
+            session_path = Path(thread.rollout_path)
+            start_offset = recent_offsets.get(thread.id, (thread, session_path, 0))[2]
+            set_selected_thread_id(thread.id)
+            print(
+                "[delivery_redirected] "
+                f"expected={expected_label} actual={get_thread_label(thread)}"
+            )
+        else:
+            raise RuntimeError(
+                "Prompt landed in a different thread. "
+                f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
+            )
     print(f"[delivery_verified] {get_thread_label(thread)}")
 
     if args.background:
