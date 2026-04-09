@@ -2615,10 +2615,11 @@ def command_ask(args: argparse.Namespace) -> int:
         f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
     )
 
+    delivery_timeout_sec = 10.0 if pending_new else 4.0
     delivered_thread = wait_for_prompt_delivery(
         recent_offsets,
         prompt,
-        timeout_sec=4.0,
+        timeout_sec=delivery_timeout_sec,
         allow_new_cwd=str(pending_new.get("cwd", "")) if pending_new else None,
         require_new_thread=bool(pending_new),
     )
