@@ -2615,7 +2615,7 @@ def command_ask(args: argparse.Namespace) -> int:
         f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
     )
 
-    delivery_timeout_sec = 15.0 if pending_new else 4.0
+    delivery_timeout_sec = 10.0 if pending_new else 4.0
     delivered_thread = wait_for_prompt_delivery(
         recent_offsets,
         prompt,
