@@ -245,6 +245,30 @@ def set_selected_thread_id(thread_id: str | None) -> None:
     save_bridge_state(data)
 
 
+def get_pending_new_thread_request() -> dict | None:
+    data = load_bridge_state()
+    value = data.get("pending_new_thread")
+    return value if isinstance(value, dict) else None
+
+
+def set_pending_new_thread_request(workspace_name: str, cwd: str, source_thread_id: str) -> None:
+    data = load_bridge_state()
+    data["pending_new_thread"] = {
+        "workspace_name": workspace_name,
+        "cwd": cwd,
+        "source_thread_id": source_thread_id,
+        "created_at": time.time(),
+    }
+    save_bridge_state(data)
+
+
+def clear_pending_new_thread_request() -> None:
+    data = load_bridge_state()
+    if "pending_new_thread" in data:
+        data.pop("pending_new_thread", None)
+        save_bridge_state(data)
+
+
 def connect_readonly(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
@@ -712,13 +736,29 @@ def wait_for_prompt_delivery(
     session_offsets: dict[str, tuple[ThreadInfo, Path, int]],
     prompt: str,
     timeout_sec: float = 4.0,
+    allow_new_cwd: str | None = None,
+    require_new_thread: bool = False,
 ) -> ThreadInfo | None:
     normalized_prompt = normalize_prompt_text(prompt)
     deadline = time.time() + timeout_sec
     cursors = {thread_id: offset for thread_id, (_, _, offset) in session_offsets.items()}
+    initial_thread_ids = set(session_offsets)
+    target_cwd = normalize_workspace_path(allow_new_cwd) if allow_new_cwd else ""
 
     while time.time() < deadline:
-        for thread_id, (thread, session_path, _initial_offset) in session_offsets.items():
+        if target_cwd:
+            for candidate in load_recent_threads(limit=0):
+                if candidate.id in session_offsets:
+                    continue
+                if normalize_workspace_path(candidate.cwd) != target_cwd:
+                    continue
+                session_path = Path(candidate.rollout_path)
+                if not session_path.exists():
+                    continue
+                session_offsets[candidate.id] = (candidate, session_path, 0)
+                cursors[candidate.id] = 0
+
+        for thread_id, (thread, session_path, _initial_offset) in list(session_offsets.items()):
             cursor = cursors.get(thread_id, 0)
             events, cursor = read_new_session_events(session_path, cursor)
             cursors[thread_id] = cursor
@@ -727,6 +767,8 @@ def wait_for_prompt_delivery(
                 if not user_text:
                     continue
                 if normalize_prompt_text(user_text) == normalized_prompt:
+                    if require_new_thread and thread_id in initial_thread_ids:
+                        continue
                     return thread
         time.sleep(0.2)
 
@@ -2304,6 +2346,7 @@ def command_focus(args: argparse.Namespace) -> int:
 
 def command_use(args: argparse.Namespace) -> int:
     if args.clear:
+        clear_pending_new_thread_request()
         set_selected_thread_id(None)
         print("selected_thread: cleared")
         return 0
@@ -2313,6 +2356,7 @@ def command_use(args: argparse.Namespace) -> int:
     else:
         thread = choose_thread(args.thread_id, args.cwd)
 
+    clear_pending_new_thread_request()
     set_selected_thread_id(thread.id)
     print(f"selected_thread: {thread.id}")
     print(f"title: {thread.title}")
@@ -2389,10 +2433,24 @@ def command_new(args: argparse.Namespace) -> int:
     clicked_button = start_new_thread_in_workspace(workspace_name)
     new_thread = wait_for_new_thread_in_workspace(before_ids, source_thread.cwd, timeout_sec=6.0)
     if new_thread is None:
-        raise RuntimeError(
-            "The workspace new-thread button was clicked, but no new thread was recorded in the local Codex state."
-        )
+        set_selected_thread_id(None)
+        set_pending_new_thread_request(workspace_name, source_thread.cwd, source_thread.id)
+        print("selected_thread: pending-new-thread")
+        print("target_thread: pending-new-thread")
+        print(f"source_thread: {source_thread.id}")
+        print(f"source_workspace: {workspace_name}")
+        print(f"source_activation: {source_activation}")
+        print(f"title: -")
+        print(f"ui_name: -")
+        print(f"cwd: {source_thread.cwd}")
+        if cancelled_labels:
+            print(f"reply_abort_requested: {', '.join(cancelled_labels)}")
+            if cancel_remaining:
+                print(f"reply_abort_pending: {', '.join(cancel_remaining)}")
+        print(f"ui_activation: workspace-new:{clicked_button} [pending-first-prompt]")
+        return 0
 
+    clear_pending_new_thread_request()
     set_selected_thread_id(new_thread.id)
     verified_by = verify_active_thread(new_thread.id)
     ui_activation = (
@@ -2434,6 +2492,7 @@ def command_open(args: argparse.Namespace) -> int:
                 f"Busy thread(s): {labels}. Wait for `[ready]` or rerun with `open --abort ...`."
             )
         cancelled_labels, cancel_remaining = cancel_codex_reply_if_busy(timeout_sec=3.0)
+    clear_pending_new_thread_request()
     set_selected_thread_id(thread.id)
     activation_warning = ""
     try:
@@ -2467,16 +2526,39 @@ def command_open(args: argparse.Namespace) -> int:
 
 
 def command_ask(args: argparse.Namespace) -> int:
-    thread = choose_thread(args.thread_id, args.cwd)
-    session_path = Path(thread.rollout_path)
-    if not session_path.exists():
-        raise RuntimeError(f"Session file not found: {session_path}")
+    pending_new = None
+    if not args.thread_id and not args.cwd:
+        pending_new = get_pending_new_thread_request()
+        if pending_new:
+            try:
+                thread = get_thread_by_id(
+                    str(pending_new.get("source_thread_id", "")),
+                    threads=load_recent_threads(limit=0),
+                )
+            except RuntimeError:
+                clear_pending_new_thread_request()
+                pending_new = None
+            else:
+                session_path = Path(thread.rollout_path)
+                if not session_path.exists():
+                    clear_pending_new_thread_request()
+                    pending_new = None
+    if not pending_new:
+        thread = choose_thread(args.thread_id, args.cwd)
+        session_path = Path(thread.rollout_path)
+        if not session_path.exists():
+            raise RuntimeError(f"Session file not found: {session_path}")
 
     prompt = args.prompt
-    print(f"target_thread: {thread.id}")
+    if pending_new:
+        print("target_thread: pending-new-thread")
+        print(f"source_thread: {thread.id}")
+        print(f"source_workspace: {pending_new.get('workspace_name') or get_thread_workspace_name(thread)}")
+    else:
+        print(f"target_thread: {thread.id}")
     print(f"title: {thread.title}")
     print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
-    print(f"cwd: {thread.cwd}")
+    print(f"cwd: {pending_new.get('cwd') if pending_new else thread.cwd}")
     print("")
 
     if args.dry_run:
@@ -2492,16 +2574,18 @@ def command_ask(args: argparse.Namespace) -> int:
             f"Busy thread(s): {labels}. Pass --force-while-busy to override."
         )
 
-    if is_thread_busy(session_path) and not args.force_while_busy:
+    if not pending_new and is_thread_busy(session_path) and not args.force_while_busy:
         raise RuntimeError(
             "The selected thread is still busy. This often means the same Codex thread is currently active "
             "or another task is still running. Wait, switch to another thread, or pass --force-while-busy."
         )
 
-    start_offset = session_path.stat().st_size
+    start_offset = session_path.stat().st_size if not pending_new else 0
     recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
     activation_warning = ""
-    if args.switch_thread:
+    if pending_new:
+        activation_method = "pending-new-thread [current-ui]"
+    elif args.switch_thread:
         try:
             activation_method = activate_thread_in_ui(thread)
         except Exception as exc:
@@ -2531,13 +2615,30 @@ def command_ask(args: argparse.Namespace) -> int:
         f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
     )
 
-    delivered_thread = wait_for_prompt_delivery(recent_offsets, prompt, timeout_sec=4.0)
+    delivered_thread = wait_for_prompt_delivery(
+        recent_offsets,
+        prompt,
+        timeout_sec=4.0,
+        allow_new_cwd=str(pending_new.get("cwd", "")) if pending_new else None,
+        require_new_thread=bool(pending_new),
+    )
     if delivered_thread is None:
+        if pending_new:
+            raise RuntimeError(
+                "Prompt delivery could not be confirmed in the pending new thread. "
+                "The blank thread UI likely moved, or the first prompt was not recorded."
+            )
         raise RuntimeError(
             "Prompt delivery could not be confirmed in any recent Codex thread. "
             "The UI likely moved, but the message was not recorded."
         )
-    if delivered_thread.id != thread.id:
+    if pending_new:
+        thread = delivered_thread
+        session_path = Path(thread.rollout_path)
+        start_offset = 0
+        clear_pending_new_thread_request()
+        set_selected_thread_id(thread.id)
+    elif delivered_thread.id != thread.id:
         raise RuntimeError(
             "Prompt landed in a different thread. "
             f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
