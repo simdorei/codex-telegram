@@ -346,19 +346,6 @@ def pop_pending_ask() -> dict[str, object] | None:
         return PENDING_ASKS.pop(0)
 
 
-def remove_pending_asks_for_chat(chat_id: int) -> list[dict[str, object]]:
-    removed: list[dict[str, object]] = []
-    with PENDING_ASKS_LOCK:
-        kept: list[dict[str, object]] = []
-        for item in PENDING_ASKS:
-            if int(item.get("chat_id") or 0) == chat_id:
-                removed.append(item)
-            else:
-                kept.append(item)
-        PENDING_ASKS[:] = kept
-    return removed
-
-
 def start_ask_worker(
     token: str,
     chat_id: int,
@@ -597,22 +584,6 @@ def handle_open_command(token: str, chat_id: int, ref: str, abort: bool, reply_t
     )
 
 
-def handle_new_command(token: str, chat_id: int, ref: str | None, abort: bool, reply_to_message_id: int | None) -> None:
-    argv = ["new"]
-    if abort:
-        argv.append("--abort")
-    if ref:
-        argv.append(ref)
-    exit_code, output = run_bridge_command(argv)
-    prefix = "New ok" if exit_code == 0 else f"New failed (exit {exit_code})"
-    send_text(
-        token,
-        chat_id,
-        f"{prefix}\n\n{output or '(no output)'}",
-        reply_to_message_id=reply_to_message_id,
-    )
-
-
 def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> None:
     chat = message.get("chat") or {}
     chat_id = int(chat.get("id"))
@@ -639,7 +610,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             send_text(
                 token,
                 chat_id,
-                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.\n취소하려면 /cancel",
+                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.",
                 reply_to_message_id=reply_to_message_id,
             )
             return
@@ -658,15 +629,12 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 [
                     "Commands:",
                     "/list [limit]",
-                    "/new [ref]",
-                    "/new_abort [ref]",
                     "/open <ref>",
                     "/open_abort <ref>",
                     "/status [ref]",
                     "/doctor",
                     "/ask <prompt>",
                     "/abort",
-                    "/cancel",
                     "/chatid",
                     "",
                     "Thread refs use the same format as the bridge, for example:",
@@ -726,22 +694,6 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         send_text(token, chat_id, f"{prefix}\n\n{output}", reply_to_message_id=reply_to_message_id)
         return
 
-    if command == "/cancel":
-        removed = remove_pending_asks_for_chat(chat_id)
-        if removed:
-            lines = [f"Cancelled {len(removed)} queued ask(s)."]
-            active_summary = get_active_job_summary()
-            if active_summary:
-                lines.extend(["", "Running ask is unchanged.", "Use /abort if you also want to stop the active reply."])
-            send_text(token, chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
-        else:
-            lines = ["No queued asks to cancel."]
-            active_summary = get_active_job_summary()
-            if active_summary:
-                lines.extend(["", "A reply is currently running.", "Use /abort to stop the active reply."])
-            send_text(token, chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
-        return
-
     if command == "/open":
         if not arg:
             send_text(token, chat_id, "Usage: /open <ref>", reply_to_message_id=reply_to_message_id)
@@ -756,14 +708,6 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         handle_open_command(token, chat_id, arg, abort=True, reply_to_message_id=reply_to_message_id)
         return
 
-    if command == "/new":
-        handle_new_command(token, chat_id, arg or None, abort=False, reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/new_abort":
-        handle_new_command(token, chat_id, arg or None, abort=True, reply_to_message_id=reply_to_message_id)
-        return
-
     if command == "/ask":
         if not arg:
             send_text(token, chat_id, "Usage: /ask <prompt>", reply_to_message_id=reply_to_message_id)
@@ -773,7 +717,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             send_text(
                 token,
                 chat_id,
-                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.\n취소하려면 /cancel",
+                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.",
                 reply_to_message_id=reply_to_message_id,
             )
             return
