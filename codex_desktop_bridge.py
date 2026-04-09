@@ -269,6 +269,36 @@ def clear_pending_new_thread_request() -> None:
         save_bridge_state(data)
 
 
+def get_recent_ui_thread_id(max_age_sec: float = 30.0) -> str | None:
+    data = load_bridge_state()
+    value = data.get("recent_ui_thread")
+    if not isinstance(value, dict):
+        return None
+    thread_id = value.get("thread_id")
+    activated_at = value.get("activated_at")
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return None
+    try:
+        activated_at_float = float(activated_at)
+    except (TypeError, ValueError):
+        return None
+    if time.time() - activated_at_float > max_age_sec:
+        return None
+    return thread_id.strip()
+
+
+def set_recent_ui_thread_id(thread_id: str | None) -> None:
+    data = load_bridge_state()
+    if thread_id:
+        data["recent_ui_thread"] = {
+            "thread_id": thread_id,
+            "activated_at": time.time(),
+        }
+    else:
+        data.pop("recent_ui_thread", None)
+    save_bridge_state(data)
+
+
 def connect_readonly(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
@@ -2347,6 +2377,7 @@ def command_focus(args: argparse.Namespace) -> int:
 def command_use(args: argparse.Namespace) -> int:
     if args.clear:
         clear_pending_new_thread_request()
+        set_recent_ui_thread_id(None)
         set_selected_thread_id(None)
         print("selected_thread: cleared")
         return 0
@@ -2357,6 +2388,7 @@ def command_use(args: argparse.Namespace) -> int:
         thread = choose_thread(args.thread_id, args.cwd)
 
     clear_pending_new_thread_request()
+    set_recent_ui_thread_id(None)
     set_selected_thread_id(thread.id)
     print(f"selected_thread: {thread.id}")
     print(f"title: {thread.title}")
@@ -2433,6 +2465,7 @@ def command_new(args: argparse.Namespace) -> int:
     clicked_button = start_new_thread_in_workspace(workspace_name)
     new_thread = wait_for_new_thread_in_workspace(before_ids, source_thread.cwd, timeout_sec=6.0)
     if new_thread is None:
+        set_recent_ui_thread_id(None)
         set_selected_thread_id(None)
         set_pending_new_thread_request(workspace_name, source_thread.cwd, source_thread.id)
         print("selected_thread: pending-new-thread")
@@ -2453,6 +2486,7 @@ def command_new(args: argparse.Namespace) -> int:
     clear_pending_new_thread_request()
     set_selected_thread_id(new_thread.id)
     verified_by = verify_active_thread(new_thread.id)
+    set_recent_ui_thread_id(new_thread.id if verified_by else None)
     ui_activation = (
         f"workspace-new:{clicked_button} [{verified_by}]"
         if verified_by
@@ -2500,6 +2534,7 @@ def command_open(args: argparse.Namespace) -> int:
     except Exception as exc:
         activation_method = "best-effort (unverified)"
         activation_warning = str(exc)
+    set_recent_ui_thread_id(thread.id if not activation_method.startswith("best-effort") else None)
     session_path = Path(thread.rollout_path)
     last_user, last_assistant = get_last_user_and_assistant_messages(session_path)
     print(f"selected_thread: {thread.id}")
@@ -2591,16 +2626,21 @@ def command_ask(args: argparse.Namespace) -> int:
         except Exception as exc:
             activation_method = "best-effort-switch (unverified)"
             activation_warning = str(exc)
+        set_recent_ui_thread_id(thread.id if not activation_method.startswith("best-effort") else None)
     else:
-        verified_by = verify_active_thread_by_header(get_thread_ui_name(thread.id, thread) or "")
-        if not verified_by:
-            activation_method = "best-effort-current-ui (unverified)"
-            activation_warning = (
-                "The selected thread could not be verified as the currently open Codex thread. "
-                "Proceeding anyway and checking where the prompt is actually recorded."
-            )
+        recent_ui_thread_id = get_recent_ui_thread_id()
+        if recent_ui_thread_id and recent_ui_thread_id == thread.id:
+            activation_method = "best-effort-current-ui [recent-open]"
         else:
-            activation_method = f"already-open [{verified_by}]"
+            verified_by = verify_active_thread_by_header(get_thread_ui_name(thread.id, thread) or "")
+            if not verified_by:
+                activation_method = "best-effort-current-ui (unverified)"
+                activation_warning = (
+                    "The selected thread could not be verified as the currently open Codex thread. "
+                    "Proceeding anyway and checking where the prompt is actually recorded."
+                )
+            else:
+                activation_method = f"already-open [{verified_by}]"
     print(f"ui_activation: {activation_method}")
     if activation_warning:
         print(f"ui_warning: {activation_warning}")
@@ -2638,13 +2678,15 @@ def command_ask(args: argparse.Namespace) -> int:
         session_path = Path(thread.rollout_path)
         start_offset = 0
         clear_pending_new_thread_request()
+        set_recent_ui_thread_id(thread.id)
         set_selected_thread_id(thread.id)
     elif delivered_thread.id != thread.id:
-        if activation_method.startswith("best-effort"):
+        if activation_method.startswith("best-effort") or not args.switch_thread:
             expected_label = get_thread_label(thread)
             thread = delivered_thread
             session_path = Path(thread.rollout_path)
             start_offset = recent_offsets.get(thread.id, (thread, session_path, 0))[2]
+            set_recent_ui_thread_id(thread.id)
             set_selected_thread_id(thread.id)
             print(
                 "[delivery_redirected] "

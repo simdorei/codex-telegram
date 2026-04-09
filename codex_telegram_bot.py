@@ -517,7 +517,7 @@ def run_ask_job(token: str, chat_id: int, prompt: str, reply_to_message_id: int 
         exit_code, output = run_bridge_command_stream(
             [
                 "ask",
-                "--switch-thread",
+                "--no-switch-thread",
                 "--click",
                 "--foreground",
                 "--stream",
