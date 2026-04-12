@@ -14,6 +14,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -35,7 +37,11 @@ PENDING_ASKS_LOCK = threading.Lock()
 PENDING_ASKS: list[dict[str, object]] = []
 OPEN_WAITERS_LOCK = threading.Lock()
 OPEN_WAITERS: dict[int, dict[str, object]] = {}
+ASK_WAITERS_LOCK = threading.Lock()
+ASK_WAITERS: dict[int, dict[str, object]] = {}
 SINGLE_INSTANCE_MUTEX = None
+RESTART_LOCK = threading.Lock()
+RESTART_SCHEDULED = False
 
 ERROR_ALREADY_EXISTS = 183
 
@@ -58,6 +64,18 @@ def acquire_single_instance_mutex(token: str | None = None) -> bool:
 
     SINGLE_INSTANCE_MUTEX = handle
     return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
+
+
+def release_single_instance_mutex() -> None:
+    global SINGLE_INSTANCE_MUTEX
+    handle = SINGLE_INSTANCE_MUTEX
+    if not handle:
+        return
+    try:
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    SINGLE_INSTANCE_MUTEX = None
 
 
 def load_local_env(path: Path) -> None:
@@ -150,6 +168,50 @@ def send_text(token: str, chat_id: int, text: str, reply_to_message_id: int | No
         if reply_to_message_id is not None:
             params["reply_to_message_id"] = str(reply_to_message_id)
         telegram_api("sendMessage", token, params=params)
+
+
+def resolve_restart_python_exe() -> Path:
+    current = Path(sys.executable).resolve()
+    if current.name.lower() == "python.exe":
+        pythonw = current.with_name("pythonw.exe")
+        if pythonw.exists():
+            return pythonw
+    return current
+
+
+def _exit_after_restart_delay(delay_sec: float) -> None:
+    time.sleep(delay_sec)
+    os._exit(0)
+
+
+def schedule_bot_restart() -> tuple[bool, str]:
+    global RESTART_SCHEDULED
+    with RESTART_LOCK:
+        if RESTART_SCHEDULED:
+            return False, "Restart already scheduled."
+        restart_exe = resolve_restart_python_exe()
+        script_path = SCRIPT_DIR / "codex_telegram_bot.py"
+        creationflags = 0
+        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        release_single_instance_mutex()
+        subprocess.Popen(
+            [str(restart_exe), str(script_path), "--skip-old-updates"],
+            cwd=str(SCRIPT_DIR),
+            creationflags=creationflags,
+            close_fds=True,
+        )
+        RESTART_SCHEDULED = True
+        log_line(
+            f"restart_scheduled exe={restart_exe} script={script_path} args=--skip-old-updates"
+        )
+        threading.Thread(
+            target=_exit_after_restart_delay,
+            args=(0.5,),
+            daemon=True,
+            name="codex-telegram-restart",
+        ).start()
+        return True, "Restart scheduled."
 
 
 class LineStream(io.TextIOBase):
@@ -424,6 +486,13 @@ def _clear_open_waiter(chat_id: int, worker: threading.Thread) -> None:
             OPEN_WAITERS.pop(chat_id, None)
 
 
+def _clear_ask_waiter(chat_id: int, worker: threading.Thread) -> None:
+    with ASK_WAITERS_LOCK:
+        current = ASK_WAITERS.get(chat_id)
+        if current and current.get("thread") is worker:
+            ASK_WAITERS.pop(chat_id, None)
+
+
 def wait_for_busy_to_clear(
     token: str,
     chat_id: int,
@@ -512,6 +581,94 @@ def ensure_open_waiter(
         return True, None
 
 
+def wait_for_selected_thread_to_clear(
+    token: str,
+    chat_id: int,
+    target_ref: str,
+    target_label: str,
+    reply_to_message_id: int | None,
+    timeout_sec: float = 3600.0,
+) -> None:
+    worker = threading.current_thread()
+    deadline = time.time() + timeout_sec
+    log_line(
+        f"ask_waiter_start chat_id={chat_id} target_ref={target_ref} "
+        f"target_label={target_label} timeout={timeout_sec}"
+    )
+    try:
+        last_busy = target_label
+        while time.time() < deadline:
+            busy_now = get_busy_labels(limit=50)
+            if target_label not in busy_now:
+                send_text(
+                    token,
+                    chat_id,
+                    "\n".join(
+                        [
+                            "Busy finished.",
+                            "",
+                            f"{target_ref} is ready now.",
+                            "Send your next message when ready.",
+                        ]
+                    ),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                log_line(f"ask_waiter_ready chat_id={chat_id} target_ref={target_ref}")
+                return
+            if busy_now:
+                last_busy = ", ".join(busy_now[:3])
+            time.sleep(2.0)
+
+        send_text(
+            token,
+            chat_id,
+            "\n".join(
+                [
+                    "Busy wait timed out.",
+                    "",
+                    f"Still busy: {last_busy or '-'}",
+                    f"Target: {target_ref}",
+                ]
+            ),
+            reply_to_message_id=reply_to_message_id,
+        )
+        log_line(f"ask_waiter_timeout chat_id={chat_id} target_ref={target_ref} last_busy={last_busy}")
+    except Exception:
+        log_line(f"ask_waiter_crash chat_id={chat_id} target_ref={target_ref}\n{traceback.format_exc()}")
+    finally:
+        _clear_ask_waiter(chat_id, worker)
+
+
+def ensure_ask_waiter(
+    token: str,
+    chat_id: int,
+    target_ref: str,
+    target_label: str,
+    reply_to_message_id: int | None,
+) -> tuple[bool, str | None]:
+    with ASK_WAITERS_LOCK:
+        current = ASK_WAITERS.get(chat_id)
+        if current:
+            current_thread = current.get("thread")
+            if current_thread and getattr(current_thread, "is_alive", lambda: False)():
+                return False, str(current.get("target_ref") or "")
+            ASK_WAITERS.pop(chat_id, None)
+
+        worker = threading.Thread(
+            target=wait_for_selected_thread_to_clear,
+            args=(token, chat_id, target_ref, target_label, reply_to_message_id),
+            daemon=True,
+            name=f"codex-ask-wait-{chat_id}",
+        )
+        ASK_WAITERS[chat_id] = {
+            "thread": worker,
+            "target_ref": target_ref,
+            "target_label": target_label,
+        }
+        worker.start()
+        return True, None
+
+
 def run_ask_job(
     token: str,
     chat_id: int,
@@ -520,6 +677,14 @@ def run_ask_job(
     use_ipc: bool = False,
 ) -> None:
     relay = TelegramAskRelay(token, chat_id, reply_to_message_id)
+    target_ref = ""
+    target_label = ""
+    try:
+        target_thread = bridge.choose_thread(None, None)
+        target_ref = bridge.get_thread_workspace_ref(target_thread)
+        target_label = bridge.get_thread_label(target_thread)
+    except Exception:
+        pass
     try:
         log_line(
             f"ask_job_start chat_id={chat_id} use_ipc={use_ipc} "
@@ -543,6 +708,37 @@ def run_ask_job(
             relay.feed_line,
         )
         log_line(f"ask_job_finish chat_id={chat_id} exit_code={exit_code}")
+        note = ""
+        if (
+            exit_code != 0
+            and "The selected thread is still busy." in output
+            and target_ref
+            and target_label
+        ):
+            started, existing_ref = ensure_ask_waiter(
+                token=token,
+                chat_id=chat_id,
+                target_ref=target_ref,
+                target_label=target_label,
+                reply_to_message_id=reply_to_message_id,
+            )
+            if started:
+                note = (
+                    "\n\nBusy-end notifier armed."
+                    f"\nI'll send a message here when {target_ref} is ready."
+                )
+            else:
+                note = (
+                    "\n\nBusy-end notifier already active."
+                    + (f"\nCurrent waiting target: {existing_ref}" if existing_ref else "")
+                )
+        elif exit_code != 0 and "IPC owner client for the selected thread was not discovered" in output:
+            note = (
+                "\n\nIPC recovery tip / IPC 복구 안내"
+                "\n- Restart the Telegram bot and try again."
+                "\n- 텔레그램 봇을 재시작한 뒤 다시 시도해보세요."
+                "\n- Restart command / 재시작 명령: /restart_bot"
+            )
         relay.finish()
         if relay.sent_live:
             if exit_code == 0 and not relay.saw_aborted:
@@ -551,12 +747,12 @@ def run_ask_job(
                 send_text(
                     token,
                     chat_id,
-                    f"Ask failed (exit {exit_code})\n\n{output or '(no output)'}",
+                    f"Ask failed (exit {exit_code})\n\n{output or '(no output)'}{note}",
                     reply_to_message_id=reply_to_message_id,
                 )
         else:
             title = "Ask finished" if exit_code == 0 else f"Ask failed (exit {exit_code})"
-            message = f"{title}\n\n{output or '(no output)'}"
+            message = f"{title}\n\n{output or '(no output)'}{note}"
             send_text(token, chat_id, message, reply_to_message_id=reply_to_message_id)
     except Exception:  # pragma: no cover - operational path
         log_line(f"ask_job_crash chat_id={chat_id}\n{traceback.format_exc()}")
@@ -661,6 +857,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                     "/doctor",
                     "/ask <prompt>",
                     "/ask_ipc <prompt> (alias)",
+                    "/restart_bot",
                     "/abort",
                     "/chatid",
                     "",
@@ -670,6 +867,29 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             ),
             reply_to_message_id=reply_to_message_id,
         )
+        return
+
+    if command == "/restart_bot":
+        try:
+            started, detail = schedule_bot_restart()
+        except Exception:
+            log_line("restart_command_error\n" + traceback.format_exc())
+            send_text(
+                token,
+                chat_id,
+                "Bot restart failed.\n봇 재시작에 실패했습니다.\n\n" + traceback.format_exc(),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        message = (
+            "Restarting Telegram bot.\n"
+            "텔레그램 봇을 재시작합니다.\n\n"
+            "Retry the last IPC ask after the bot comes back.\n"
+            "봇이 다시 올라온 뒤 마지막 IPC 요청을 다시 보내세요."
+        )
+        if not started and detail:
+            message += f"\n\n{detail}"
+        send_text(token, chat_id, message, reply_to_message_id=reply_to_message_id)
         return
 
     if command in {"/chatid", "/whoami"}:

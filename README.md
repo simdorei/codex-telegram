@@ -99,6 +99,7 @@ Default `ask` is foreground mode:
 - `/doctor`
 - `/ask <prompt>`
 - `/ask_ipc <prompt> (alias)`
+- `/restart_bot`
 - `/abort`
 - `/chatid`
 
@@ -117,6 +118,7 @@ Latest IPC patch note:
 - The bridge no longer requires a pre-discovered `owner client` before sending an IPC ask.
 - If the target thread is already loaded in any Codex window, an untargeted IPC request can now resolve the handling client automatically.
 - If the thread exists only in recent history/state but is not currently loaded by the app, IPC can still fail with `no-client-found`. In that case, open the thread in Codex Desktop once and retry.
+- If IPC fails with `IPC owner client for the selected thread was not discovered`, restarting the Telegram bot can help re-establish discovery state. Telegram command: `/restart_bot`
 
 ## Thread References
 
