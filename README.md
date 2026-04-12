@@ -20,12 +20,9 @@ No third-party Python packages are required.
 
 - `codex_desktop_bridge.py`: local thread discovery, window activation, ask/watch flow
 - `codex_telegram_bot.py`: Telegram adapter that runs the bridge in-process
-- `cli/codex_cli_telegram_bot.py`: Telegram adapter for `codex exec` and `codex exec resume`
 - `codex-bridge.cmd`: main launcher
 - `codex-telegram-bot.cmd`: Telegram-only launcher
-- `cli/codex-cli-telegram-bot.cmd`: Codex CLI Telegram launcher
 - `.env.example`: local environment template
-- `cli/.env`: separate CLI Telegram bot environment copy
 
 ## Quick Start
 
@@ -56,10 +53,6 @@ TELEGRAM_ALLOWED_CHAT_IDS=
 CODEX_HOME=
 PYTHON_EXE=
 CODEX_BRIDGE_AUTO_START_TELEGRAM=1
-CODEX_CLI_WORKDIR=C:\taxlab
-CODEX_EXE=
-CODEX_CLI_FULL_AUTO=0
-CODEX_CLI_SKIP_GIT_REPO_CHECK=0
 ```
 
 Important variables:
@@ -69,10 +62,6 @@ Important variables:
 - `CODEX_HOME`: override default Codex state directory if needed
 - `PYTHON_EXE`: force a specific Python interpreter
 - `CODEX_BRIDGE_AUTO_START_TELEGRAM`: set `0` to disable bot auto-start
-- `CODEX_CLI_WORKDIR`: workspace path for new Codex CLI sessions
-- `CODEX_EXE`: override the Codex CLI executable name or path
-- `CODEX_CLI_FULL_AUTO`: set `1` to run CLI asks with `--full-auto`
-- `CODEX_CLI_SKIP_GIT_REPO_CHECK`: set `1` to pass `--skip-git-repo-check`
 
 Advanced overrides used by the bridge:
 
@@ -123,42 +112,6 @@ Current Telegram flow:
 
 Current default Telegram `ask` uses IPC instead of UI paste. Telegram no longer exposes `/open`; use `/use` to bind the target thread. Very old threads may need to be opened once in the Codex Desktop app before IPC can address them directly.
 
-## Codex CLI Telegram Bot
-
-Files:
-
-- `cli/codex_cli_telegram_bot.py`
-- `cli/codex-cli-telegram-bot.cmd`
-- `cli/.env`
-
-Start it with:
-
-```powershell
-.\cli\codex-cli-telegram-bot.cmd
-```
-
-The CLI bot reads `cli\.env`, requires both `TELEGRAM_BOT_TOKEN` and
-`TELEGRAM_ALLOWED_CHAT_IDS`, and keeps one saved Codex CLI session per Telegram
-chat. Run `/sessions`, choose one with `/use <number>`, then plain text
-messages continue the selected session. Use `/new` to arm a fresh session.
-You can keep a different bot token here from the desktop bridge's root `.env`.
-
-CLI bot commands:
-
-- `/sessions`
-- `/use <number|session_id>`
-- `/ask <prompt>`
-- `/reset`
-- `/new`
-- `/session`
-- `/cwd`
-- `/chatid`
-
-If Windows cannot find `codex`, the CLI bot will try `wsl.exe` automatically.
-You can force that path with `CODEX_BACKEND=wsl` in `cli\.env`. Optional WSL
-overrides are `CODEX_WSL_WORKDIR`, `CODEX_WSL_CODEX_HOME`, and
-`CODEX_WSL_DISTRO`.
-
 ## Thread References
 
 When a workspace has multiple recent threads, the bridge labels them as:
@@ -171,7 +124,7 @@ Example:
 
 ```powershell
 list
-open ai:2
+use ai:2
 ask "Test"
 ```
 
@@ -241,10 +194,8 @@ Removing a workspace root in the app does not necessarily delete old thread meta
 
 - `codex_desktop_bridge.py`: 로컬 thread 탐색, window 활성화, ask/watch 흐름
 - `codex_telegram_bot.py`: 브리지를 같은 프로세스 안에서 호출하는 텔레그램 어댑터
-- `cli/codex_cli_telegram_bot.py`: `codex exec`, `codex exec resume` 기반 CLI 텔레그램 어댑터
 - `codex-bridge.cmd`: 메인 실행기
 - `codex-telegram-bot.cmd`: 텔레그램 봇만 실행
-- `cli/codex-cli-telegram-bot.cmd`: CLI 텔레그램 봇 실행기
 
 ### 주요 환경 변수
 
@@ -253,10 +204,6 @@ Removing a workspace root in the app does not necessarily delete old thread meta
 - `CODEX_HOME`: Codex 상태 디렉터리를 수동 지정할 때 사용
 - `PYTHON_EXE`: 특정 Python 실행 파일 강제 지정
 - `CODEX_BRIDGE_AUTO_START_TELEGRAM`: `0`이면 봇 자동 실행 비활성화
-- `CODEX_CLI_WORKDIR`: 새 Codex CLI 세션의 기본 작업 폴더
-- `CODEX_EXE`: Codex CLI 실행 파일 이름 또는 경로
-- `CODEX_CLI_FULL_AUTO`: `1`이면 CLI ask에 `--full-auto` 전달
-- `CODEX_CLI_SKIP_GIT_REPO_CHECK`: `1`이면 `--skip-git-repo-check` 전달
 
 ### 브리지 REPL 명령
 
@@ -319,22 +266,6 @@ list
 use ai:2
 ask "Test"
 ```
-
-### Codex CLI 텔레그램 봇
-
-CLI용 텔레그램 봇은 별도 파일과 별도 `.env`를 사용합니다.
-
-- `cli/codex_cli_telegram_bot.py`
-- `cli/codex-cli-telegram-bot.cmd`
-- `cli/.env`
-
-실행:
-
-```powershell
-.\cli\codex-cli-telegram-bot.cmd
-```
-
-이 봇은 텔레그램 chat마다 별도 Codex CLI 세션을 유지합니다. `/sessions`로 목록을 보고 `/use <번호>`로 선택한 뒤 일반 텍스트를 보내면 그 세션에 이어서 질문합니다. 새 세션은 `/new`로 시작합니다.
 
 ### 공개 저장소 관련
 
