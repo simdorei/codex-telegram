@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -69,10 +70,12 @@ GLOBAL_STATE_PATH = get_env_path("CODEX_GLOBAL_STATE", CODEX_HOME / ".codex-glob
 STATE_DB_PATH = resolve_state_db_path(CODEX_HOME)
 SESSION_INDEX_PATH = get_env_path("CODEX_SESSION_INDEX", CODEX_HOME / "session_index.jsonl")
 BRIDGE_STATE_PATH = get_env_path("CODEX_BRIDGE_STATE", CODEX_HOME / "codex_desktop_bridge_state.json")
+CODEX_IPC_PIPE = r"\\.\pipe\codex-ipc"
 BACKGROUND_WATCHERS: dict[str, threading.Thread] = {}
 BACKGROUND_WATCHERS_LOCK = threading.Lock()
 PRINT_LOCK = threading.Lock()
 ULONG_PTR = wt.WPARAM
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 SW_RESTORE = 9
 CF_UNICODETEXT = 13
@@ -80,6 +83,10 @@ GMEM_MOVEABLE = 0x0002
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_EXISTING = 3
+PIPE_PEEK_RETRY_SEC = 0.05
 VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_RETURN = 0x0D
@@ -87,6 +94,7 @@ VK_SHIFT = 0x10
 VK_BACK = 0x08
 VK_TAB = 0x09
 VK_ESCAPE = 0x1B
+VK_A = 0x41
 VK_B = 0x42
 VK_C = 0x43
 VK_J = 0x4A
@@ -179,6 +187,16 @@ kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
 kernel32.GlobalUnlock.restype = wt.BOOL
 kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
 kernel32.GlobalFree.restype = wt.HGLOBAL
+kernel32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE]
+kernel32.CreateFileW.restype = wt.HANDLE
+kernel32.ReadFile.argtypes = [wt.HANDLE, wt.LPVOID, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.LPVOID]
+kernel32.ReadFile.restype = wt.BOOL
+kernel32.WriteFile.argtypes = [wt.HANDLE, wt.LPCVOID, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.LPVOID]
+kernel32.WriteFile.restype = wt.BOOL
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.CloseHandle.restype = wt.BOOL
+kernel32.PeekNamedPipe.argtypes = [wt.HANDLE, wt.LPVOID, wt.DWORD, ctypes.POINTER(wt.DWORD), ctypes.POINTER(wt.DWORD), ctypes.POINTER(wt.DWORD)]
+kernel32.PeekNamedPipe.restype = wt.BOOL
 
 
 @dataclass
@@ -220,6 +238,22 @@ def load_json(path: Path) -> dict:
 def save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def collapse_list_text(value: str, limit: int = 70) -> str:
+    collapsed = " ".join((value or "").replace("\r", " ").replace("\n", " ").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: max(0, limit - 3)].rstrip() + "..."
+
+
+def make_console_safe_text(value: str) -> str:
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return value.encode(encoding, errors="replace").decode(encoding)
+
+
+def format_title_preview(value: str, limit: int = 120) -> str:
+    return make_console_safe_text(collapse_list_text(value, limit=limit))
 
 
 def load_bridge_state() -> dict:
@@ -658,6 +692,210 @@ def read_new_session_events(session_path: Path, start_offset: int) -> tuple[list
             except json.JSONDecodeError:
                 handle.seek(pos)
                 return events, pos
+
+
+def _get_last_win_error_message() -> str:
+    code = int(kernel32.GetLastError())
+    if not code:
+        return "unknown Windows error"
+    return f"{ctypes.WinError(code)}"
+
+
+def _open_codex_ipc_pipe() -> int:
+    handle = kernel32.CreateFileW(
+        CODEX_IPC_PIPE,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        None,
+        OPEN_EXISTING,
+        0,
+        None,
+    )
+    if not handle or handle == INVALID_HANDLE_VALUE:
+        raise RuntimeError(f"Could not open {CODEX_IPC_PIPE}: {_get_last_win_error_message()}")
+    return int(handle)
+
+
+def _peek_pipe_bytes_available(handle: int) -> int:
+    total_available = wt.DWORD(0)
+    ok = kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(total_available), None)
+    if not ok:
+        raise RuntimeError(f"Could not peek {CODEX_IPC_PIPE}: {_get_last_win_error_message()}")
+    return int(total_available.value)
+
+
+def _wait_for_pipe_bytes(handle: int, min_bytes: int, timeout_sec: float) -> None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if _peek_pipe_bytes_available(handle) >= min_bytes:
+            return
+        time.sleep(PIPE_PEEK_RETRY_SEC)
+    raise TimeoutError(f"Timed out waiting for IPC data from {CODEX_IPC_PIPE}.")
+
+
+def _read_pipe_exact(handle: int, size: int, timeout_sec: float) -> bytes:
+    _wait_for_pipe_bytes(handle, size, timeout_sec)
+    buffer = ctypes.create_string_buffer(size)
+    bytes_read = wt.DWORD(0)
+    ok = kernel32.ReadFile(handle, buffer, size, ctypes.byref(bytes_read), None)
+    if not ok:
+        raise RuntimeError(f"Could not read from {CODEX_IPC_PIPE}: {_get_last_win_error_message()}")
+    if int(bytes_read.value) != size:
+        raise RuntimeError(f"Short IPC read from {CODEX_IPC_PIPE}: expected {size}, got {bytes_read.value}.")
+    return buffer.raw[:size]
+
+
+def _read_ipc_message(handle: int, timeout_sec: float) -> dict:
+    header = _read_pipe_exact(handle, 4, timeout_sec)
+    payload_size = int.from_bytes(header, "little")
+    if payload_size < 0:
+        raise RuntimeError("IPC payload length was negative.")
+    payload = _read_pipe_exact(handle, payload_size, timeout_sec)
+    return json.loads(payload.decode("utf-8", errors="ignore"))
+
+
+def _write_ipc_message(handle: int, payload: dict) -> None:
+    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    frame = len(data).to_bytes(4, "little") + data
+    buffer = ctypes.create_string_buffer(frame)
+    bytes_written = wt.DWORD(0)
+    ok = kernel32.WriteFile(handle, buffer, len(frame), ctypes.byref(bytes_written), None)
+    if not ok:
+        raise RuntimeError(f"Could not write to {CODEX_IPC_PIPE}: {_get_last_win_error_message()}")
+    if int(bytes_written.value) != len(frame):
+        raise RuntimeError(
+            f"Short IPC write to {CODEX_IPC_PIPE}: expected {len(frame)}, got {bytes_written.value}."
+        )
+
+
+def _record_owner_client_from_ipc_message(message: dict, owner_clients: dict[str, str]) -> None:
+    if message.get("type") != "broadcast" or message.get("method") != "thread-stream-state-changed":
+        return
+    params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return
+    conversation_id = str(params.get("conversationId") or "").strip()
+    source_client_id = str(message.get("sourceClientId") or "").strip()
+    if conversation_id and source_client_id:
+        owner_clients[conversation_id] = source_client_id
+
+
+def _read_ipc_response(
+    handle: int,
+    request_id: str,
+    timeout_sec: float,
+    owner_clients: dict[str, str],
+) -> dict:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        message = _read_ipc_message(handle, max(PIPE_PEEK_RETRY_SEC, deadline - time.time()))
+        _record_owner_client_from_ipc_message(message, owner_clients)
+        if message.get("type") == "response" and message.get("requestId") == request_id:
+            return message
+    raise TimeoutError(f"Timed out waiting for IPC response to request {request_id}.")
+
+
+def _initialize_ipc_client(handle: int, owner_clients: dict[str, str], timeout_sec: float = 3.0) -> str:
+    request_id = str(uuid.uuid4())
+    _write_ipc_message(
+        handle,
+        {
+            "type": "request",
+            "requestId": request_id,
+            "sourceClientId": "initializing-client",
+            "version": 0,
+            "method": "initialize",
+            "params": {"clientType": "codex-desktop-bridge"},
+        },
+    )
+    response = _read_ipc_response(handle, request_id, timeout_sec=timeout_sec, owner_clients=owner_clients)
+    if response.get("resultType") != "success":
+        raise RuntimeError(f"IPC initialize failed: {response.get('error') or 'unknown error'}")
+    result = response.get("result") or {}
+    if not isinstance(result, dict):
+        raise RuntimeError("IPC initialize returned an invalid payload.")
+    client_id = str(result.get("clientId") or "").strip()
+    if not client_id:
+        raise RuntimeError("IPC initialize did not return a clientId.")
+    return client_id
+
+
+def _discover_owner_client_for_thread(handle: int, thread_id: str, timeout_sec: float) -> str | None:
+    owner_clients: dict[str, str] = {}
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if thread_id in owner_clients:
+            return owner_clients[thread_id]
+        try:
+            message = _read_ipc_message(handle, max(PIPE_PEEK_RETRY_SEC, deadline - time.time()))
+        except TimeoutError:
+            return owner_clients.get(thread_id)
+        _record_owner_client_from_ipc_message(message, owner_clients)
+        if thread_id in owner_clients:
+            return owner_clients[thread_id]
+    return None
+
+
+def start_turn_via_ipc(thread: ThreadInfo, prompt: str, timeout_sec: float = 4.0) -> dict[str, str]:
+    handle = _open_codex_ipc_pipe()
+    owner_clients: dict[str, str] = {}
+    try:
+        source_client_id = _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
+        owner_client_id = owner_clients.get(thread.id)
+        if not owner_client_id:
+            owner_client_id = _discover_owner_client_for_thread(handle, thread.id, timeout_sec=timeout_sec)
+        if not owner_client_id:
+            raise RuntimeError(
+                "IPC owner client for the selected thread was not discovered. "
+                "Open that thread in a Codex window once before using --ipc."
+            )
+
+        request_id = str(uuid.uuid4())
+        _write_ipc_message(
+            handle,
+            {
+                "type": "request",
+                "requestId": request_id,
+                "sourceClientId": source_client_id,
+                "targetClientId": owner_client_id,
+                "version": 1,
+                "method": "thread-follower-start-turn",
+                "params": {
+                    "conversationId": thread.id,
+                    "turnStartParams": {
+                        "inheritThreadSettings": True,
+                        "input": [{"type": "text", "text": prompt}],
+                        "cwd": None,
+                        "approvalPolicy": None,
+                        "sandboxPolicy": None,
+                        "approvalsReviewer": "user",
+                        "model": None,
+                        "serviceTier": "default",
+                        "effort": None,
+                        "summary": "none",
+                        "personality": None,
+                        "outputSchema": None,
+                        "collaborationMode": None,
+                        "attachments": [],
+                    },
+                },
+            },
+        )
+        response = _read_ipc_response(handle, request_id, timeout_sec=timeout_sec, owner_clients=owner_clients)
+        if response.get("resultType") != "success":
+            raise RuntimeError(f"IPC start-turn failed: {response.get('error') or 'unknown error'}")
+        payload = response.get("result") or {}
+        if not isinstance(payload, dict):
+            raise RuntimeError("IPC start-turn returned an invalid payload.")
+        nested_result = payload.get("result") or {}
+        turn = nested_result.get("turn") if isinstance(nested_result, dict) else {}
+        turn_id = str((turn or {}).get("id") or "").strip()
+        return {
+            "owner_client_id": owner_client_id,
+            "turn_id": turn_id,
+        }
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def extract_user_text_from_event(event: dict) -> str:
@@ -1939,7 +2177,16 @@ def send_prompt_to_codex(
     if not skip_click:
         click_window(window, x_ratio=click_x_ratio, y_offset=click_y_offset)
         composer_focused = ensure_codex_composer_focus() or composer_focused
+    if composer_focused:
+        send_hotkey(VK_CONTROL, VK_A)
+        send_key_event(VK_BACK, keyup=False)
+        send_key_event(VK_BACK, keyup=True)
+        time.sleep(0.05)
     set_clipboard_text(prompt)
+    if get_clipboard_text() != prompt:
+        time.sleep(0.05)
+        if get_clipboard_text() != prompt:
+            raise RuntimeError("Clipboard did not contain the prompt after setting it.")
     send_hotkey(VK_CONTROL, VK_V)
     send_key_event(VK_RETURN, keyup=False)
     send_key_event(VK_RETURN, keyup=True)
@@ -1954,13 +2201,12 @@ def print_thread_list(threads: list[ThreadInfo]) -> None:
     for index, thread in enumerate(threads, start=1):
         marker = "*" if thread.id == selected_thread_id else " "
         ui_name = get_thread_ui_name(thread.id, thread)
-        summary = ui_name or thread.title[:70]
+        summary = collapse_list_text(ui_name or thread.title, limit=70)
         workspace = workspace_refs.get(thread.id, get_thread_workspace_name(thread))
         busy = is_thread_busy(Path(thread.rollout_path))
         state = "busy" if busy else "idle"
-        print(
-            f"{marker}{index:>2} | {workspace:<12} | {state:<4} | {thread.id} | {format_timestamp(thread.updated_at)} | {summary}"
-        )
+        line = f"{marker}{index:>2} | {workspace:<12} | {state:<4} | {thread.id} | {format_timestamp(thread.updated_at)} | {summary}"
+        print(make_console_safe_text(line))
 
 
 def command_list(args: argparse.Namespace) -> int:
@@ -2078,8 +2324,19 @@ def command_use(args: argparse.Namespace) -> int:
         thread = choose_thread(args.thread_id, args.cwd)
 
     set_selected_thread_id(thread.id)
+    session_path = Path(thread.rollout_path)
+    last_user, last_assistant = get_last_user_and_assistant_messages(session_path)
     print(f"selected_thread: {thread.id}")
-    print(f"title: {thread.title}")
+    if last_user:
+        print("")
+        print("[last_user]")
+        print(last_user)
+    if last_assistant:
+        print("")
+        print("[last_assistant]")
+        print(last_assistant)
+    print("")
+    print(f"title: {format_title_preview(thread.title)}")
     print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
     print(f"cwd: {thread.cwd}")
     return 0
@@ -2157,7 +2414,7 @@ def command_open(args: argparse.Namespace) -> int:
     last_user, last_assistant = get_last_user_and_assistant_messages(session_path)
     print(f"selected_thread: {thread.id}")
     print(f"target_thread: {thread.id}")
-    print(f"title: {thread.title}")
+    print(f"title: {format_title_preview(thread.title)}")
     print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
     print(f"cwd: {thread.cwd}")
     if cancelled_labels:
@@ -2186,7 +2443,7 @@ def command_ask(args: argparse.Namespace) -> int:
 
     prompt = args.prompt
     print(f"target_thread: {thread.id}")
-    print(f"title: {thread.title}")
+    print(f"title: {format_title_preview(thread.title)}")
     print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
     print(f"cwd: {thread.cwd}")
     print("")
@@ -2197,7 +2454,7 @@ def command_ask(args: argparse.Namespace) -> int:
         return 0
 
     busy_threads = get_busy_threads(limit=50)
-    if busy_threads and not args.force_while_busy:
+    if busy_threads and not args.force_while_busy and not args.ipc:
         labels = ", ".join(get_thread_label(item) for item in busy_threads[:3])
         raise RuntimeError(
             "A Codex reply is still in progress. You can `open` other threads, but `ask` is blocked until it finishes. "
@@ -2211,50 +2468,59 @@ def command_ask(args: argparse.Namespace) -> int:
         )
 
     start_offset = session_path.stat().st_size
-    recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
-    activation_warning = ""
-    if args.switch_thread:
-        try:
-            activation_method = activate_thread_in_ui(thread)
-        except Exception as exc:
-            activation_method = "best-effort-switch (unverified)"
-            activation_warning = str(exc)
+    if args.ipc:
+        print("ui_activation: ipc-thread-follower-start-turn")
+        ipc_result = start_turn_via_ipc(thread, prompt, timeout_sec=4.0)
+        print(f"[delivery_verified] {get_thread_label(thread)}")
+        print(
+            f"[ipc_delivery] owner_client={ipc_result['owner_client_id']} "
+            f"turn_id={ipc_result['turn_id'] or '-'}"
+        )
     else:
-        verified_by = verify_active_thread_by_header(get_thread_ui_name(thread.id, thread) or "")
-        if not verified_by:
-            activation_method = "best-effort-current-ui (unverified)"
-            activation_warning = (
-                "The selected thread could not be verified as the currently open Codex thread. "
-                "Proceeding anyway and checking where the prompt is actually recorded."
-            )
+        recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
+        activation_warning = ""
+        if args.switch_thread:
+            try:
+                activation_method = activate_thread_in_ui(thread)
+            except Exception as exc:
+                activation_method = "best-effort-switch (unverified)"
+                activation_warning = str(exc)
         else:
-            activation_method = f"already-open [{verified_by}]"
-    print(f"ui_activation: {activation_method}")
-    if activation_warning:
-        print(f"ui_warning: {activation_warning}")
-    window = send_prompt_to_codex(
-        prompt=prompt,
-        click_x_ratio=args.click_x_ratio,
-        click_y_offset=args.click_y_offset,
-        skip_click=not args.click,
-    )
-    print(
-        f"sent_to_window: hwnd={window.hwnd} title={window.title} "
-        f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
-    )
+            verified_by = verify_active_thread_by_header(get_thread_ui_name(thread.id, thread) or "")
+            if not verified_by:
+                activation_method = "best-effort-current-ui (unverified)"
+                activation_warning = (
+                    "The selected thread could not be verified as the currently open Codex thread. "
+                    "Proceeding anyway and checking where the prompt is actually recorded."
+                )
+            else:
+                activation_method = f"already-open [{verified_by}]"
+        print(f"ui_activation: {activation_method}")
+        if activation_warning:
+            print(f"ui_warning: {activation_warning}")
+        window = send_prompt_to_codex(
+            prompt=prompt,
+            click_x_ratio=args.click_x_ratio,
+            click_y_offset=args.click_y_offset,
+            skip_click=not args.click,
+        )
+        print(
+            f"sent_to_window: hwnd={window.hwnd} title={window.title} "
+            f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
+        )
 
-    delivered_thread = wait_for_prompt_delivery(recent_offsets, prompt, timeout_sec=4.0)
-    if delivered_thread is None:
-        raise RuntimeError(
-            "Prompt delivery could not be confirmed in any recent Codex thread. "
-            "The UI likely moved, but the message was not recorded."
-        )
-    if delivered_thread.id != thread.id:
-        raise RuntimeError(
-            "Prompt landed in a different thread. "
-            f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
-        )
-    print(f"[delivery_verified] {get_thread_label(thread)}")
+        delivered_thread = wait_for_prompt_delivery(recent_offsets, prompt, timeout_sec=4.0)
+        if delivered_thread is None:
+            raise RuntimeError(
+                "Prompt delivery could not be confirmed in any recent Codex thread. "
+                "The UI likely moved, but the message was not recorded."
+            )
+        if delivered_thread.id != thread.id:
+            raise RuntimeError(
+                "Prompt landed in a different thread. "
+                f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
+            )
+        print(f"[delivery_verified] {get_thread_label(thread)}")
 
     if args.background:
         started = start_background_watch(
@@ -2417,6 +2683,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--stream", dest="stream", action="store_true", help="Stream commentary while a reply is in progress.")
     ask_parser.add_argument("--no-stream", dest="stream", action="store_false", help="Do not stream reply text; only print ready.")
     ask_parser.add_argument("--force-while-busy", action="store_true")
+    ask_parser.add_argument("--ipc", action="store_true", help="Pilot: send the prompt through Codex IPC instead of UI paste.")
     ask_parser.add_argument(
         "--switch-thread",
         dest="switch_thread",

@@ -327,13 +327,20 @@ def set_active_job(thread: threading.Thread | None, chat_id: int | None = None, 
         ACTIVE_JOB["summary"] = summary
 
 
-def enqueue_pending_ask(chat_id: int, prompt: str, reply_to_message_id: int | None) -> int:
+def enqueue_pending_ask(
+    chat_id: int,
+    prompt: str,
+    reply_to_message_id: int | None,
+    *,
+    use_ipc: bool = False,
+) -> int:
     with PENDING_ASKS_LOCK:
         PENDING_ASKS.append(
             {
                 "chat_id": chat_id,
                 "prompt": prompt,
                 "reply_to_message_id": reply_to_message_id,
+                "use_ipc": use_ipc,
             }
         )
         return len(PENDING_ASKS)
@@ -353,6 +360,7 @@ def start_ask_worker(
     reply_to_message_id: int | None,
     *,
     queued: bool = False,
+    use_ipc: bool = False,
 ) -> bool:
     with ACTIVE_JOB_LOCK:
         current = ACTIVE_JOB.get("thread")
@@ -360,13 +368,13 @@ def start_ask_worker(
             return False
         worker = threading.Thread(
             target=run_ask_job,
-            args=(token, chat_id, prompt, reply_to_message_id),
+            args=(token, chat_id, prompt, reply_to_message_id, use_ipc),
             daemon=True,
             name="codex-telegram-ask",
         )
         ACTIVE_JOB["thread"] = worker
         ACTIVE_JOB["chat_id"] = chat_id
-        ACTIVE_JOB["summary"] = f"Running ask: {prompt[:120]}"
+        ACTIVE_JOB["summary"] = f"Running {'ask-ipc' if use_ipc else 'ask'}: {prompt[:120]}"
     worker.start()
     start_label = "대기 요청 시작됨." if queued else "Ask started."
     send_text(token, chat_id, f"{start_label}\n\n{prompt}", reply_to_message_id=reply_to_message_id)
@@ -380,15 +388,22 @@ def start_next_pending_ask(token: str) -> bool:
     chat_id = int(pending["chat_id"])
     prompt = str(pending["prompt"])
     reply_to_message_id = pending.get("reply_to_message_id")
+    use_ipc = bool(pending.get("use_ipc"))
     started = start_ask_worker(
         token=token,
         chat_id=chat_id,
         prompt=prompt,
         reply_to_message_id=reply_to_message_id if isinstance(reply_to_message_id, int) else None,
         queued=True,
+        use_ipc=use_ipc,
     )
     if not started:
-        enqueue_pending_ask(chat_id, prompt, reply_to_message_id if isinstance(reply_to_message_id, int) else None)
+        enqueue_pending_ask(
+            chat_id,
+            prompt,
+            reply_to_message_id if isinstance(reply_to_message_id, int) else None,
+            use_ipc=use_ipc,
+        )
         return False
     log_line(f"pending_ask_started chat_id={chat_id} prompt={prompt[:120].replace(chr(10), ' ')}")
     return True
@@ -497,22 +512,34 @@ def ensure_open_waiter(
         return True, None
 
 
-def run_ask_job(token: str, chat_id: int, prompt: str, reply_to_message_id: int | None = None) -> None:
+def run_ask_job(
+    token: str,
+    chat_id: int,
+    prompt: str,
+    reply_to_message_id: int | None = None,
+    use_ipc: bool = False,
+) -> None:
     relay = TelegramAskRelay(token, chat_id, reply_to_message_id)
     try:
-        log_line(f"ask_job_start chat_id={chat_id} prompt={prompt[:160].replace(chr(10), ' ')}")
+        log_line(
+            f"ask_job_start chat_id={chat_id} use_ipc={use_ipc} "
+            f"prompt={prompt[:160].replace(chr(10), ' ')}"
+        )
+        argv = [
+            "ask",
+            "--foreground",
+            "--stream",
+            "--include-commentary",
+            "--timeout",
+            "0",
+        ]
+        if use_ipc:
+            argv.append("--ipc")
+        else:
+            argv.extend(["--no-switch-thread", "--click"])
+        argv.append(prompt)
         exit_code, output = run_bridge_command_stream(
-            [
-                "ask",
-                "--no-switch-thread",
-                "--click",
-                "--foreground",
-                "--stream",
-                "--include-commentary",
-                "--timeout",
-                "0",
-                prompt,
-            ],
+            argv,
             relay.feed_line,
         )
         log_line(f"ask_job_finish chat_id={chat_id} exit_code={exit_code}")
@@ -606,7 +633,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
 
     if not text.startswith("/"):
         if active_summary:
-            position = enqueue_pending_ask(chat_id, text, reply_to_message_id)
+            position = enqueue_pending_ask(chat_id, text, reply_to_message_id, use_ipc=True)
             send_text(
                 token,
                 chat_id,
@@ -614,7 +641,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 reply_to_message_id=reply_to_message_id,
             )
             return
-        start_ask_worker(token, chat_id, text, reply_to_message_id)
+        start_ask_worker(token, chat_id, text, reply_to_message_id, use_ipc=True)
         return
 
     parts = text.split(maxsplit=1)
@@ -629,11 +656,11 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 [
                     "Commands:",
                     "/list [limit]",
-                    "/open <ref>",
-                    "/open_abort <ref>",
+                    "/use <ref>",
                     "/status [ref]",
                     "/doctor",
                     "/ask <prompt>",
+                    "/ask_ipc <prompt> (alias)",
                     "/abort",
                     "/chatid",
                     "",
@@ -694,18 +721,22 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         send_text(token, chat_id, f"{prefix}\n\n{output}", reply_to_message_id=reply_to_message_id)
         return
 
-    if command == "/open":
+    if command == "/use":
         if not arg:
-            send_text(token, chat_id, "Usage: /open <ref>", reply_to_message_id=reply_to_message_id)
+            send_text(token, chat_id, "Usage: /use <ref>", reply_to_message_id=reply_to_message_id)
             return
-        handle_open_command(token, chat_id, arg, abort=False, reply_to_message_id=reply_to_message_id)
+        exit_code, output = run_bridge_command(["use", arg])
+        prefix = "Use ok" if exit_code == 0 else f"Use failed (exit {exit_code})"
+        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
         return
 
-    if command == "/open_abort":
-        if not arg:
-            send_text(token, chat_id, "Usage: /open_abort <ref>", reply_to_message_id=reply_to_message_id)
-            return
-        handle_open_command(token, chat_id, arg, abort=True, reply_to_message_id=reply_to_message_id)
+    if command in {"/open", "/open_abort"}:
+        send_text(
+            token,
+            chat_id,
+            "Removed. Use /use <ref> to pick the target thread, then send /ask or a plain message.",
+            reply_to_message_id=reply_to_message_id,
+        )
         return
 
     if command == "/ask":
@@ -713,7 +744,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             send_text(token, chat_id, "Usage: /ask <prompt>", reply_to_message_id=reply_to_message_id)
             return
         if active_summary:
-            position = enqueue_pending_ask(chat_id, arg, reply_to_message_id)
+            position = enqueue_pending_ask(chat_id, arg, reply_to_message_id, use_ipc=True)
             send_text(
                 token,
                 chat_id,
@@ -721,7 +752,23 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 reply_to_message_id=reply_to_message_id,
             )
             return
-        start_ask_worker(token, chat_id, arg, reply_to_message_id)
+        start_ask_worker(token, chat_id, arg, reply_to_message_id, use_ipc=True)
+        return
+
+    if command == "/ask_ipc":
+        if not arg:
+            send_text(token, chat_id, "Usage: /ask_ipc <prompt>", reply_to_message_id=reply_to_message_id)
+            return
+        if active_summary:
+            position = enqueue_pending_ask(chat_id, arg, reply_to_message_id, use_ipc=True)
+            send_text(
+                token,
+                chat_id,
+                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        start_ask_worker(token, chat_id, arg, reply_to_message_id, use_ipc=True)
         return
 
     send_text(token, chat_id, f"Unknown command: {command}", reply_to_message_id=reply_to_message_id)
