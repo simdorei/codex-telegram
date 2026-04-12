@@ -864,7 +864,7 @@ def start_turn_via_ipc(thread: ThreadInfo, prompt: str, timeout_sec: float = 4.0
                     "conversationId": thread.id,
                     "turnStartParams": {
                         "inheritThreadSettings": True,
-                        "input": [{"type": "text", "text": prompt}],
+                        "input": [{"type": "text", "text": prompt, "text_elements": []}],
                         "cwd": None,
                         "approvalPolicy": None,
                         "sandboxPolicy": None,
