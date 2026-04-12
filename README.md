@@ -112,6 +112,12 @@ Current Telegram flow:
 
 Current default Telegram `ask` uses IPC instead of UI paste. Telegram no longer exposes `/open`; use `/use` to bind the target thread. Very old threads may need to be opened once in the Codex Desktop app before IPC can address them directly.
 
+Latest IPC patch note:
+
+- The bridge no longer requires a pre-discovered `owner client` before sending an IPC ask.
+- If the target thread is already loaded in any Codex window, an untargeted IPC request can now resolve the handling client automatically.
+- If the thread exists only in recent history/state but is not currently loaded by the app, IPC can still fail with `no-client-found`. In that case, open the thread in Codex Desktop once and retry.
+
 ## Thread References
 
 When a workspace has multiple recent threads, the bridge labels them as:

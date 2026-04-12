@@ -842,56 +842,60 @@ def start_turn_via_ipc(thread: ThreadInfo, prompt: str, timeout_sec: float = 4.0
     try:
         source_client_id = _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
         owner_client_id = owner_clients.get(thread.id)
-        if not owner_client_id:
-            owner_client_id = _discover_owner_client_for_thread(handle, thread.id, timeout_sec=timeout_sec)
-        if not owner_client_id:
-            raise RuntimeError(
-                "IPC owner client for the selected thread was not discovered. "
-                "Open that thread in a Codex window once before using --ipc."
-            )
 
         request_id = str(uuid.uuid4())
-        _write_ipc_message(
-            handle,
-            {
-                "type": "request",
-                "requestId": request_id,
-                "sourceClientId": source_client_id,
-                "targetClientId": owner_client_id,
-                "version": 1,
-                "method": "thread-follower-start-turn",
-                "params": {
-                    "conversationId": thread.id,
-                    "turnStartParams": {
-                        "inheritThreadSettings": True,
-                        "input": [{"type": "text", "text": prompt, "text_elements": []}],
-                        "cwd": None,
-                        "approvalPolicy": None,
-                        "sandboxPolicy": None,
-                        "approvalsReviewer": "user",
-                        "model": None,
-                        "serviceTier": "default",
-                        "effort": None,
-                        "summary": "none",
-                        "personality": None,
-                        "outputSchema": None,
-                        "collaborationMode": None,
-                        "attachments": [],
-                    },
+        request = {
+            "type": "request",
+            "requestId": request_id,
+            "sourceClientId": source_client_id,
+            "version": 1,
+            "method": "thread-follower-start-turn",
+            "params": {
+                "conversationId": thread.id,
+                "turnStartParams": {
+                    "inheritThreadSettings": True,
+                    "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                    "cwd": None,
+                    "approvalPolicy": None,
+                    "sandboxPolicy": None,
+                    "approvalsReviewer": "user",
+                    "model": None,
+                    "serviceTier": "default",
+                    "effort": None,
+                    "summary": "none",
+                    "personality": None,
+                    "outputSchema": None,
+                    "collaborationMode": None,
+                    "attachments": [],
                 },
             },
-        )
+        }
+        if owner_client_id:
+            request["targetClientId"] = owner_client_id
+        _write_ipc_message(handle, request)
         response = _read_ipc_response(handle, request_id, timeout_sec=timeout_sec, owner_clients=owner_clients)
         if response.get("resultType") != "success":
-            raise RuntimeError(f"IPC start-turn failed: {response.get('error') or 'unknown error'}")
+            error = str(response.get("error") or "unknown error")
+            if "no-client-found" in error:
+                raise RuntimeError(
+                    "IPC owner client for the selected thread was not discovered. "
+                    "Open that thread in a Codex window once before using --ipc."
+                )
+            raise RuntimeError(f"IPC start-turn failed: {error}")
         payload = response.get("result") or {}
         if not isinstance(payload, dict):
             raise RuntimeError("IPC start-turn returned an invalid payload.")
         nested_result = payload.get("result") or {}
         turn = nested_result.get("turn") if isinstance(nested_result, dict) else {}
         turn_id = str((turn or {}).get("id") or "").strip()
+        handled_by_client_id = str(
+            response.get("handledByClientId")
+            or owner_clients.get(thread.id)
+            or owner_client_id
+            or ""
+        ).strip()
         return {
-            "owner_client_id": owner_client_id,
+            "owner_client_id": handled_by_client_id,
             "turn_id": turn_id,
         }
     finally:
