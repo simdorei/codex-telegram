@@ -2,7 +2,7 @@
 Telegram adapter for codex_desktop_bridge.py.
 
 This uses the Telegram Bot HTTP API directly with the Python standard library.
-It keeps the Codex bridge in-process so foreground ask/watch behavior stays alive.
+It keeps the Codex bridge in-process so background IPC ask/watch behavior stays alive.
 """
 
 from __future__ import annotations
@@ -221,6 +221,23 @@ def schedule_bot_restart() -> tuple[bool, str]:
             name="codex-telegram-restart",
         ).start()
         return True, "Restart scheduled."
+
+
+IPC_RESTART_ERROR_MARKERS = (
+    "ipc owner client for the selected thread was not discovered",
+    "ipc start-turn failed:",
+    "ipc initialize failed:",
+    "timed out waiting for ipc response",
+    "pipe\\codex-ipc",
+    "no-client-found",
+)
+
+
+def should_restart_bot_after_ask_failure(output: str, use_ipc: bool) -> bool:
+    if not use_ipc:
+        return False
+    lowered = (output or "").lower()
+    return any(marker in lowered for marker in IPC_RESTART_ERROR_MARKERS)
 
 
 class LineStream(io.TextIOBase):
@@ -724,6 +741,7 @@ def run_ask_job(
                 f"{output or '(no output)'}"
             )
         note = ""
+        restart_after_response = False
         if (
             exit_code != 0
             and "The selected thread is still busy." in output
@@ -747,7 +765,8 @@ def run_ask_job(
                     "\n\nBusy-end notifier already active."
                     + (f"\nCurrent waiting target: {existing_ref}" if existing_ref else "")
                 )
-        elif exit_code != 0 and "IPC owner client for the selected thread was not discovered" in output:
+        elif exit_code != 0 and should_restart_bot_after_ask_failure(output, use_ipc):
+            restart_after_response = True
             note = (
                 "\n\nIPC recovery tip / IPC 복구 안내"
                 "\n- Restart the Telegram bot and try again."
@@ -769,6 +788,15 @@ def run_ask_job(
             title = "Ask finished" if exit_code == 0 else f"Ask failed (exit {exit_code})"
             message = f"{title}\n\n{output or '(no output)'}{note}"
             send_text(token, chat_id, message, reply_to_message_id=reply_to_message_id)
+        if restart_after_response:
+            try:
+                started, detail = schedule_bot_restart()
+                log_line(
+                    f"ask_job_restart_after_failure chat_id={chat_id} use_ipc={use_ipc} "
+                    f"started={started} detail={detail}"
+                )
+            except Exception:
+                log_line(f"ask_job_restart_schedule_error chat_id={chat_id}\n{traceback.format_exc()}")
     except Exception:  # pragma: no cover - operational path
         log_line(f"ask_job_crash chat_id={chat_id}\n{traceback.format_exc()}")
         send_text(

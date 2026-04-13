@@ -74,6 +74,8 @@ BRIDGE_STATE_PATH = get_env_path("CODEX_BRIDGE_STATE", CODEX_HOME / "codex_deskt
 CODEX_IPC_PIPE = r"\\.\pipe\codex-ipc"
 SINGLE_BACKUP_LOG_LIMIT_BYTES = 500 * 1024
 IPC_PROBE_LOG_PATH = SCRIPT_DIR / "_ipc_probe_log.jsonl"
+HIGH_CONTEXT_INPUT_RATIO_THRESHOLD = 0.60
+CRITICAL_CONTEXT_INPUT_RATIO_THRESHOLD = 0.80
 BACKGROUND_WATCHERS: dict[str, threading.Thread] = {}
 BACKGROUND_WATCHERS_LOCK = threading.Lock()
 PRINT_LOCK = threading.Lock()
@@ -236,6 +238,14 @@ class ThreadInfo:
     model: str
     reasoning_effort: str
     tokens_used: int
+
+
+@dataclass
+class ThreadContextUsage:
+    model_context_window: int
+    last_input_tokens: int
+    last_total_tokens: int
+    usage_ratio: float
 
 
 @dataclass
@@ -653,6 +663,89 @@ def get_last_user_and_assistant_messages(session_path: Path) -> tuple[str, str]:
     return last_user, last_assistant
 
 
+def coerce_nonnegative_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return 0
+
+
+def get_thread_context_usage(thread: ThreadInfo) -> ThreadContextUsage | None:
+    session_path = Path(thread.rollout_path)
+    if not session_path.exists():
+        return None
+
+    model_context_window = 0
+    last_input_tokens = 0
+    last_total_tokens = 0
+    saw_token_count = False
+
+    for event in iter_session_events(session_path):
+        payload = event.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        if event.get("type") != "event_msg":
+            continue
+
+        event_type = payload.get("type")
+        if event_type == "task_started":
+            model_context_window = coerce_nonnegative_int(payload.get("model_context_window")) or model_context_window
+            continue
+        if event_type != "token_count":
+            continue
+
+        info = payload.get("info") or {}
+        if not isinstance(info, dict):
+            continue
+
+        model_context_window = coerce_nonnegative_int(info.get("model_context_window")) or model_context_window
+
+        last_usage = info.get("last_token_usage") or {}
+        if isinstance(last_usage, dict):
+            saw_token_count = True
+            last_input_tokens = coerce_nonnegative_int(last_usage.get("input_tokens"))
+            last_total_tokens = coerce_nonnegative_int(last_usage.get("total_tokens"))
+
+    if not saw_token_count or model_context_window <= 0:
+        return None
+
+    usage_ratio = min(1.0, last_input_tokens / model_context_window) if last_input_tokens else 0.0
+    return ThreadContextUsage(
+        model_context_window=model_context_window,
+        last_input_tokens=last_input_tokens,
+        last_total_tokens=last_total_tokens,
+        usage_ratio=usage_ratio,
+    )
+
+
+def describe_thread_context_usage(context_usage: ThreadContextUsage) -> str:
+    if context_usage.usage_ratio >= CRITICAL_CONTEXT_INPUT_RATIO_THRESHOLD:
+        return "critical"
+    if context_usage.usage_ratio >= HIGH_CONTEXT_INPUT_RATIO_THRESHOLD:
+        return "high"
+    return "normal"
+
+
+def get_high_context_threads(limit: int = 20) -> list[tuple[ThreadInfo, ThreadContextUsage]]:
+    flagged: list[tuple[ThreadInfo, ThreadContextUsage]] = []
+    for thread in load_recent_threads(limit=limit):
+        context_usage = get_thread_context_usage(thread)
+        if context_usage is None:
+            continue
+        if context_usage.usage_ratio >= HIGH_CONTEXT_INPUT_RATIO_THRESHOLD:
+            flagged.append((thread, context_usage))
+
+    flagged.sort(key=lambda item: (item[1].usage_ratio, item[0].updated_at), reverse=True)
+    return flagged
+
+
 def is_thread_busy(session_path: Path) -> bool:
     last_started = -1
     last_complete = -1
@@ -863,68 +956,134 @@ def _discover_owner_client_for_thread(handle: int, thread_id: str, timeout_sec: 
     return None
 
 
-def start_turn_via_ipc(thread: ThreadInfo, prompt: str, timeout_sec: float = 4.0) -> dict[str, str]:
+class IPCNoClientFoundError(RuntimeError):
+    pass
+
+
+def _request_start_turn_via_ipc(
+    handle: int,
+    source_client_id: str,
+    thread: ThreadInfo,
+    prompt: str,
+    timeout_sec: float,
+    owner_clients: dict[str, str],
+) -> dict[str, str]:
+    owner_client_id = owner_clients.get(thread.id)
+
+    request_id = str(uuid.uuid4())
+    request = {
+        "type": "request",
+        "requestId": request_id,
+        "sourceClientId": source_client_id,
+        "version": 1,
+        "method": "thread-follower-start-turn",
+        "params": {
+            "conversationId": thread.id,
+            "turnStartParams": {
+                "inheritThreadSettings": True,
+                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "cwd": None,
+                "approvalPolicy": None,
+                "sandboxPolicy": None,
+                "approvalsReviewer": "user",
+                "model": None,
+                "serviceTier": "default",
+                "effort": None,
+                "summary": "none",
+                "personality": None,
+                "outputSchema": None,
+                "collaborationMode": None,
+                "attachments": [],
+            },
+        },
+    }
+    if owner_client_id:
+        request["targetClientId"] = owner_client_id
+    _write_ipc_message(handle, request)
+    response = _read_ipc_response(handle, request_id, timeout_sec=timeout_sec, owner_clients=owner_clients)
+    if response.get("resultType") != "success":
+        error = str(response.get("error") or "unknown error")
+        if "no-client-found" in error:
+            raise IPCNoClientFoundError(error)
+        raise RuntimeError(f"IPC start-turn failed: {error}")
+    payload = response.get("result") or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("IPC start-turn returned an invalid payload.")
+    nested_result = payload.get("result") or {}
+    turn = nested_result.get("turn") if isinstance(nested_result, dict) else {}
+    turn_id = str((turn or {}).get("id") or "").strip()
+    handled_by_client_id = str(
+        response.get("handledByClientId")
+        or owner_clients.get(thread.id)
+        or owner_client_id
+        or ""
+    ).strip()
+    return {
+        "owner_client_id": handled_by_client_id,
+        "turn_id": turn_id,
+    }
+
+
+def start_turn_via_ipc(
+    thread: ThreadInfo,
+    prompt: str,
+    timeout_sec: float = 4.0,
+    *,
+    allow_ui_recovery: bool = False,
+) -> dict[str, str]:
     handle = _open_codex_ipc_pipe()
     owner_clients: dict[str, str] = {}
+    recovery_method = ""
+    last_activation_error = ""
     try:
         source_client_id = _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
-        owner_client_id = owner_clients.get(thread.id)
 
-        request_id = str(uuid.uuid4())
-        request = {
-            "type": "request",
-            "requestId": request_id,
-            "sourceClientId": source_client_id,
-            "version": 1,
-            "method": "thread-follower-start-turn",
-            "params": {
-                "conversationId": thread.id,
-                "turnStartParams": {
-                    "inheritThreadSettings": True,
-                    "input": [{"type": "text", "text": prompt, "text_elements": []}],
-                    "cwd": None,
-                    "approvalPolicy": None,
-                    "sandboxPolicy": None,
-                    "approvalsReviewer": "user",
-                    "model": None,
-                    "serviceTier": "default",
-                    "effort": None,
-                    "summary": "none",
-                    "personality": None,
-                    "outputSchema": None,
-                    "collaborationMode": None,
-                    "attachments": [],
-                },
-            },
-        }
-        if owner_client_id:
-            request["targetClientId"] = owner_client_id
-        _write_ipc_message(handle, request)
-        response = _read_ipc_response(handle, request_id, timeout_sec=timeout_sec, owner_clients=owner_clients)
-        if response.get("resultType") != "success":
-            error = str(response.get("error") or "unknown error")
-            if "no-client-found" in error:
-                raise RuntimeError(
-                    "IPC owner client for the selected thread was not discovered. "
-                    "Open that thread in a Codex window once before using --ipc."
+        for attempt in range(3):
+            try:
+                result = _request_start_turn_via_ipc(
+                    handle,
+                    source_client_id,
+                    thread,
+                    prompt,
+                    timeout_sec,
+                    owner_clients,
                 )
-            raise RuntimeError(f"IPC start-turn failed: {error}")
-        payload = response.get("result") or {}
-        if not isinstance(payload, dict):
-            raise RuntimeError("IPC start-turn returned an invalid payload.")
-        nested_result = payload.get("result") or {}
-        turn = nested_result.get("turn") if isinstance(nested_result, dict) else {}
-        turn_id = str((turn or {}).get("id") or "").strip()
-        handled_by_client_id = str(
-            response.get("handledByClientId")
-            or owner_clients.get(thread.id)
-            or owner_client_id
-            or ""
-        ).strip()
-        return {
-            "owner_client_id": handled_by_client_id,
-            "turn_id": turn_id,
-        }
+                if recovery_method:
+                    result["recovery_method"] = recovery_method
+                return result
+            except IPCNoClientFoundError:
+                if attempt >= 2:
+                    if allow_ui_recovery:
+                        detail = (
+                            "IPC owner client for the selected thread was not discovered even after "
+                            "re-activating the thread in the Codex UI. The app is likely still loading "
+                            "or lagging. Wait a few seconds, open the thread once, and retry."
+                        )
+                        if last_activation_error:
+                            detail += f" Last activation error: {last_activation_error}"
+                    else:
+                        detail = (
+                            "IPC owner client for the selected thread was not discovered in background mode. "
+                            "The target thread may still be loading. Open that thread once, wait a few seconds, "
+                            "or rerun with --ipc-recover-ui if you want an automatic UI recovery attempt."
+                        )
+                    raise RuntimeError(detail)
+
+                if allow_ui_recovery:
+                    last_activation_error = ""
+                    try:
+                        recovery_method = activate_thread_in_ui(thread)
+                    except Exception as exc:
+                        last_activation_error = str(exc)
+
+                time.sleep(0.75 * (attempt + 1))
+                discovered_owner = _discover_owner_client_for_thread(
+                    handle,
+                    thread.id,
+                    timeout_sec=max(2.0, min(timeout_sec, 6.0)),
+                )
+                if discovered_owner:
+                    owner_clients[thread.id] = discovered_owner
     finally:
         kernel32.CloseHandle(handle)
 
@@ -2261,6 +2420,7 @@ def command_status(args: argparse.Namespace) -> int:
     busy = is_thread_busy(session_path)
     slot = get_thread_slot(thread)
     ui_name = get_thread_ui_name(thread.id, thread)
+    context_usage = get_thread_context_usage(thread)
     print(f"thread_id: {thread.id}")
     print(f"thread_ref: {get_thread_workspace_ref(thread)}")
     print(f"title: {thread.title}")
@@ -2269,6 +2429,16 @@ def command_status(args: argparse.Namespace) -> int:
     print(f"updated_at: {format_timestamp(thread.updated_at)}")
     print(f"model: {thread.model} / {thread.reasoning_effort}")
     print(f"tokens_used: {thread.tokens_used}")
+    if context_usage is not None:
+        print(f"context_window: {context_usage.model_context_window}")
+        print(f"last_input_tokens: {context_usage.last_input_tokens}")
+        print(f"last_total_tokens: {context_usage.last_total_tokens}")
+        print(
+            "context_usage: "
+            f"{context_usage.usage_ratio * 100:.1f}% ({describe_thread_context_usage(context_usage)})"
+        )
+    else:
+        print("context_usage: -")
     print(f"ui_slot: {slot if slot is not None else '-'}")
     print(f"busy: {busy}")
     print(f"session_path: {session_path}")
@@ -2312,6 +2482,18 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"thread_count: {thread_count}")
     if db_error:
         print(f"db_error: {db_error}")
+
+    print(f"high_context_threshold: {HIGH_CONTEXT_INPUT_RATIO_THRESHOLD * 100:.1f}%")
+    scan_limit = max(20, args.limit * 4)
+    high_context_threads = get_high_context_threads(limit=scan_limit)
+    if high_context_threads:
+        labels = ", ".join(
+            f"{get_thread_workspace_ref(thread)}={usage.usage_ratio * 100:.1f}%"
+            for thread, usage in high_context_threads[: args.limit]
+        )
+        print(f"high_context_threads: {labels}")
+    else:
+        print("high_context_threads: -")
 
     try:
         window = find_codex_window()
@@ -2509,8 +2691,15 @@ def command_ask(args: argparse.Namespace) -> int:
     start_offset = session_path.stat().st_size
     if args.ipc:
         print("ui_activation: ipc-thread-follower-start-turn")
-        ipc_result = start_turn_via_ipc(thread, prompt, timeout_sec=10.0)
+        ipc_result = start_turn_via_ipc(
+            thread,
+            prompt,
+            timeout_sec=10.0,
+            allow_ui_recovery=args.ipc_recover_ui,
+        )
         print(f"[delivery_verified] {get_thread_label(thread)}")
+        if ipc_result.get("recovery_method"):
+            print(f"[ipc_recovery] {ipc_result['recovery_method']}")
         print(
             f"[ipc_delivery] owner_client={ipc_result['owner_client_id']} "
             f"turn_id={ipc_result['turn_id'] or '-'}"
@@ -2714,7 +2903,23 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--stream", dest="stream", action="store_true", help="Stream commentary while a reply is in progress.")
     ask_parser.add_argument("--no-stream", dest="stream", action="store_false", help="Do not stream reply text; only print ready.")
     ask_parser.add_argument("--force-while-busy", action="store_true")
-    ask_parser.add_argument("--ipc", action="store_true", help="Pilot: send the prompt through Codex IPC instead of UI paste.")
+    ask_parser.add_argument(
+        "--ipc",
+        dest="ipc",
+        action="store_true",
+        help="Send the prompt through Codex IPC without UI paste. Default behavior.",
+    )
+    ask_parser.add_argument(
+        "--ui",
+        dest="ipc",
+        action="store_false",
+        help="Use the legacy UI paste path. This can move the Codex window to the foreground.",
+    )
+    ask_parser.add_argument(
+        "--ipc-recover-ui",
+        action="store_true",
+        help="If background IPC cannot find the target thread owner, reactivate the thread in the Codex UI and retry.",
+    )
     ask_parser.add_argument(
         "--switch-thread",
         dest="switch_thread",
@@ -2731,6 +2936,8 @@ def build_parser() -> argparse.ArgumentParser:
         func=command_ask,
         wait=True,
         background=False,
+        ipc=True,
+        ipc_recover_ui=False,
         switch_thread=False,
         stream=False,
         include_commentary=False,
@@ -2765,9 +2972,9 @@ def run_repl() -> int:
     print("Example: doctor")
     print('Example: ask "이 파일 수정해줘"')
     print("`open` selects + opens a thread. `use` only selects without opening.")
-    print('Tip: plain text is treated as `ask --no-switch-thread --stream --include-commentary "..."`')
+    print('Tip: plain text is treated as `ask --stream --include-commentary "..."`')
     print("Busy safety: `open` is blocked while another reply is running unless you pass `--abort`.")
-    print("Default ask is foreground: it streams the reply and keeps the prompt occupied until done.")
+    print("Default ask uses background IPC. Pass `--ui` to use the legacy foreground paste path.")
     print("")
 
     while True:
@@ -2799,7 +3006,7 @@ def run_repl() -> int:
             continue
 
         if argv[0].lower() not in known_commands and not argv[0].startswith("-"):
-            argv = ["ask", "--no-switch-thread", "--stream", "--include-commentary", line]
+            argv = ["ask", "--stream", "--include-commentary", line]
         elif argv[0].lower() == "ask":
             has_wait_mode = any(
                 token in {"--background", "--foreground", "--no-wait"} for token in argv[1:]

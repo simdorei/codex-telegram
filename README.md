@@ -85,11 +85,11 @@ To find your Telegram chat ID:
 - `status`
 - `doctor`
 
-Default `ask` is foreground mode:
+Default `ask` uses background IPC:
 
-- it streams commentary
-- it prints the final answer
-- it keeps the prompt occupied until the reply ends
+- it avoids UI paste by default
+- it streams commentary when requested
+- it prints the final answer or keeps the watch attached, depending on flags
 
 ## Telegram Commands
 
@@ -118,7 +118,7 @@ Latest IPC patch note:
 - The bridge no longer requires a pre-discovered `owner client` before sending an IPC ask.
 - If the target thread is already loaded in any Codex window, an untargeted IPC request can now resolve the handling client automatically.
 - If the thread exists only in recent history/state but is not currently loaded by the app, IPC can still fail with `no-client-found`. In that case, open the thread in Codex Desktop once and retry.
-- If IPC fails with `IPC owner client for the selected thread was not discovered`, restarting the Telegram bot can help re-establish discovery state. Telegram command: `/restart_bot`
+- If IPC ask fails in Telegram due to owner/discovery/background IPC errors, the bot now schedules an automatic restart and then you can retry the same ask after it comes back. Manual command: `/restart_bot`
 
 ## Thread References
 
