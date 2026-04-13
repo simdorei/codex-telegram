@@ -2474,7 +2474,7 @@ def command_ask(args: argparse.Namespace) -> int:
     start_offset = session_path.stat().st_size
     if args.ipc:
         print("ui_activation: ipc-thread-follower-start-turn")
-        ipc_result = start_turn_via_ipc(thread, prompt, timeout_sec=4.0)
+        ipc_result = start_turn_via_ipc(thread, prompt, timeout_sec=10.0)
         print(f"[delivery_verified] {get_thread_label(thread)}")
         print(
             f"[ipc_delivery] owner_client={ipc_result['owner_client_id']} "
