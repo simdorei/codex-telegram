@@ -30,6 +30,7 @@ import codex_desktop_bridge as bridge
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 LOG_PATH = SCRIPT_DIR / "codex_telegram_bot.log"
+PROBE_LOG_PATH = SCRIPT_DIR / "_ipc_probe_log.jsonl"
 TELEGRAM_MAX_LEN = 3900
 ACTIVE_JOB_LOCK = threading.Lock()
 ACTIVE_JOB: dict[str, object] = {"thread": None, "chat_id": None, "summary": ""}
@@ -42,6 +43,7 @@ ASK_WAITERS: dict[int, dict[str, object]] = {}
 SINGLE_INSTANCE_MUTEX = None
 RESTART_LOCK = threading.Lock()
 RESTART_SCHEDULED = False
+LOG_FILE_LOCK = threading.Lock()
 
 ERROR_ALREADY_EXISTS = 183
 
@@ -94,10 +96,17 @@ def load_local_env(path: Path) -> None:
 
 def log_line(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(f"[{timestamp}] {message}\n")
+        with LOG_FILE_LOCK:
+            bridge.rotate_single_backup_file(
+                LOG_PATH,
+                incoming_bytes=len(line.encode("utf-8")),
+            )
+            bridge.rotate_single_backup_file(PROBE_LOG_PATH)
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(line)
     except Exception:
         pass
 
@@ -708,6 +717,12 @@ def run_ask_job(
             relay.feed_line,
         )
         log_line(f"ask_job_finish chat_id={chat_id} exit_code={exit_code}")
+        if exit_code != 0:
+            log_line(
+                "ask_job_failure_output "
+                f"chat_id={chat_id} use_ipc={use_ipc} target_ref={target_ref or '-'}\n"
+                f"{output or '(no output)'}"
+            )
         note = ""
         if (
             exit_code != 0

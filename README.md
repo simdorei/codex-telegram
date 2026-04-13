@@ -142,6 +142,24 @@ ask "Test"
 - `*.log` is ignored by Git.
 - `requirements.txt` is intentionally empty of packages because the project uses only the Python standard library.
 
+## Log Rotation
+
+The bridge keeps a single backup for the local runtime logs below:
+
+- `codex_telegram_bot.log`
+- `_ipc_probe_log.jsonl`
+
+Rotation rule:
+
+- if the current file would grow past `500 KB`, the previous `.bak` file is deleted
+- the current file is moved to `<name>.bak`
+- a new empty current file is created and logging continues there
+
+This means each managed log keeps at most:
+
+- one current file
+- one backup file
+
 ## Troubleshooting
 
 If an old folder such as `codex-desktop-bridge` still appears in the Codex app after you removed it from the workspace list, the usual causes are:

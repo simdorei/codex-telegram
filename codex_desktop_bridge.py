@@ -65,12 +65,15 @@ def resolve_state_db_path(codex_home: Path) -> Path:
     return codex_home / "state_5.sqlite"
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 CODEX_HOME = get_env_path("CODEX_HOME", Path.home() / ".codex")
 GLOBAL_STATE_PATH = get_env_path("CODEX_GLOBAL_STATE", CODEX_HOME / ".codex-global-state.json")
 STATE_DB_PATH = resolve_state_db_path(CODEX_HOME)
 SESSION_INDEX_PATH = get_env_path("CODEX_SESSION_INDEX", CODEX_HOME / "session_index.jsonl")
 BRIDGE_STATE_PATH = get_env_path("CODEX_BRIDGE_STATE", CODEX_HOME / "codex_desktop_bridge_state.json")
 CODEX_IPC_PIPE = r"\\.\pipe\codex-ipc"
+SINGLE_BACKUP_LOG_LIMIT_BYTES = 500 * 1024
+IPC_PROBE_LOG_PATH = SCRIPT_DIR / "_ipc_probe_log.jsonl"
 BACKGROUND_WATCHERS: dict[str, threading.Thread] = {}
 BACKGROUND_WATCHERS_LOCK = threading.Lock()
 PRINT_LOCK = threading.Lock()
@@ -103,6 +106,30 @@ VK_V = 0x56
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+
+
+def rotate_single_backup_file(
+    path: Path,
+    *,
+    max_bytes: int = SINGLE_BACKUP_LOG_LIMIT_BYTES,
+    incoming_bytes: int = 0,
+) -> None:
+    try:
+        if max_bytes <= 0:
+            return
+        current_path = Path(path)
+        if not current_path.exists():
+            return
+        projected_size = current_path.stat().st_size + max(0, incoming_bytes)
+        if projected_size <= max_bytes:
+            return
+        backup_path = current_path.with_name(current_path.name + ".bak")
+        if backup_path.exists():
+            backup_path.unlink()
+        current_path.replace(backup_path)
+        current_path.touch()
+    except OSError:
+        pass
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -2077,6 +2104,14 @@ def activate_thread_in_ui(thread: ThreadInfo) -> str:
     )
 
 
+def verify_thread_in_ui(thread: ThreadInfo) -> str | None:
+    for thread_name in get_thread_ui_name_candidates(thread):
+        header_verified = verify_active_thread_by_header(thread_name)
+        if header_verified:
+            return header_verified
+    return verify_active_thread(thread.id)
+
+
 def set_clipboard_text(text: str) -> None:
     if not user32.OpenClipboard(None):
         raise RuntimeError("Failed to open the clipboard.")
@@ -2482,26 +2517,18 @@ def command_ask(args: argparse.Namespace) -> int:
         )
     else:
         recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
-        activation_warning = ""
         if args.switch_thread:
-            try:
-                activation_method = activate_thread_in_ui(thread)
-            except Exception as exc:
-                activation_method = "best-effort-switch (unverified)"
-                activation_warning = str(exc)
+            activation_method = activate_thread_in_ui(thread)
         else:
-            verified_by = verify_active_thread_by_header(get_thread_ui_name(thread.id, thread) or "")
+            verified_by = verify_thread_in_ui(thread)
             if not verified_by:
-                activation_method = "best-effort-current-ui (unverified)"
-                activation_warning = (
-                    "The selected thread could not be verified as the currently open Codex thread. "
-                    "Proceeding anyway and checking where the prompt is actually recorded."
+                raise RuntimeError(
+                    "The selected thread is not confirmed as the currently open Codex thread. "
+                    "Refusing to paste because it could create a new chat instead. "
+                    "Open the thread first or rerun with --switch-thread."
                 )
-            else:
-                activation_method = f"already-open [{verified_by}]"
+            activation_method = f"already-open [{verified_by}]"
         print(f"ui_activation: {activation_method}")
-        if activation_warning:
-            print(f"ui_warning: {activation_warning}")
         window = send_prompt_to_codex(
             prompt=prompt,
             click_x_ratio=args.click_x_ratio,
@@ -2809,6 +2836,7 @@ def run_repl() -> int:
 
 
 def main() -> int:
+    rotate_single_backup_file(IPC_PROBE_LOG_PATH)
     if len(sys.argv) == 1:
         return run_repl()
 

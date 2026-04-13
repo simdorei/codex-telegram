@@ -1,5 +1,8 @@
 .env
 *.log
+codex_telegram_bot.log.bak
+_ipc_probe_log.jsonl
+_ipc_probe_log.jsonl.bak
 __pycache__/
 *.pyc
 .vscode/
