@@ -70,6 +70,7 @@ TELEGRAM_HELP_LINES = [
     "ai:1, ai:2, taxlab, other, 1, 2",
 ]
 CHOICE_LINE_RE = re.compile(r"^\s*(\d+)[\.\)]\s+(.*\S)\s*$")
+LIST_BUSY_RE = re.compile(r"\|\s*busy\s*\|")
 
 
 def acquire_single_instance_mutex(token: str | None = None) -> bool:
@@ -285,6 +286,11 @@ def build_choices_text(thread_ref: str, choices: list[str]) -> str:
     return "\n".join(lines)
 
 
+def rewrite_list_output_for_telegram(output: str) -> str:
+    text = output or "(no output)"
+    return LIST_BUSY_RE.sub("| waiting |", text)
+
+
 def resolve_restart_python_exe() -> Path:
     current = Path(sys.executable).resolve()
     if current.name.lower() == "python.exe":
@@ -366,6 +372,26 @@ class TelegramAskRelay:
         self.saw_ready = False
         self.saw_aborted = False
         self.saw_timeout = False
+        self.last_choice_signature = ""
+
+    def _send_choices_if_detected(self, text: str) -> None:
+        choices = extract_numbered_choices(text)
+        if not choices:
+            return
+        signature = "\n".join(choices)
+        if signature == self.last_choice_signature:
+            return
+        self.last_choice_signature = signature
+        lines = ["Choices detected", ""]
+        for index, choice in enumerate(choices, start=1):
+            lines.append(f"{index}. {choice}")
+        lines.extend(["", "Reply with /choose <number> or /choose <text>."])
+        send_text(
+            self.token,
+            self.chat_id,
+            "\n".join(lines),
+            reply_to_message_id=self.reply_to_message_id,
+        )
 
     def _send_block(self) -> None:
         text = "\n".join(self.block_lines).strip()
@@ -375,10 +401,12 @@ class TelegramAskRelay:
         if self.mode == "commentary":
             send_text(self.token, self.chat_id, f"In progress\n\n{text}", reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
+            self._send_choices_if_detected(text)
         elif self.mode == "final":
             send_text(self.token, self.chat_id, text, reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
             self.saw_final = True
+            self._send_choices_if_detected(text)
         elif self.mode == "timeout":
             send_text(self.token, self.chat_id, f"Timed out\n\n{text}", reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
@@ -1005,11 +1033,12 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
                 pass
         exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
         prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
+        display_output = rewrite_list_output_for_telegram(output or "(no output)")
         waiting_suffix = build_waiting_list_suffix(active_summary)
         send_text(
             token,
             chat_id,
-            f"{prefix}\n\n{output or '(no output)'}{waiting_suffix}",
+            f"{prefix}\n\n{display_output}{waiting_suffix}",
             reply_to_message_id=reply_to_message_id,
         )
         return
@@ -1288,11 +1317,12 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30)
         exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
         prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
+        display_output = rewrite_list_output_for_telegram(output or "(no output)")
         waiting_suffix = build_waiting_list_suffix(active_summary)
         send_text(
             token,
             chat_id,
-            f"{prefix}\n\n{output or '(no output)'}{waiting_suffix}",
+            f"{prefix}\n\n{display_output}{waiting_suffix}",
             reply_to_message_id=reply_to_message_id,
         )
         return

@@ -164,6 +164,8 @@ Telegram commands:
 - `/confirm_delete_archive <ref>`
 - `/use <ref>`
 - `/status [ref]`
+- `/choices`
+- `/choose <number|text>`
 - `/doctor`
 - `/ask <prompt>`
 - `/ask_ipc <prompt> (alias)`

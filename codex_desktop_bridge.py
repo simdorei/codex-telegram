@@ -758,6 +758,57 @@ def extract_message_text(payload: dict) -> str:
     return "\n".join(texts).strip()
 
 
+def parse_function_call_arguments(payload: dict) -> dict:
+    raw = payload.get("arguments")
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    raw = raw.strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def build_interactive_notice_from_function_call(payload: dict) -> str:
+    name = str(payload.get("name") or "").strip()
+    args = parse_function_call_arguments(payload)
+
+    if name == "request_user_input":
+        lines = ["[choice_required]"]
+        questions = args.get("questions")
+        if isinstance(questions, list) and questions:
+            first = questions[0] if isinstance(questions[0], dict) else {}
+            prompt = str(first.get("question") or "").strip()
+            if prompt:
+                lines.append(prompt)
+            options = first.get("options")
+            if isinstance(options, list):
+                for index, option in enumerate(options, start=1):
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get("label") or "").strip()
+                    if label:
+                        lines.append(f"{index}. {label}")
+        return "\n".join(lines)
+
+    if str(args.get("sandbox_permissions") or "").strip().lower() == "require_escalated":
+        lines = ["[approval_required]"]
+        tool_name = name or str(args.get("tool") or "").strip()
+        if tool_name:
+            lines.append(f"tool: {tool_name}")
+        question = str(args.get("justification") or "").strip()
+        if question:
+            lines.append(question)
+        return "\n".join(lines)
+
+    return ""
+
+
 def iter_session_events(session_path: Path) -> Iterator[dict]:
     with session_path.open("r", encoding="utf-8") as handle:
         for raw in handle:
@@ -1851,6 +1902,7 @@ def watch_for_final_answer(
     commentary: list[str] = []
     final_answer = ""
     seen_agent_messages: set[str] = set()
+    seen_interactive_notices: set[str] = set()
     did_stream_live = False
 
     while deadline is None or time.time() < deadline:
@@ -1886,6 +1938,36 @@ def watch_for_final_answer(
                 }
 
             if event.get("type") != "response_item":
+                continue
+
+            if payload.get("type") == "function_call":
+                notice = build_interactive_notice_from_function_call(payload)
+                if include_commentary and notice and notice not in seen_interactive_notices:
+                    seen_interactive_notices.add(notice)
+                    commentary.append(notice)
+                    if stream_live:
+                        did_stream_live = True
+                        with PRINT_LOCK:
+                            prefix = f"{stream_label} " if stream_label else ""
+                            print(f"{prefix}[commentary]")
+                            print(notice)
+                            print("")
+                continue
+
+            if payload.get("type") == "function_call_output":
+                output_text = str(payload.get("output") or "").strip()
+                if include_commentary and output_text and "rejected by user" in output_text.lower():
+                    notice = "[approval_rejected]\nCommand approval was rejected by user."
+                    if notice not in seen_interactive_notices:
+                        seen_interactive_notices.add(notice)
+                        commentary.append(notice)
+                        if stream_live:
+                            did_stream_live = True
+                            with PRINT_LOCK:
+                                prefix = f"{stream_label} " if stream_label else ""
+                                print(f"{prefix}[commentary]")
+                                print(notice)
+                                print("")
                 continue
 
             if payload.get("type") != "message":
