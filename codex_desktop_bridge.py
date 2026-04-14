@@ -19,13 +19,16 @@ import ctypes.wintypes as wt
 import json
 import os
 import platform
+import queue
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -71,11 +74,17 @@ GLOBAL_STATE_PATH = get_env_path("CODEX_GLOBAL_STATE", CODEX_HOME / ".codex-glob
 STATE_DB_PATH = resolve_state_db_path(CODEX_HOME)
 SESSION_INDEX_PATH = get_env_path("CODEX_SESSION_INDEX", CODEX_HOME / "session_index.jsonl")
 BRIDGE_STATE_PATH = get_env_path("CODEX_BRIDGE_STATE", CODEX_HOME / "codex_desktop_bridge_state.json")
+LOG_DB_PATH = get_env_path("CODEX_LOG_DB", CODEX_HOME / "logs_2.sqlite")
+ARCHIVED_SESSIONS_DIR = get_env_path("CODEX_ARCHIVED_SESSIONS_DIR", CODEX_HOME / "archived_sessions")
+MAINTENANCE_BACKUP_ROOT = get_env_path("CODEX_MAINTENANCE_BACKUP_ROOT", CODEX_HOME / "maintenance_backups")
 CODEX_IPC_PIPE = r"\\.\pipe\codex-ipc"
+CODEX_APP_SERVER_EXE = os.environ.get("CODEX_EXE", "").strip()
 SINGLE_BACKUP_LOG_LIMIT_BYTES = 500 * 1024
 IPC_PROBE_LOG_PATH = SCRIPT_DIR / "_ipc_probe_log.jsonl"
 HIGH_CONTEXT_INPUT_RATIO_THRESHOLD = 0.60
 CRITICAL_CONTEXT_INPUT_RATIO_THRESHOLD = 0.80
+ARCHIVE_RECOMMEND_TOKENS_USED_THRESHOLD = 50_000_000
+ARCHIVE_RECOMMEND_CONTEXT_TOKENS_THRESHOLD = 200_000
 BACKGROUND_WATCHERS: dict[str, threading.Thread] = {}
 BACKGROUND_WATCHERS_LOCK = threading.Lock()
 PRINT_LOCK = threading.Lock()
@@ -238,6 +247,7 @@ class ThreadInfo:
     model: str
     reasoning_effort: str
     tokens_used: int
+    archived_at: int = 0
 
 
 @dataclass
@@ -245,6 +255,8 @@ class ThreadContextUsage:
     model_context_window: int
     last_input_tokens: int
     last_total_tokens: int
+    peak_input_tokens: int
+    peak_total_tokens: int
     usage_ratio: float
 
 
@@ -320,6 +332,10 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
 
+def connect_writable(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(path)
+
+
 def is_protocol_registered(protocol: str) -> bool:
     if not protocol or winreg is None:
         return False
@@ -383,6 +399,33 @@ def load_session_thread_names() -> dict[str, str]:
         if isinstance(thread_id, str) and isinstance(thread_name, str) and thread_name.strip():
             mapping[thread_id] = thread_name.strip()
     return mapping
+
+
+def format_session_index_timestamp(ts: float | None = None) -> str:
+    moment = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond:06d}0Z"
+
+
+def write_session_index_entries(entries: list[dict]) -> None:
+    SESSION_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    rendered = "\n".join(json.dumps(item, ensure_ascii=False) for item in entries)
+    if rendered:
+        rendered += "\n"
+    SESSION_INDEX_PATH.write_text(rendered, encoding="utf-8")
+
+
+def sync_session_index_with_state() -> int:
+    threads = load_recent_threads(limit=0)
+    entries = [
+        {
+            "id": thread.id,
+            "thread_name": thread.title or get_thread_ui_name(thread.id, thread) or thread.id,
+            "updated_at": format_session_index_timestamp(float(thread.updated_at or time.time())),
+        }
+        for thread in threads
+    ]
+    write_session_index_entries(entries)
+    return len(entries)
 
 
 def normalize_ui_match_text(text: str) -> str:
@@ -488,6 +531,44 @@ def load_recent_threads(limit: int = 20) -> list[ThreadInfo]:
     return threads
 
 
+def load_archived_threads(limit: int = 20) -> list[ThreadInfo]:
+    if not STATE_DB_PATH.exists():
+        raise FileNotFoundError(
+            f"Codex state database not found: {STATE_DB_PATH}. "
+            "Set CODEX_HOME or CODEX_STATE_DB if your Codex data lives elsewhere."
+        )
+
+    query = """
+        SELECT id, title, cwd, updated_at, rollout_path, model, reasoning_effort, tokens_used, archived_at
+        FROM threads
+        WHERE archived = 1
+        ORDER BY archived_at DESC, updated_at DESC
+    """
+    params: tuple[object, ...] = ()
+    if limit > 0:
+        query += "\n        LIMIT ?"
+        params = (limit,)
+    with connect_readonly(STATE_DB_PATH) as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    threads = []
+    for row in rows:
+        threads.append(
+            ThreadInfo(
+                id=row[0],
+                title=row[1] or "",
+                cwd=row[2] or "",
+                updated_at=row[3] or 0,
+                rollout_path=row[4] or "",
+                model=row[5] or "",
+                reasoning_effort=row[6] or "",
+                tokens_used=row[7] or 0,
+                archived_at=row[8] or 0,
+            )
+        )
+    return threads
+
+
 def get_thread_by_id(thread_id: str, threads: list[ThreadInfo] | None = None) -> ThreadInfo:
     pool = threads or load_recent_threads(limit=50)
     for thread in pool:
@@ -574,6 +655,41 @@ def resolve_thread_ref(thread_ref: str, limit: int = 50) -> ThreadInfo:
     return get_thread_by_id(thread_ref, threads=load_recent_threads(limit=0))
 
 
+def resolve_archived_thread_ref(thread_ref: str, limit: int = 100) -> ThreadInfo:
+    threads = load_archived_threads(limit=limit)
+    if not threads:
+        raise RuntimeError("No archived Codex threads found in the local state DB.")
+
+    normalized = thread_ref.strip().lower()
+
+    if thread_ref.isdigit():
+        index = int(thread_ref)
+        if 1 <= index <= len(threads):
+            return threads[index - 1]
+        raise RuntimeError(f"Archived thread index out of range: {thread_ref}")
+
+    workspace_map = build_workspace_ref_map(threads)
+    for thread in threads:
+        if workspace_map.get(thread.id, "").lower() == normalized:
+            return thread
+
+    for thread in threads:
+        if normalize_workspace_path(thread.cwd) == normalize_workspace_path(thread_ref):
+            return thread
+
+    workspace_matches = [thread for thread in threads if get_thread_workspace_name(thread).lower() == normalized]
+    if len(workspace_matches) > 1:
+        refs = ", ".join(workspace_map.get(thread.id, thread.id) for thread in workspace_matches)
+        raise RuntimeError(
+            f"Multiple archived threads match workspace `{thread_ref}`. Use one of: {refs}"
+        )
+    for thread in threads:
+        if get_thread_workspace_name(thread).lower() == normalized:
+            return thread
+
+    return get_thread_by_id(thread_ref, threads=load_archived_threads(limit=0))
+
+
 def get_thread_slot(thread: ThreadInfo, limit: int = 9) -> int | None:
     threads = load_recent_threads(limit=max(limit, 9))
     for index, item in enumerate(threads, start=1):
@@ -619,6 +735,16 @@ def format_timestamp(unix_seconds: int) -> str:
     if not unix_seconds:
         return "-"
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(unix_seconds))
+
+
+def format_token_k(value: int) -> str:
+    if value <= 0:
+        return "-"
+    if value < 1000:
+        return str(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    return f"{value / 1000:.1f}k"
 
 
 def extract_message_text(payload: dict) -> str:
@@ -685,6 +811,8 @@ def get_thread_context_usage(thread: ThreadInfo) -> ThreadContextUsage | None:
     model_context_window = 0
     last_input_tokens = 0
     last_total_tokens = 0
+    peak_input_tokens = 0
+    peak_total_tokens = 0
     saw_token_count = False
 
     for event in iter_session_events(session_path):
@@ -712,6 +840,8 @@ def get_thread_context_usage(thread: ThreadInfo) -> ThreadContextUsage | None:
             saw_token_count = True
             last_input_tokens = coerce_nonnegative_int(last_usage.get("input_tokens"))
             last_total_tokens = coerce_nonnegative_int(last_usage.get("total_tokens"))
+            peak_input_tokens = max(peak_input_tokens, last_input_tokens)
+            peak_total_tokens = max(peak_total_tokens, last_total_tokens)
 
     if not saw_token_count or model_context_window <= 0:
         return None
@@ -721,6 +851,8 @@ def get_thread_context_usage(thread: ThreadInfo) -> ThreadContextUsage | None:
         model_context_window=model_context_window,
         last_input_tokens=last_input_tokens,
         last_total_tokens=last_total_tokens,
+        peak_input_tokens=peak_input_tokens,
+        peak_total_tokens=peak_total_tokens,
         usage_ratio=usage_ratio,
     )
 
@@ -744,6 +876,17 @@ def get_high_context_threads(limit: int = 20) -> list[tuple[ThreadInfo, ThreadCo
 
     flagged.sort(key=lambda item: (item[1].usage_ratio, item[0].updated_at), reverse=True)
     return flagged
+
+
+def should_recommend_archive(thread: ThreadInfo, context_usage: ThreadContextUsage | None) -> bool:
+    if thread.tokens_used >= ARCHIVE_RECOMMEND_TOKENS_USED_THRESHOLD:
+        return True
+    if context_usage is None:
+        return False
+    return (
+        context_usage.last_input_tokens >= ARCHIVE_RECOMMEND_CONTEXT_TOKENS_THRESHOLD
+        or context_usage.peak_input_tokens >= ARCHIVE_RECOMMEND_CONTEXT_TOKENS_THRESHOLD
+    )
 
 
 def is_thread_busy(session_path: Path) -> bool:
@@ -960,6 +1103,10 @@ class IPCNoClientFoundError(RuntimeError):
     pass
 
 
+class CodexSidecarError(RuntimeError):
+    pass
+
+
 def _request_start_turn_via_ipc(
     handle: int,
     source_client_id: str,
@@ -1035,10 +1182,17 @@ def start_turn_via_ipc(
     owner_clients: dict[str, str] = {}
     recovery_method = ""
     last_activation_error = ""
+    max_attempts = 3 if allow_ui_recovery else 2
+    retry_sleep_base = 0.75 if allow_ui_recovery else 0.35
+    discover_timeout_sec = (
+        max(2.0, min(timeout_sec, 6.0))
+        if allow_ui_recovery
+        else max(0.75, min(timeout_sec, 1.5))
+    )
     try:
         source_client_id = _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
 
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
                 result = _request_start_turn_via_ipc(
                     handle,
@@ -1052,7 +1206,7 @@ def start_turn_via_ipc(
                     result["recovery_method"] = recovery_method
                 return result
             except IPCNoClientFoundError:
-                if attempt >= 2:
+                if attempt >= (max_attempts - 1):
                     if allow_ui_recovery:
                         detail = (
                             "IPC owner client for the selected thread was not discovered even after "
@@ -1076,16 +1230,552 @@ def start_turn_via_ipc(
                     except Exception as exc:
                         last_activation_error = str(exc)
 
-                time.sleep(0.75 * (attempt + 1))
+                time.sleep(retry_sleep_base * (attempt + 1))
                 discovered_owner = _discover_owner_client_for_thread(
                     handle,
                     thread.id,
-                    timeout_sec=max(2.0, min(timeout_sec, 6.0)),
+                    timeout_sec=discover_timeout_sec,
                 )
                 if discovered_owner:
                     owner_clients[thread.id] = discovered_owner
     finally:
         kernel32.CloseHandle(handle)
+
+
+def resolve_codex_app_server_executable() -> str:
+    if CODEX_APP_SERVER_EXE:
+        return CODEX_APP_SERVER_EXE
+
+    bundled_name = "codex.exe" if os.name == "nt" else "codex"
+    bundled_path = CODEX_HOME / ".sandbox-bin" / bundled_name
+    if bundled_path.exists():
+        return str(bundled_path)
+
+    for candidate in ("codex", "codex.exe"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    return bundled_name
+
+
+class CodexAppServerSidecar:
+    def __init__(self) -> None:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self.process = subprocess.Popen(
+            [resolve_codex_app_server_executable(), "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+        if self.process.stdin is None or self.process.stdout is None:
+            self.close()
+            raise RuntimeError("Failed to start the Codex app-server sidecar.")
+
+        self._stdout_queue: queue.Queue[str | None] = queue.Queue()
+        self._stdout_thread = threading.Thread(target=self._drain_stdout, daemon=True)
+        self._stdout_thread.start()
+        self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "codex-desktop-bridge",
+                    "version": "1.0",
+                }
+            },
+            timeout_sec=5.0,
+        )
+
+    def __enter__(self) -> "CodexAppServerSidecar":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _drain_stdout(self) -> None:
+        try:
+            assert self.process.stdout is not None
+            for raw_line in self.process.stdout:
+                self._stdout_queue.put(raw_line.rstrip("\r\n"))
+        finally:
+            self._stdout_queue.put(None)
+
+    def close(self) -> None:
+        stdin = self.process.stdin
+        if stdin is not None and not stdin.closed:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+
+        if self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1.5)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+
+    def request(self, method: str, params: dict, *, timeout_sec: float = 10.0) -> dict:
+        if self.process.poll() is not None:
+            raise RuntimeError(f"Codex app-server sidecar exited with code {self.process.returncode}.")
+
+        assert self.process.stdin is not None
+        request_id = str(uuid.uuid4())
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.process.stdin.flush()
+
+        deadline = time.time() + max(timeout_sec, 0.0)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for app-server response to {method}.")
+            try:
+                raw_line = self._stdout_queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError(f"Timed out waiting for app-server response to {method}.") from exc
+
+            if raw_line is None:
+                raise RuntimeError(f"Codex app-server sidecar exited while waiting for {method}.")
+
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                error = message.get("error") or {}
+                if isinstance(error, dict):
+                    detail = str(error.get("message") or error)
+                else:
+                    detail = str(error)
+                raise CodexSidecarError(f"{method} failed: {detail}")
+            result = message.get("result") or {}
+            if not isinstance(result, dict):
+                raise RuntimeError(f"{method} returned an invalid payload.")
+            return result
+
+    def start_thread(self, cwd: str | None) -> dict:
+        params: dict[str, object] = {}
+        if cwd:
+            params["cwd"] = cwd
+        return self.request("thread/start", params, timeout_sec=10.0)
+
+    def read_thread(self, thread_id: str, *, include_turns: bool = False) -> dict:
+        return self.request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": include_turns},
+            timeout_sec=8.0,
+        )
+
+    def resume_thread(self, thread_id: str) -> dict:
+        return self.request("thread/resume", {"threadId": thread_id}, timeout_sec=10.0)
+
+    def start_turn(self, thread_id: str, prompt: str) -> dict:
+        return self.request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+            },
+            timeout_sec=12.0,
+        )
+
+    def interrupt_turn(self, thread_id: str, turn_id: str) -> dict:
+        return self.request(
+            "turn/interrupt",
+            {
+                "threadId": thread_id,
+                "turnId": turn_id,
+            },
+            timeout_sec=10.0,
+        )
+
+    def clean_background_terminals(self, thread_id: str) -> dict:
+        return self.request(
+            "thread/backgroundTerminals/clean",
+            {"threadId": thread_id},
+            timeout_sec=10.0,
+        )
+
+    def archive_thread(self, thread_id: str) -> dict:
+        return self.request("thread/archive", {"threadId": thread_id}, timeout_sec=10.0)
+
+
+def load_thread_record_by_id(thread_id: str) -> tuple[ThreadInfo, bool] | None:
+    if not STATE_DB_PATH.exists():
+        return None
+    query = """
+        SELECT id, title, cwd, updated_at, rollout_path, model, reasoning_effort, tokens_used, archived
+        FROM threads
+        WHERE id = ?
+        LIMIT 1
+    """
+    with connect_readonly(STATE_DB_PATH) as conn:
+        row = conn.execute(query, (thread_id,)).fetchone()
+    if row is None:
+        return None
+
+    thread = ThreadInfo(
+        id=row[0],
+        title=row[1] or "",
+        cwd=row[2] or "",
+        updated_at=row[3] or 0,
+        rollout_path=row[4] or "",
+        model=row[5] or "",
+        reasoning_effort=row[6] or "",
+        tokens_used=row[7] or 0,
+    )
+    return thread, bool(row[8])
+
+
+def wait_for_thread_record(
+    thread_id: str,
+    *,
+    archived: bool | None = None,
+    timeout_sec: float = 8.0,
+) -> tuple[ThreadInfo, bool] | None:
+    deadline = time.time() + max(timeout_sec, 0.0)
+    while time.time() < deadline:
+        record = load_thread_record_by_id(thread_id)
+        if record is not None:
+            thread, is_archived = record
+            if archived is None or is_archived == archived:
+                return thread, is_archived
+        time.sleep(0.2)
+    return None
+
+
+def is_path_within_directory(path: Path, directory: Path) -> bool:
+    candidate = Path(strip_windows_extended_prefix(str(path))).expanduser().resolve(strict=False)
+    root = Path(strip_windows_extended_prefix(str(directory))).expanduser().resolve(strict=False)
+    try:
+        return os.path.commonpath([str(candidate), str(root)]) == str(root)
+    except ValueError:
+        return False
+
+
+def sqlite_backup_to_path(source: Path, destination: Path) -> bool:
+    if not source.exists():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with connect_writable(source) as src, connect_writable(destination) as dst:
+        src.backup(dst)
+    return True
+
+
+def copy_file_to_backup(source: Path, destination: Path) -> bool:
+    if not source.exists():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return True
+
+
+def create_archive_delete_backup_dir(thread_id: str) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    backup_dir = MAINTENANCE_BACKUP_ROOT / f"delete-archive-{stamp}-{thread_id[:8]}"
+    if backup_dir.exists():
+        backup_dir = backup_dir.with_name(f"{backup_dir.name}-{uuid.uuid4().hex[:6]}")
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    return backup_dir
+
+
+def backup_archive_delete_inputs(backup_dir: Path) -> list[Path]:
+    copied: list[Path] = []
+    if sqlite_backup_to_path(STATE_DB_PATH, backup_dir / STATE_DB_PATH.name):
+        copied.append(backup_dir / STATE_DB_PATH.name)
+    if sqlite_backup_to_path(LOG_DB_PATH, backup_dir / LOG_DB_PATH.name):
+        copied.append(backup_dir / LOG_DB_PATH.name)
+    for source in (GLOBAL_STATE_PATH, BRIDGE_STATE_PATH, SESSION_INDEX_PATH):
+        destination = backup_dir / source.name
+        if copy_file_to_backup(source, destination):
+            copied.append(destination)
+    return copied
+
+
+def scrub_bridge_state_deleted_thread(thread_id: str) -> list[str]:
+    data = load_bridge_state()
+    changed: list[str] = []
+    if data.get("selected_thread_id") == thread_id:
+        data.pop("selected_thread_id", None)
+        changed.append("selected_thread_id")
+    recent_ui_thread = data.get("recent_ui_thread")
+    if isinstance(recent_ui_thread, dict) and str(recent_ui_thread.get("thread_id") or "") == thread_id:
+        data.pop("recent_ui_thread", None)
+        changed.append("recent_ui_thread")
+    if changed:
+        save_bridge_state(data)
+    return changed
+
+
+def scrub_global_state_deleted_thread(thread_id: str) -> list[str]:
+    if not GLOBAL_STATE_PATH.exists():
+        return []
+    data = load_json(GLOBAL_STATE_PATH)
+    changed: list[str] = []
+    queued_follow_ups = data.get("queued-follow-ups")
+    if isinstance(queued_follow_ups, dict) and thread_id in queued_follow_ups:
+        queued_follow_ups.pop(thread_id, None)
+        changed.append("queued-follow-ups")
+    pinned_thread_ids = data.get("pinned-thread-ids")
+    if isinstance(pinned_thread_ids, list):
+        filtered = [item for item in pinned_thread_ids if str(item) != thread_id]
+        if len(filtered) != len(pinned_thread_ids):
+            data["pinned-thread-ids"] = filtered
+            changed.append("pinned-thread-ids")
+    if changed:
+        save_json(GLOBAL_STATE_PATH, data)
+    return changed
+
+
+def scrub_session_index_deleted_thread(thread_id: str) -> int:
+    if not SESSION_INDEX_PATH.exists():
+        return 0
+    original = SESSION_INDEX_PATH.read_text(encoding="utf-8")
+    kept_lines: list[str] = []
+    removed = 0
+    for raw_line in original.splitlines():
+        line = raw_line.strip()
+        if not line:
+            kept_lines.append(raw_line)
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            kept_lines.append(raw_line)
+            continue
+        if str(payload.get("id") or "") == thread_id:
+            removed += 1
+            continue
+        kept_lines.append(raw_line)
+    if removed:
+        rewritten = "\n".join(kept_lines)
+        if original.endswith(("\n", "\r")) and rewritten:
+            rewritten += "\n"
+        SESSION_INDEX_PATH.write_text(rewritten, encoding="utf-8")
+    return removed
+
+
+def delete_archived_thread_locally(thread: ThreadInfo) -> dict[str, object]:
+    rollout_path = Path(strip_windows_extended_prefix(thread.rollout_path)).expanduser()
+    if not is_path_within_directory(rollout_path, ARCHIVED_SESSIONS_DIR):
+        raise RuntimeError(
+            "Refusing to delete an archived thread whose rollout path is outside the archived_sessions directory."
+        )
+
+    record = load_thread_record_by_id(thread.id)
+    if record is None:
+        raise RuntimeError("The archived thread no longer exists in the local state DB.")
+    _thread_record, is_archived = record
+    if not is_archived:
+        raise RuntimeError("Refusing to delete an active thread. Only archived threads can be deleted.")
+
+    backup_dir = create_archive_delete_backup_dir(thread.id)
+    backup_paths = backup_archive_delete_inputs(backup_dir)
+
+    with connect_writable(STATE_DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            DELETE FROM thread_spawn_edges
+            WHERE child_thread_id = ?
+               OR parent_thread_id = ?
+            """,
+            (thread.id, thread.id),
+        )
+        deleted_rows = conn.execute("DELETE FROM threads WHERE id = ?", (thread.id,)).rowcount
+        if deleted_rows != 1:
+            conn.rollback()
+            raise RuntimeError("Archived thread deletion aborted because the target row changed during deletion.")
+        conn.commit()
+
+    deleted_log_rows = 0
+    if LOG_DB_PATH.exists():
+        with connect_writable(LOG_DB_PATH) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            deleted_log_rows = conn.execute("DELETE FROM logs WHERE thread_id = ?", (thread.id,)).rowcount
+            conn.commit()
+
+    bridge_state_scrubbed = scrub_bridge_state_deleted_thread(thread.id)
+    global_state_scrubbed = scrub_global_state_deleted_thread(thread.id)
+    session_index_removed = scrub_session_index_deleted_thread(thread.id)
+
+    deleted_rollout_path = ""
+    if rollout_path.exists():
+        rollout_path.unlink()
+        deleted_rollout_path = str(rollout_path)
+
+    if load_thread_record_by_id(thread.id) is not None:
+        raise RuntimeError("Archived thread row is still present after deletion.")
+
+    remaining_log_rows = 0
+    if LOG_DB_PATH.exists():
+        with connect_readonly(LOG_DB_PATH) as conn:
+            remaining_log_rows = int(conn.execute("SELECT COUNT(*) FROM logs WHERE thread_id = ?", (thread.id,)).fetchone()[0] or 0)
+    if remaining_log_rows:
+        raise RuntimeError("Archived thread logs are still present after deletion.")
+
+    if rollout_path.exists():
+        raise RuntimeError("Archived rollout file is still present after deletion.")
+
+    return {
+        "backup_dir": backup_dir,
+        "backup_paths": backup_paths,
+        "deleted_log_rows": deleted_log_rows,
+        "deleted_rollout_path": deleted_rollout_path or str(rollout_path),
+        "bridge_state_scrubbed": bridge_state_scrubbed,
+        "global_state_scrubbed": global_state_scrubbed,
+        "session_index_removed": session_index_removed,
+    }
+
+
+def resolve_new_thread_cwd(cwd: str | None) -> str:
+    target_source = str(cwd or "").strip()
+    if not target_source:
+        try:
+            target_source = strip_windows_extended_prefix(choose_thread(None, None).cwd)
+        except Exception:
+            target_source = ""
+    if not target_source:
+        target_source = os.getcwd()
+
+    target = Path(target_source).expanduser()
+    if not target.is_absolute():
+        target = target.resolve()
+    if not target.exists():
+        raise RuntimeError(f"New-thread cwd does not exist: {target}")
+    if not target.is_dir():
+        raise RuntimeError(f"New-thread cwd is not a directory: {target}")
+    return str(target)
+
+
+def get_sidecar_thread_status_type(thread_payload: dict) -> str:
+    status = thread_payload.get("status") or {}
+    if isinstance(status, dict):
+        return str(status.get("type") or "").strip()
+    return ""
+
+
+def ensure_thread_loaded_via_sidecar(client: CodexAppServerSidecar, thread_id: str) -> dict:
+    thread_payload = (client.read_thread(thread_id, include_turns=False).get("thread") or {})
+    if get_sidecar_thread_status_type(thread_payload) != "notLoaded":
+        return thread_payload
+    resumed = client.resume_thread(thread_id)
+    resumed_thread = resumed.get("thread") or {}
+    if not isinstance(resumed_thread, dict):
+        raise RuntimeError("thread/resume did not return a thread payload.")
+    return resumed_thread
+
+
+def get_in_progress_turn_id(thread_payload: dict) -> str | None:
+    turns = thread_payload.get("turns") or []
+    if not isinstance(turns, list):
+        return None
+    for turn in reversed(turns):
+        if not isinstance(turn, dict):
+            continue
+        turn_id = str(turn.get("id") or "").strip()
+        status = str(turn.get("status") or "").strip()
+        if turn_id and status == "inProgress":
+            return turn_id
+    return None
+
+
+def interrupt_thread_via_sidecar(thread: ThreadInfo) -> bool:
+    with CodexAppServerSidecar() as client:
+        ensure_thread_loaded_via_sidecar(client, thread.id)
+        thread_payload = (client.read_thread(thread.id, include_turns=True).get("thread") or {})
+        turn_id = get_in_progress_turn_id(thread_payload)
+        if turn_id:
+            client.interrupt_turn(thread.id, turn_id)
+            return True
+        client.clean_background_terminals(thread.id)
+        return True
+
+
+def is_transient_sidecar_attach_error(exc: Exception) -> bool:
+    detail = str(exc).lower()
+    return "thread not found" in detail or "no rollout found" in detail
+
+
+def start_turn_via_sidecar(
+    thread: ThreadInfo,
+    prompt: str,
+    *,
+    timeout_sec: float = 10.0,
+    keep_client_open: bool = False,
+) -> dict[str, object]:
+    deadline = time.time() + max(timeout_sec, 0.0)
+    attempt = 0
+    last_error = ""
+    while True:
+        attempt += 1
+        client: CodexAppServerSidecar | None = None
+        keep_open = False
+        try:
+            client = CodexAppServerSidecar()
+            ensure_thread_loaded_via_sidecar(client, thread.id)
+            result = client.start_turn(thread.id, prompt)
+            turn = result.get("turn") or {}
+            payload: dict[str, object] = {
+                "owner_client_id": "",
+                "turn_id": str(turn.get("id") or "").strip(),
+                "attempts": str(attempt),
+            }
+            if keep_client_open:
+                payload["_client"] = client
+                keep_open = True
+            return payload
+        except Exception as exc:
+            last_error = str(exc)
+            if time.time() >= deadline or not is_transient_sidecar_attach_error(exc):
+                raise RuntimeError(
+                    "Local sidecar could not attach to the selected thread in time. "
+                    f"Last error: {last_error}"
+                ) from exc
+            time.sleep(min(0.5 * attempt, 1.5))
+        finally:
+            if client is not None and not keep_open:
+                client.close()
+
+
+def spawn_background_new_thread_runner(prompt: str, cwd: str) -> subprocess.Popen:
+    creationflags = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "DETACHED_PROCESS", 0)
+    )
+    return subprocess.Popen(
+        [
+            resolve_codex_app_server_executable(),
+            "debug",
+            "app-server",
+            "send-message-v2",
+            prompt,
+        ],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
 
 
 def extract_user_text_from_event(event: dict) -> str:
@@ -1443,7 +2133,7 @@ def ensure_codex_composer_focus(attempts: int = 4) -> bool:
     return False
 
 
-def activate_thread_by_sidebar(thread_name: str, project_name: str | None = None) -> str:
+def _legacy_activate_thread_by_sidebar(thread_name: str, project_name: str | None = None) -> str:
     if not thread_name.strip():
         raise RuntimeError("Missing thread_name for sidebar activation.")
 
@@ -2325,28 +3015,47 @@ def send_hotkey(*keys: int) -> None:
     time.sleep(0.05)
 
 
+def wait_for_new_thread(previous_ids: set[str], timeout_sec: float = 8.0) -> ThreadInfo | None:
+    deadline = time.time() + max(timeout_sec, 0.0)
+    scan_limit = max(20, len(previous_ids) + 5)
+    while time.time() < deadline:
+        for thread in load_recent_threads(limit=scan_limit):
+            if thread.id not in previous_ids:
+                return thread
+        time.sleep(0.25)
+    return None
+
+
 def cancel_codex_reply_if_busy(timeout_sec: float = 3.0) -> tuple[list[str], list[str]]:
     busy_before = get_busy_threads(limit=50)
     if not busy_before:
         return [], []
 
     labels_before = [get_thread_label(thread) for thread in busy_before]
-    try:
-        focus_window(find_codex_window())
-    except Exception:
+    selected_thread_id = get_selected_thread_id()
+    target_thread = None
+    if selected_thread_id:
+        for thread in busy_before:
+            if thread.id == selected_thread_id:
+                target_thread = thread
+                break
+    if target_thread is None and len(busy_before) == 1:
+        target_thread = busy_before[0]
+
+    if target_thread is None:
         return labels_before, labels_before
 
-    for _ in range(2):
-        send_key_event(VK_ESCAPE, keyup=False)
-        send_key_event(VK_ESCAPE, keyup=True)
-        time.sleep(0.12)
+    try:
+        interrupt_thread_via_sidecar(target_thread)
+    except Exception:
+        return labels_before, labels_before
 
     deadline = time.time() + timeout_sec
     remaining_threads = busy_before
     while time.time() < deadline:
         remaining_threads = get_busy_threads(limit=50)
-        if not remaining_threads:
-            return labels_before, []
+        if not any(thread.id == target_thread.id for thread in remaining_threads):
+            return labels_before, [get_thread_label(thread) for thread in remaining_threads]
         time.sleep(0.2)
 
     return labels_before, [get_thread_label(thread) for thread in remaining_threads]
@@ -2403,13 +3112,45 @@ def print_thread_list(threads: list[ThreadInfo]) -> None:
         workspace = workspace_refs.get(thread.id, get_thread_workspace_name(thread))
         busy = is_thread_busy(Path(thread.rollout_path))
         state = "busy" if busy else "idle"
-        line = f"{marker}{index:>2} | {workspace:<12} | {state:<4} | {thread.id} | {format_timestamp(thread.updated_at)} | {summary}"
+        context_usage = get_thread_context_usage(thread)
+        if context_usage is None:
+            ctx_display = "-/-"
+        else:
+            ctx_display = (
+                f"{format_token_k(context_usage.last_input_tokens)}/"
+                f"{format_token_k(context_usage.peak_input_tokens)}"
+            )
+        used_display = format_token_k(thread.tokens_used)
+        rec_display = "archive" if should_recommend_archive(thread, context_usage) else "-"
+        line = (
+            f"{marker}{index:>2} | {workspace:<12} | {state:<4} | "
+            f"ctx {ctx_display:>15} | used {used_display:>7} | rec {rec_display:<7} | "
+            f"{thread.id} | {format_timestamp(thread.updated_at)} | {summary}"
+        )
+        print(make_console_safe_text(line))
+
+
+def print_archived_thread_list(threads: list[ThreadInfo]) -> None:
+    selected_thread_id = get_selected_thread_id()
+    workspace_refs = build_workspace_ref_map(threads)
+    for index, thread in enumerate(threads, start=1):
+        marker = "*" if thread.id == selected_thread_id else " "
+        summary = collapse_list_text(thread.title, limit=70)
+        workspace = workspace_refs.get(thread.id, get_thread_workspace_name(thread))
+        archived_at = format_timestamp(thread.archived_at or thread.updated_at)
+        line = f"{marker}{index:>2} | {workspace:<12} | {thread.id} | {archived_at} | {summary}"
         print(make_console_safe_text(line))
 
 
 def command_list(args: argparse.Namespace) -> int:
     threads = load_recent_threads(limit=args.limit)
     print_thread_list(threads)
+    return 0
+
+
+def command_archived_list(args: argparse.Namespace) -> int:
+    threads = load_archived_threads(limit=args.limit)
+    print_archived_thread_list(threads)
     return 0
 
 
@@ -2497,15 +3238,18 @@ def command_doctor(args: argparse.Namespace) -> int:
 
     try:
         window = find_codex_window()
+        safe_title = make_console_safe_text(window.title)
         print(f"codex_window_found: True")
-        print(f"codex_window_title: {window.title}")
+        print(f"codex_window_title: {safe_title}")
         print(
-            "codex_window_rect: "
-            f"({window.left},{window.top})-({window.right},{window.bottom})"
+            make_console_safe_text(
+                "codex_window_rect: "
+                f"({window.left},{window.top})-({window.right},{window.bottom})"
+            )
         )
     except Exception as exc:
         print("codex_window_found: False")
-        print(f"codex_window_error: {exc}")
+        print(f"codex_window_error: {make_console_safe_text(str(exc))}")
 
     busy_threads = get_busy_threads(limit=max(10, args.limit))
     if busy_threads:
@@ -2526,10 +3270,139 @@ def command_focus(args: argparse.Namespace) -> int:
         print(f"clicked: {x},{y}")
         composer_focused = ensure_codex_composer_focus() or composer_focused
     print(
-        f"focused_window: hwnd={window.hwnd} title={window.title} "
-        f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
+        make_console_safe_text(
+            f"focused_window: hwnd={window.hwnd} title={window.title} "
+            f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
+        )
     )
     print(f"composer_focused: {composer_focused}")
+    return 0
+
+
+def command_new(args: argparse.Namespace) -> int:
+    cancelled_labels: list[str] = []
+    cancel_remaining: list[str] = []
+    if args.abort:
+        cancelled_labels, cancel_remaining = cancel_codex_reply_if_busy(timeout_sec=3.0)
+
+    target_cwd = resolve_new_thread_cwd(args.cwd)
+    prompt = args.prompt or ""
+    if not prompt:
+        raise RuntimeError(
+            "Background `new` requires an initial prompt. The local runner only persists a new thread once the first "
+            "message is sent."
+        )
+
+    previous_ids = {thread.id for thread in load_recent_threads(limit=0)}
+    runner = spawn_background_new_thread_runner(prompt, target_cwd)
+    thread = wait_for_new_thread(previous_ids, timeout_sec=args.create_timeout)
+    if thread is None:
+        exit_code = runner.poll()
+        if exit_code is None:
+            raise RuntimeError(
+                "Background new-thread runner started, but a new persisted thread did not appear in local Codex state in time."
+            )
+        raise RuntimeError(
+            f"Background new-thread runner exited before a new thread appeared in local Codex state (exit={exit_code})."
+        )
+
+    set_selected_thread_id(thread.id)
+
+    print(f"selected_thread: {thread.id}")
+    print(f"target_thread: {thread.id}")
+    print(f"title: {format_title_preview(thread.title)}")
+    print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
+    print(f"cwd: {thread.cwd or target_cwd}")
+    print("transport: local-sidecar runner (debug app-server send-message-v2)")
+    if cancelled_labels:
+        print(f"reply_abort_requested: {', '.join(cancelled_labels)}")
+        if cancel_remaining:
+            print(f"reply_abort_pending: {', '.join(cancel_remaining)}")
+
+    session_path = Path(thread.rollout_path)
+    if session_path.exists():
+        delivered_thread = wait_for_prompt_delivery(
+            {thread.id: (thread, session_path, 0)},
+            prompt,
+            timeout_sec=6.0,
+        )
+        if delivered_thread is None:
+            raise RuntimeError(
+                "Prompt delivery could not be confirmed in the newly created thread."
+            )
+        print(f"[delivery_verified] {get_thread_label(thread)}")
+
+    sync_session_index_with_state()
+    print(f"[background_runner_pid] {runner.pid}")
+    return 0
+
+
+def command_archive(args: argparse.Namespace) -> int:
+    if getattr(args, "thread_ref", None):
+        thread = resolve_thread_ref(args.thread_ref)
+    else:
+        thread = choose_thread(args.thread_id, args.cwd)
+
+    session_path = Path(thread.rollout_path)
+    if session_path.exists() and is_thread_busy(session_path):
+        raise RuntimeError(
+            "The selected thread is still busy. Wait for it to finish before archiving it."
+        )
+
+    with CodexAppServerSidecar() as client:
+        client.archive_thread(thread.id)
+
+    archived_record = wait_for_thread_record(thread.id, archived=True, timeout_sec=args.timeout)
+    if archived_record is None:
+        raise RuntimeError(
+            "thread/archive returned, but the thread did not appear as archived in local Codex state in time."
+        )
+    archived_thread, _archived = archived_record
+
+    if get_selected_thread_id() == thread.id:
+        set_selected_thread_id(None)
+        print("selected_thread: cleared")
+
+    sync_session_index_with_state()
+    print(f"archived_thread: {thread.id}")
+    print(f"title: {format_title_preview(thread.title)}")
+    print(f"cwd: {thread.cwd}")
+    print(f"archived_rollout_path: {archived_thread.rollout_path}")
+    print("transport: local-sidecar thread/archive")
+    return 0
+
+
+def command_delete_archive(args: argparse.Namespace) -> int:
+    thread = resolve_archived_thread_ref(args.thread_ref, limit=0)
+    print(f"thread_id: {thread.id}")
+    print(f"title: {format_title_preview(thread.title)}")
+    print(f"cwd: {thread.cwd}")
+    print(f"archived_at: {format_timestamp(thread.archived_at or thread.updated_at)}")
+    print(f"rollout_path: {thread.rollout_path}")
+    if not args.confirm:
+        print("delete_mode: preview")
+        print(f"rerun: delete_archive --confirm {thread.id}")
+        return 0
+
+    result = delete_archived_thread_locally(thread)
+    sync_session_index_with_state()
+    print("delete_mode: confirmed")
+    print(f"deleted_log_rows: {result['deleted_log_rows']}")
+    print(f"deleted_rollout_path: {result['deleted_rollout_path']}")
+    print(f"backup_dir: {result['backup_dir']}")
+    backup_paths = result.get("backup_paths") or []
+    if backup_paths:
+        print("backup_files:")
+        for path in backup_paths:
+            print(f"- {path}")
+    bridge_state_scrubbed = result.get("bridge_state_scrubbed") or []
+    if bridge_state_scrubbed:
+        print(f"bridge_state_scrubbed: {', '.join(bridge_state_scrubbed)}")
+    global_state_scrubbed = result.get("global_state_scrubbed") or []
+    if global_state_scrubbed:
+        print(f"global_state_scrubbed: {', '.join(global_state_scrubbed)}")
+    session_index_removed = int(result.get("session_index_removed") or 0)
+    print(f"session_index_removed: {session_index_removed}")
     return 0
 
 
@@ -2689,117 +3562,155 @@ def command_ask(args: argparse.Namespace) -> int:
         )
 
     start_offset = session_path.stat().st_size
-    if args.ipc:
-        print("ui_activation: ipc-thread-follower-start-turn")
-        ipc_result = start_turn_via_ipc(
-            thread,
-            prompt,
-            timeout_sec=10.0,
-            allow_ui_recovery=args.ipc_recover_ui,
-        )
-        print(f"[delivery_verified] {get_thread_label(thread)}")
-        if ipc_result.get("recovery_method"):
-            print(f"[ipc_recovery] {ipc_result['recovery_method']}")
-        print(
-            f"[ipc_delivery] owner_client={ipc_result['owner_client_id']} "
-            f"turn_id={ipc_result['turn_id'] or '-'}"
-        )
-    else:
-        recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
-        if args.switch_thread:
-            activation_method = activate_thread_in_ui(thread)
-        else:
-            verified_by = verify_thread_in_ui(thread)
-            if not verified_by:
-                raise RuntimeError(
-                    "The selected thread is not confirmed as the currently open Codex thread. "
-                    "Refusing to paste because it could create a new chat instead. "
-                    "Open the thread first or rerun with --switch-thread."
-                )
-            activation_method = f"already-open [{verified_by}]"
-        print(f"ui_activation: {activation_method}")
-        window = send_prompt_to_codex(
-            prompt=prompt,
-            click_x_ratio=args.click_x_ratio,
-            click_y_offset=args.click_y_offset,
-            skip_click=not args.click,
-        )
-        print(
-            f"sent_to_window: hwnd={window.hwnd} title={window.title} "
-            f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
-        )
-
-        delivered_thread = wait_for_prompt_delivery(recent_offsets, prompt, timeout_sec=4.0)
-        if delivered_thread is None:
-            raise RuntimeError(
-                "Prompt delivery could not be confirmed in any recent Codex thread. "
-                "The UI likely moved, but the message was not recorded."
-            )
-        if delivered_thread.id != thread.id:
-            raise RuntimeError(
-                "Prompt landed in a different thread. "
-                f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
-            )
-        print(f"[delivery_verified] {get_thread_label(thread)}")
-
-    if args.background:
-        started = start_background_watch(
-            thread=thread,
-            start_offset=start_offset,
-            timeout_sec=args.timeout,
-            include_commentary=args.include_commentary,
-            stream_output=args.stream,
-        )
-        if started:
-            print(f"[background_watch_started] {get_thread_label(thread)}")
-        else:
-            print(f"[background_watch_already_running] {get_thread_label(thread)}")
-        return 0
-
-    if not args.wait:
-        return 0
-
-    print("[waiting_for_final_answer]")
-    print("Use Ctrl+C to stop waiting after the prompt is sent.")
-
+    recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
+    sidecar_client: CodexAppServerSidecar | None = None
     try:
-        result = watch_for_final_answer(
-            session_path=session_path,
-            start_offset=start_offset,
-            timeout_sec=args.timeout,
-            include_commentary=args.include_commentary,
-            stream_live=args.stream,
-        )
-    except KeyboardInterrupt:
-        print("[wait_cancelled]")
-        print("Prompt was already sent. Waiting stopped by user.")
-        print("Use `status` or `tail --only-new` to monitor the same thread.")
-        return 0
-
-    if args.include_commentary and result["commentary"] and not result.get("streamed_live"):
-        for item in result["commentary"]:
-            print("[commentary]")
-            print(item)
-            print("")
-
-    if result["final_answer"]:
-        if result.get("streamed_live"):
-            print("[ready]")
+        if args.ipc:
+            print("ui_activation: ipc-thread-follower-start-turn")
+            ipc_result: dict[str, object]
+            try:
+                ipc_result = start_turn_via_ipc(
+                    thread,
+                    prompt,
+                    timeout_sec=10.0,
+                    allow_ui_recovery=args.ipc_recover_ui,
+                )
+            except RuntimeError as exc:
+                if "IPC owner client for the selected thread was not discovered" not in str(exc):
+                    raise
+                ipc_result = start_turn_via_sidecar(
+                    thread,
+                    prompt,
+                    timeout_sec=10.0,
+                    keep_client_open=not args.background,
+                )
+                maybe_client = ipc_result.pop("_client", None)
+                if isinstance(maybe_client, CodexAppServerSidecar):
+                    sidecar_client = maybe_client
+                ipc_result["fallback_transport"] = "local-sidecar"
+            delivered_thread = wait_for_prompt_delivery(recent_offsets, prompt, timeout_sec=6.0)
+            if delivered_thread is None:
+                raise RuntimeError(
+                    "Prompt delivery could not be confirmed in any recent Codex thread after IPC delivery. "
+                    "The transport reported success, but no matching user message was recorded."
+                )
+            if delivered_thread.id != thread.id:
+                raise RuntimeError(
+                    "Prompt landed in a different thread after IPC delivery. "
+                    f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
+                )
+            print(f"[delivery_verified] {get_thread_label(thread)}")
+            if ipc_result.get("fallback_transport"):
+                print(
+                    f"[ipc_fallback] transport={ipc_result['fallback_transport']} "
+                    f"attempts={ipc_result.get('attempts', '-')}"
+                )
+            if ipc_result.get("recovery_method"):
+                print(f"[ipc_recovery] {ipc_result['recovery_method']}")
+            print(
+                f"[ipc_delivery] owner_client={ipc_result['owner_client_id']} "
+                f"turn_id={ipc_result['turn_id'] or '-'}"
+            )
         else:
-            print("[final_answer]")
-            print(result["final_answer"])
-            print("")
-            print("[ready]")
-        return 0
+            if args.switch_thread:
+                activation_method = activate_thread_in_ui(thread)
+            else:
+                verified_by = verify_thread_in_ui(thread)
+                if not verified_by:
+                    raise RuntimeError(
+                        "The selected thread is not confirmed as the currently open Codex thread. "
+                        "Refusing to paste because it could create a new chat instead. "
+                        "Open the thread first or rerun with --switch-thread."
+                    )
+                activation_method = f"already-open [{verified_by}]"
+            print(f"ui_activation: {activation_method}")
+            window = send_prompt_to_codex(
+                prompt=prompt,
+                click_x_ratio=args.click_x_ratio,
+                click_y_offset=args.click_y_offset,
+                skip_click=not args.click,
+            )
+            print(
+                make_console_safe_text(
+                    f"sent_to_window: hwnd={window.hwnd} title={window.title} "
+                    f"rect=({window.left},{window.top})-({window.right},{window.bottom})"
+                )
+            )
 
-    if result["status"] == "aborted":
-        print("[aborted]")
-        return 0
+            delivered_thread = wait_for_prompt_delivery(recent_offsets, prompt, timeout_sec=4.0)
+            if delivered_thread is None:
+                raise RuntimeError(
+                    "Prompt delivery could not be confirmed in any recent Codex thread. "
+                    "The UI likely moved, but the message was not recorded."
+                )
+            if delivered_thread.id != thread.id:
+                raise RuntimeError(
+                    "Prompt landed in a different thread. "
+                    f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
+                )
+            print(f"[delivery_verified] {get_thread_label(thread)}")
 
-    print("[timeout]")
-    if result["commentary"]:
-        print(result["commentary"][-1])
-    return 2
+        if args.background:
+            started = start_background_watch(
+                thread=thread,
+                start_offset=start_offset,
+                timeout_sec=args.timeout,
+                include_commentary=args.include_commentary,
+                stream_output=args.stream,
+            )
+            if started:
+                print(f"[background_watch_started] {get_thread_label(thread)}")
+            else:
+                print(f"[background_watch_already_running] {get_thread_label(thread)}")
+            return 0
+
+        if not args.wait:
+            return 0
+
+        print("[waiting_for_final_answer]")
+        print("Use Ctrl+C to stop waiting after the prompt is sent.")
+
+        try:
+            result = watch_for_final_answer(
+                session_path=session_path,
+                start_offset=start_offset,
+                timeout_sec=args.timeout,
+                include_commentary=args.include_commentary,
+                stream_live=args.stream,
+            )
+        except KeyboardInterrupt:
+            print("[wait_cancelled]")
+            print("Prompt was already sent. Waiting stopped by user.")
+            print("Use `status` or `tail --only-new` to monitor the same thread.")
+            return 0
+
+        if args.include_commentary and result["commentary"] and not result.get("streamed_live"):
+            for item in result["commentary"]:
+                print("[commentary]")
+                print(item)
+                print("")
+
+        if result["final_answer"]:
+            if result.get("streamed_live"):
+                print("[ready]")
+            else:
+                print("[final_answer]")
+                print(result["final_answer"])
+                print("")
+                print("[ready]")
+            return 0
+
+        if result["status"] == "aborted":
+            print("[aborted]")
+            return 0
+
+        print("[timeout]")
+        if result["commentary"]:
+            print(result["commentary"][-1])
+        return 2
+    finally:
+        if sidecar_client is not None:
+            sidecar_client.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2819,6 +3730,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_parser.add_argument("--limit", type=int, default=10)
     list_parser.set_defaults(func=command_list)
+
+    archived_list_parser = subparsers.add_parser(
+        "archived_list",
+        help="List archived local Codex Desktop threads.",
+    )
+    archived_list_parser.add_argument("--limit", type=int, default=10)
+    archived_list_parser.set_defaults(func=command_archived_list)
 
     status_parser = subparsers.add_parser(
         "status",
@@ -2844,6 +3762,57 @@ def build_parser() -> argparse.ArgumentParser:
     focus_parser.add_argument("--click-y-offset", type=int, default=90)
     focus_parser.add_argument("--click", action="store_true", help="Also click inside the window after focusing.")
     focus_parser.set_defaults(func=command_focus)
+
+    new_parser = subparsers.add_parser(
+        "new",
+        help="Create a new Codex thread through the local app-server sidecar.",
+    )
+    new_parser.add_argument("prompt", nargs="?", help="Optional first prompt for the new chat.")
+    new_parser.add_argument("--abort", action="store_true", help="Abort the currently running Codex reply first.")
+    new_parser.add_argument("--cwd", default=None, help="Working directory for the new thread. Defaults to the current shell cwd.")
+    new_parser.add_argument("--click-x-ratio", type=float, default=0.5)
+    new_parser.add_argument("--click-y-offset", type=int, default=90)
+    new_parser.add_argument("--click", action="store_true", help="Click inside the window before pasting.")
+    new_parser.add_argument(
+        "--create-timeout",
+        type=float,
+        default=8.0,
+        help="How long to wait for the newly created thread to appear in local state after sending a prompt.",
+    )
+    new_parser.set_defaults(func=command_new)
+
+    archive_parser = subparsers.add_parser(
+        "archive",
+        help="Archive a thread through the local app-server sidecar.",
+        parents=[common_parser],
+    )
+    archive_parser.add_argument(
+        "thread_ref",
+        nargs="?",
+        help="Optional workspace name, list index, `other`, or exact thread id.",
+    )
+    archive_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=8.0,
+        help="How long to wait for the archived state to appear in local Codex state.",
+    )
+    archive_parser.set_defaults(func=command_archive)
+
+    delete_archive_parser = subparsers.add_parser(
+        "delete_archive",
+        help="Delete a locally archived thread and its local traces.",
+    )
+    delete_archive_parser.add_argument(
+        "thread_ref",
+        help="Archived thread index, workspace ref, workspace name, or exact thread id.",
+    )
+    delete_archive_parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Actually delete the archived thread after previewing it.",
+    )
+    delete_archive_parser.set_defaults(func=command_delete_archive)
 
     tail_parser = subparsers.add_parser(
         "tail",
@@ -2962,11 +3931,31 @@ def split_repl_command(line: str) -> list[str]:
 
 
 def run_repl() -> int:
-    known_commands = {"list", "use", "status", "doctor", "focus", "tail", "open", "ask", "help", "exit", "quit"}
+    known_commands = {
+        "list",
+        "archived_list",
+        "use",
+        "status",
+        "doctor",
+        "focus",
+        "new",
+        "archive",
+        "delete_archive",
+        "tail",
+        "open",
+        "ask",
+        "help",
+        "exit",
+        "quit",
+    }
     print("Codex bridge shell")
-    print("Commands: list, open, ask, status, doctor, tail, focus, use, help, exit")
+    print("Commands: list, archived_list, open, use, new, archive, delete_archive, ask, status, doctor, tail, focus, help, exit")
     print("Primary flow: list -> open ai -> ask \"...\"")
     print("Example: open ai")
+    print('Example: new "테스트"')
+    print("Example: archive other")
+    print("Example: archived_list")
+    print("Example: delete_archive 1")
     print("Example: open --abort ai")
     print("Example: open other")
     print("Example: doctor")

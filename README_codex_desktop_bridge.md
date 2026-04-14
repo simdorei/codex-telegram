@@ -73,9 +73,14 @@ Optional:
 
 ## Main Commands
 
-- `list`: show recent threads
+- `list`: show recent active threads
+- `archived_list`: show archived threads
 - `open <ref>`: select and open a thread
 - `open --abort <ref>`: abort the current reply, then switch threads
+- `use <ref>`: persist the target thread without opening UI
+- `new "..."`: create a new thread and send the first prompt
+- `archive <ref>`: archive a thread
+- `delete_archive <ref>`: preview or delete an archived thread locally
 - `ask "..."`: send a prompt to the selected thread
 - `status`: show selected thread details
 - `tail --only-new`: watch raw session events
@@ -113,16 +118,29 @@ $env:TELEGRAM_ALLOWED_CHAT_IDS = '123456789'
 
 Telegram commands:
 
-- `/list`
-- `/open <ref>`
-- `/open_abort <ref>`
+- `/list [limit]`
+- `/archived_list [limit]`
+- `/new <prompt>`
+- `/archive [ref]`
+- `/delete_archive <ref>`
+- `/confirm_delete_archive <ref>`
+- `/use <ref>`
 - `/status [ref]`
 - `/doctor`
 - `/ask <prompt>`
-- `/abort`
+- `/ask_ipc <prompt> (alias)`
+- `/restart_bot`
 - `/chatid`
 
 Plain text messages are treated like `/ask <message>`.
+
+Recommended Telegram flow:
+
+1. `/list`
+2. `/use <ref>`
+3. Send `/ask <prompt>` or plain text
+
+Telegram no longer exposes `/open`; use `/use` to bind the target thread first.
 
 ## Thread References
 
@@ -136,7 +154,7 @@ Example:
 
 ```powershell
 list
-open ai:2
+use ai:2
 ask "Test"
 ```
 
@@ -144,17 +162,19 @@ If a workspace name is ambiguous, the bridge will tell you which refs to use.
 
 ## Default Behavior
 
-Default `ask` is foreground mode:
+Default REPL `ask` uses background IPC:
 
-- it streams commentary
-- it prints the final answer
-- it keeps the prompt occupied until the reply ends
+- it avoids UI paste by default
+- it can stream commentary when requested
+- plain text in the REPL is treated like `ask --stream --include-commentary "..."`
 
-Plain text in the REPL is treated like:
+Telegram `ask` also uses IPC by default.
 
-```powershell
-ask --no-switch-thread --stream --include-commentary "..."
-```
+`list` shows:
+
+- `ctx last/peak`: latest input context and historical peak input context
+- `used`: cumulative `tokens_used`
+- `rec archive`: shown when `used >= 50M` or either context value reaches `200k`
 
 ## Busy Safety
 

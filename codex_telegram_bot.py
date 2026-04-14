@@ -2,7 +2,7 @@
 Telegram adapter for codex_desktop_bridge.py.
 
 This uses the Telegram Bot HTTP API directly with the Python standard library.
-It keeps the Codex bridge in-process so background IPC ask/watch behavior stays alive.
+It keeps the Codex bridge in-process so ask/watch behavior stays alive.
 """
 
 from __future__ import annotations
@@ -36,8 +36,6 @@ ACTIVE_JOB_LOCK = threading.Lock()
 ACTIVE_JOB: dict[str, object] = {"thread": None, "chat_id": None, "summary": ""}
 PENDING_ASKS_LOCK = threading.Lock()
 PENDING_ASKS: list[dict[str, object]] = []
-OPEN_WAITERS_LOCK = threading.Lock()
-OPEN_WAITERS: dict[int, dict[str, object]] = {}
 ASK_WAITERS_LOCK = threading.Lock()
 ASK_WAITERS: dict[int, dict[str, object]] = {}
 SINGLE_INSTANCE_MUTEX = None
@@ -46,6 +44,28 @@ RESTART_SCHEDULED = False
 LOG_FILE_LOCK = threading.Lock()
 
 ERROR_ALREADY_EXISTS = 183
+TELEGRAM_HELP_LINES = [
+    "Commands / 명령",
+    "/list [limit]",
+    "/archived_list [limit]",
+    "/new <prompt>",
+    "/archive [ref]",
+    "/delete_archive <ref>",
+    "/confirm_delete_archive <ref>",
+    "/use <ref>",
+    "/status [ref]",
+    "/doctor",
+    "/ask <prompt>",
+    "/ask_ipc <prompt> (alias)",
+    "/restart_bot",
+    "/chatid",
+    "",
+    "Plain text works like /ask <message>.",
+    "일반 텍스트 메시지는 /ask <message>처럼 동작합니다.",
+    "",
+    "Thread refs follow the bridge format:",
+    "ai:1, ai:2, taxlab, other, 1, 2",
+]
 
 
 def acquire_single_instance_mutex(token: str | None = None) -> bool:
@@ -179,6 +199,51 @@ def send_text(token: str, chat_id: int, text: str, reply_to_message_id: int | No
         telegram_api("sendMessage", token, params=params)
 
 
+def build_help_message() -> str:
+    return "\n".join(TELEGRAM_HELP_LINES)
+
+
+def build_busy_queue_message(active_summary: str, position: int) -> str:
+    return "\n".join(
+        [
+            "Busy.",
+            "",
+            active_summary,
+            "",
+            f"Queued at position {position}.",
+            "현재 작업이 끝나면 자동으로 이어서 처리합니다.",
+        ]
+    )
+
+
+def send_usage(token: str, chat_id: int, reply_to_message_id: int | None, usage: str) -> None:
+    send_text(token, chat_id, f"Usage: {usage}", reply_to_message_id=reply_to_message_id)
+
+
+def send_bridge_command_result(
+    token: str,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    argv: list[str],
+    success_prefix: str,
+    failure_prefix: str | None = None,
+) -> tuple[int, str]:
+    exit_code, output = run_bridge_command(argv)
+    failed_prefix = failure_prefix or success_prefix
+    prefix = success_prefix if exit_code == 0 else f"{failed_prefix} (exit {exit_code})"
+    send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+    return exit_code, output
+
+
+def parse_bounded_int_arg(raw: str, *, default: int, minimum: int, maximum: int) -> int:
+    if not raw:
+        return default
+    try:
+        return max(minimum, min(maximum, int(raw)))
+    except ValueError:
+        return default
+
+
 def resolve_restart_python_exe() -> Path:
     current = Path(sys.executable).resolve()
     if current.name.lower() == "python.exe":
@@ -221,23 +286,6 @@ def schedule_bot_restart() -> tuple[bool, str]:
             name="codex-telegram-restart",
         ).start()
         return True, "Restart scheduled."
-
-
-IPC_RESTART_ERROR_MARKERS = (
-    "ipc owner client for the selected thread was not discovered",
-    "ipc start-turn failed:",
-    "ipc initialize failed:",
-    "timed out waiting for ipc response",
-    "pipe\\codex-ipc",
-    "no-client-found",
-)
-
-
-def should_restart_bot_after_ask_failure(output: str, use_ipc: bool) -> bool:
-    if not use_ipc:
-        return False
-    lowered = (output or "").lower()
-    return any(marker in lowered for marker in IPC_RESTART_ERROR_MARKERS)
 
 
 class LineStream(io.TextIOBase):
@@ -284,14 +332,14 @@ class TelegramAskRelay:
             self.block_lines = []
             return
         if self.mode == "commentary":
-            send_text(self.token, self.chat_id, f"진행중\n\n{text}", reply_to_message_id=self.reply_to_message_id)
+            send_text(self.token, self.chat_id, f"In progress\n\n{text}", reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
         elif self.mode == "final":
             send_text(self.token, self.chat_id, text, reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
             self.saw_final = True
         elif self.mode == "timeout":
-            send_text(self.token, self.chat_id, f"시간 초과\n\n{text}", reply_to_message_id=self.reply_to_message_id)
+            send_text(self.token, self.chat_id, f"Timed out\n\n{text}", reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
             self.saw_timeout = True
         self.block_lines = []
@@ -313,7 +361,7 @@ class TelegramAskRelay:
             self._send_block()
             self.mode = None
             self.saw_aborted = True
-            send_text(self.token, self.chat_id, "중단됨.", reply_to_message_id=self.reply_to_message_id)
+            send_text(self.token, self.chat_id, "Aborted.", reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
             return
         if line.startswith("[ready]"):
@@ -387,18 +435,6 @@ def resolve_status_args(ref: str | None) -> list[str]:
     return ["status", "--thread-id", thread.id]
 
 
-def abort_current_reply() -> tuple[int, str]:
-    cancelled, remaining = bridge.cancel_codex_reply_if_busy(timeout_sec=3.0)
-    if not cancelled:
-        return 0, "No active Codex reply to abort."
-    lines = [f"reply_abort_requested: {', '.join(cancelled)}"]
-    if remaining:
-        lines.append(f"reply_abort_pending: {', '.join(remaining)}")
-        return 1, "\n".join(lines)
-    lines.append("reply_abort_done")
-    return 0, "\n".join(lines)
-
-
 def get_active_job_summary() -> str:
     with ACTIVE_JOB_LOCK:
         thread = ACTIVE_JOB.get("thread")
@@ -415,12 +451,63 @@ def set_active_job(thread: threading.Thread | None, chat_id: int | None = None, 
         ACTIVE_JOB["summary"] = summary
 
 
+def resolve_selected_target() -> tuple[str | None, str, str]:
+    try:
+        target_thread = bridge.choose_thread(None, None)
+    except Exception:
+        return None, "", ""
+    return (
+        target_thread.id,
+        bridge.get_thread_workspace_ref(target_thread),
+        bridge.get_thread_label(target_thread),
+    )
+
+
+def start_or_queue_ask(
+    token: str,
+    chat_id: int,
+    prompt: str,
+    reply_to_message_id: int | None,
+    active_summary: str,
+    target_thread_id: str | None,
+    target_ref: str,
+    target_label: str,
+) -> None:
+    if active_summary:
+        position = enqueue_pending_ask(
+            chat_id,
+            prompt,
+            reply_to_message_id,
+            target_thread_id=target_thread_id,
+            target_ref=target_ref,
+            target_label=target_label,
+        )
+        send_text(
+            token,
+            chat_id,
+            build_busy_queue_message(active_summary, position),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    start_ask_worker(
+        token,
+        chat_id,
+        prompt,
+        reply_to_message_id,
+        target_thread_id=target_thread_id,
+        target_ref=target_ref,
+        target_label=target_label,
+    )
+
+
 def enqueue_pending_ask(
     chat_id: int,
     prompt: str,
     reply_to_message_id: int | None,
-    *,
-    use_ipc: bool = False,
+    target_thread_id: str | None = None,
+    target_ref: str = "",
+    target_label: str = "",
 ) -> int:
     with PENDING_ASKS_LOCK:
         PENDING_ASKS.append(
@@ -428,7 +515,9 @@ def enqueue_pending_ask(
                 "chat_id": chat_id,
                 "prompt": prompt,
                 "reply_to_message_id": reply_to_message_id,
-                "use_ipc": use_ipc,
+                "target_thread_id": target_thread_id,
+                "target_ref": target_ref,
+                "target_label": target_label,
             }
         )
         return len(PENDING_ASKS)
@@ -448,23 +537,30 @@ def start_ask_worker(
     reply_to_message_id: int | None,
     *,
     queued: bool = False,
-    use_ipc: bool = False,
+    target_thread_id: str | None = None,
+    target_ref: str = "",
+    target_label: str = "",
 ) -> bool:
+    if not target_thread_id:
+        target_thread_id, target_ref, target_label = resolve_selected_target()
     with ACTIVE_JOB_LOCK:
         current = ACTIVE_JOB.get("thread")
         if current and getattr(current, "is_alive", lambda: False)():
             return False
         worker = threading.Thread(
             target=run_ask_job,
-            args=(token, chat_id, prompt, reply_to_message_id, use_ipc),
+            args=(token, chat_id, prompt, reply_to_message_id, target_thread_id, target_ref, target_label),
             daemon=True,
             name="codex-telegram-ask",
         )
         ACTIVE_JOB["thread"] = worker
         ACTIVE_JOB["chat_id"] = chat_id
-        ACTIVE_JOB["summary"] = f"Running {'ask-ipc' if use_ipc else 'ask'}: {prompt[:120]}"
+        if target_ref:
+            ACTIVE_JOB["summary"] = f"Running ask on {target_ref}: {prompt[:120]}"
+        else:
+            ACTIVE_JOB["summary"] = f"Running ask: {prompt[:120]}"
     worker.start()
-    start_label = "대기 요청 시작됨." if queued else "Ask started."
+    start_label = "Queued ask started." if queued else "Ask started."
     send_text(token, chat_id, f"{start_label}\n\n{prompt}", reply_to_message_id=reply_to_message_id)
     return True
 
@@ -476,24 +572,34 @@ def start_next_pending_ask(token: str) -> bool:
     chat_id = int(pending["chat_id"])
     prompt = str(pending["prompt"])
     reply_to_message_id = pending.get("reply_to_message_id")
-    use_ipc = bool(pending.get("use_ipc"))
+    target_thread_id = str(pending.get("target_thread_id") or "").strip() or None
+    target_ref = str(pending.get("target_ref") or "")
+    target_label = str(pending.get("target_label") or "")
     started = start_ask_worker(
         token=token,
         chat_id=chat_id,
         prompt=prompt,
         reply_to_message_id=reply_to_message_id if isinstance(reply_to_message_id, int) else None,
         queued=True,
-        use_ipc=use_ipc,
+        target_thread_id=target_thread_id,
+        target_ref=target_ref,
+        target_label=target_label,
     )
     if not started:
         enqueue_pending_ask(
             chat_id,
             prompt,
             reply_to_message_id if isinstance(reply_to_message_id, int) else None,
-            use_ipc=use_ipc,
+            target_thread_id=target_thread_id,
+            target_ref=target_ref,
+            target_label=target_label,
         )
         return False
-    log_line(f"pending_ask_started chat_id={chat_id} prompt={prompt[:120].replace(chr(10), ' ')}")
+    log_line(
+        f"pending_ask_started chat_id={chat_id} "
+        f"target_ref={target_ref or '-'} "
+        f"prompt={prompt[:120].replace(chr(10), ' ')}"
+    )
     return True
 
 
@@ -505,106 +611,11 @@ def get_busy_labels(limit: int = 50) -> list[str]:
         return []
 
 
-def _clear_open_waiter(chat_id: int, worker: threading.Thread) -> None:
-    with OPEN_WAITERS_LOCK:
-        current = OPEN_WAITERS.get(chat_id)
-        if current and current.get("thread") is worker:
-            OPEN_WAITERS.pop(chat_id, None)
-
-
 def _clear_ask_waiter(chat_id: int, worker: threading.Thread) -> None:
     with ASK_WAITERS_LOCK:
         current = ASK_WAITERS.get(chat_id)
         if current and current.get("thread") is worker:
             ASK_WAITERS.pop(chat_id, None)
-
-
-def wait_for_busy_to_clear(
-    token: str,
-    chat_id: int,
-    target_ref: str,
-    watched_labels: list[str],
-    reply_to_message_id: int | None,
-    timeout_sec: float = 3600.0,
-) -> None:
-    worker = threading.current_thread()
-    watched_set = {label for label in watched_labels if label}
-    deadline = time.time() + timeout_sec
-    log_line(
-        f"open_waiter_start chat_id={chat_id} target_ref={target_ref} watched={sorted(watched_set)} timeout={timeout_sec}"
-    )
-    try:
-        last_busy = list(watched_labels)
-        while time.time() < deadline:
-            busy_now = get_busy_labels(limit=50)
-            remaining = [label for label in busy_now if label in watched_set]
-            if not remaining:
-                send_text(
-                    token,
-                    chat_id,
-                    "\n".join(
-                        [
-                            "Busy finished.",
-                            "",
-                            f"You can retry now:",
-                            f"/open {target_ref}",
-                        ]
-                    ),
-                    reply_to_message_id=reply_to_message_id,
-                )
-                log_line(f"open_waiter_ready chat_id={chat_id} target_ref={target_ref}")
-                return
-            last_busy = busy_now
-            time.sleep(2.0)
-
-        send_text(
-            token,
-            chat_id,
-            "\n".join(
-                [
-                    "Busy wait timed out.",
-                    "",
-                    f"Still busy: {', '.join(last_busy[:3]) or '-'}",
-                    f"Retry later: /open {target_ref}",
-                ]
-            ),
-            reply_to_message_id=reply_to_message_id,
-        )
-        log_line(f"open_waiter_timeout chat_id={chat_id} target_ref={target_ref} last_busy={last_busy[:3]}")
-    except Exception:
-        log_line(f"open_waiter_crash chat_id={chat_id} target_ref={target_ref}\n{traceback.format_exc()}")
-    finally:
-        _clear_open_waiter(chat_id, worker)
-
-
-def ensure_open_waiter(
-    token: str,
-    chat_id: int,
-    target_ref: str,
-    watched_labels: list[str],
-    reply_to_message_id: int | None,
-) -> tuple[bool, str | None]:
-    with OPEN_WAITERS_LOCK:
-        current = OPEN_WAITERS.get(chat_id)
-        if current:
-            current_thread = current.get("thread")
-            if current_thread and getattr(current_thread, "is_alive", lambda: False)():
-                return False, str(current.get("target_ref") or "")
-            OPEN_WAITERS.pop(chat_id, None)
-
-        worker = threading.Thread(
-            target=wait_for_busy_to_clear,
-            args=(token, chat_id, target_ref, watched_labels, reply_to_message_id),
-            daemon=True,
-            name=f"codex-open-wait-{chat_id}",
-        )
-        OPEN_WAITERS[chat_id] = {
-            "thread": worker,
-            "target_ref": target_ref,
-            "watched_labels": list(watched_labels),
-        }
-        worker.start()
-        return True, None
 
 
 def wait_for_selected_thread_to_clear(
@@ -700,34 +711,37 @@ def run_ask_job(
     chat_id: int,
     prompt: str,
     reply_to_message_id: int | None = None,
-    use_ipc: bool = False,
+    target_thread_id: str | None = None,
+    target_ref: str = "",
+    target_label: str = "",
 ) -> None:
     relay = TelegramAskRelay(token, chat_id, reply_to_message_id)
-    target_ref = ""
-    target_label = ""
-    try:
-        target_thread = bridge.choose_thread(None, None)
-        target_ref = bridge.get_thread_workspace_ref(target_thread)
-        target_label = bridge.get_thread_label(target_thread)
-    except Exception:
-        pass
+    if target_thread_id and (not target_ref or not target_label):
+        try:
+            target_thread = bridge.choose_thread(target_thread_id, None)
+            target_ref = bridge.get_thread_workspace_ref(target_thread)
+            target_label = bridge.get_thread_label(target_thread)
+        except Exception:
+            pass
+    elif not target_thread_id:
+        target_thread_id, target_ref, target_label = resolve_selected_target()
     try:
         log_line(
-            f"ask_job_start chat_id={chat_id} use_ipc={use_ipc} "
+            f"ask_job_start chat_id={chat_id} "
+            f"target_ref={target_ref or '-'} "
             f"prompt={prompt[:160].replace(chr(10), ' ')}"
         )
         argv = [
             "ask",
+            "--ipc",
             "--foreground",
             "--stream",
             "--include-commentary",
             "--timeout",
             "0",
         ]
-        if use_ipc:
-            argv.append("--ipc")
-        else:
-            argv.extend(["--no-switch-thread", "--click"])
+        if target_thread_id:
+            argv.extend(["--thread-id", target_thread_id])
         argv.append(prompt)
         exit_code, output = run_bridge_command_stream(
             argv,
@@ -737,11 +751,10 @@ def run_ask_job(
         if exit_code != 0:
             log_line(
                 "ask_job_failure_output "
-                f"chat_id={chat_id} use_ipc={use_ipc} target_ref={target_ref or '-'}\n"
+                f"chat_id={chat_id} target_ref={target_ref or '-'}\n"
                 f"{output or '(no output)'}"
             )
         note = ""
-        restart_after_response = False
         if (
             exit_code != 0
             and "The selected thread is still busy." in output
@@ -765,8 +778,7 @@ def run_ask_job(
                     "\n\nBusy-end notifier already active."
                     + (f"\nCurrent waiting target: {existing_ref}" if existing_ref else "")
                 )
-        elif exit_code != 0 and should_restart_bot_after_ask_failure(output, use_ipc):
-            restart_after_response = True
+        elif exit_code != 0 and "IPC owner client for the selected thread was not discovered" in output:
             note = (
                 "\n\nIPC recovery tip / IPC 복구 안내"
                 "\n- Restart the Telegram bot and try again."
@@ -776,7 +788,7 @@ def run_ask_job(
         relay.finish()
         if relay.sent_live:
             if exit_code == 0 and not relay.saw_aborted:
-                send_text(token, chat_id, "완료.", reply_to_message_id=reply_to_message_id)
+                send_text(token, chat_id, "Done.", reply_to_message_id=reply_to_message_id)
             elif not relay.saw_aborted and not relay.saw_timeout:
                 send_text(
                     token,
@@ -788,15 +800,6 @@ def run_ask_job(
             title = "Ask finished" if exit_code == 0 else f"Ask failed (exit {exit_code})"
             message = f"{title}\n\n{output or '(no output)'}{note}"
             send_text(token, chat_id, message, reply_to_message_id=reply_to_message_id)
-        if restart_after_response:
-            try:
-                started, detail = schedule_bot_restart()
-                log_line(
-                    f"ask_job_restart_after_failure chat_id={chat_id} use_ipc={use_ipc} "
-                    f"started={started} detail={detail}"
-                )
-            except Exception:
-                log_line(f"ask_job_restart_schedule_error chat_id={chat_id}\n{traceback.format_exc()}")
     except Exception:  # pragma: no cover - operational path
         log_line(f"ask_job_crash chat_id={chat_id}\n{traceback.format_exc()}")
         send_text(
@@ -810,47 +813,7 @@ def run_ask_job(
         start_next_pending_ask(token)
 
 
-def handle_open_command(token: str, chat_id: int, ref: str, abort: bool, reply_to_message_id: int | None) -> None:
-    argv = ["open"]
-    if abort:
-        argv.append("--abort")
-    argv.append(ref)
-    exit_code, output = run_bridge_command(argv)
-    prefix = "Open ok" if exit_code == 0 else f"Open failed (exit {exit_code})"
-    note = ""
-    if (
-        exit_code != 0
-        and not abort
-        and "A Codex reply is still in progress." in output
-    ):
-        busy_labels = get_busy_labels(limit=50)
-        if busy_labels:
-            started, existing_ref = ensure_open_waiter(
-                token=token,
-                chat_id=chat_id,
-                target_ref=ref,
-                watched_labels=busy_labels,
-                reply_to_message_id=reply_to_message_id,
-            )
-            if started:
-                note = (
-                    "\n\nBusy-end notifier armed."
-                    f"\nI'll send a message here when the current reply finishes so you can retry `/open {ref}`."
-                )
-            else:
-                note = (
-                    "\n\nBusy-end notifier already active."
-                    + (f"\nCurrent waiting target: /open {existing_ref}" if existing_ref else "")
-                )
-    send_text(
-        token,
-        chat_id,
-        f"{prefix}\n\n{output or '(no output)'}{note}",
-        reply_to_message_id=reply_to_message_id,
-    )
-
-
-def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> None:
+def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> None:
     chat = message.get("chat") or {}
     chat_id = int(chat.get("id"))
     text = (message.get("text") or "").strip()
@@ -869,10 +832,18 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         return
 
     active_summary = get_active_job_summary()
+    target_thread_id, target_ref, target_label = resolve_selected_target()
 
     if not text.startswith("/"):
         if active_summary:
-            position = enqueue_pending_ask(chat_id, text, reply_to_message_id, use_ipc=True)
+            position = enqueue_pending_ask(
+                chat_id,
+                text,
+                reply_to_message_id,
+                target_thread_id=target_thread_id,
+                target_ref=target_ref,
+                target_label=target_label,
+            )
             send_text(
                 token,
                 chat_id,
@@ -880,7 +851,15 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 reply_to_message_id=reply_to_message_id,
             )
             return
-        start_ask_worker(token, chat_id, text, reply_to_message_id, use_ipc=True)
+        start_ask_worker(
+            token,
+            chat_id,
+            text,
+            reply_to_message_id,
+            target_thread_id=target_thread_id,
+            target_ref=target_ref,
+            target_label=target_label,
+        )
         return
 
     parts = text.split(maxsplit=1)
@@ -895,13 +874,17 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 [
                     "Commands:",
                     "/list [limit]",
+                    "/archived_list [limit]",
+                    "/new <prompt>",
+                    "/archive [ref]",
+                    "/delete_archive <ref>",
+                    "/confirm_delete_archive <ref>",
                     "/use <ref>",
                     "/status [ref]",
                     "/doctor",
                     "/ask <prompt>",
                     "/ask_ipc <prompt> (alias)",
                     "/restart_bot",
-                    "/abort",
                     "/chatid",
                     "",
                     "Thread refs use the same format as the bridge, for example:",
@@ -965,6 +948,58 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
         return
 
+    if command == "/archived_list":
+        limit = 10
+        if arg:
+            try:
+                limit = max(1, min(50, int(arg)))
+            except ValueError:
+                pass
+        exit_code, output = run_bridge_command(["archived_list", "--limit", str(limit)])
+        prefix = "Archived list" if exit_code == 0 else f"Archived list failed (exit {exit_code})"
+        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/new":
+        if not arg:
+            send_text(token, chat_id, "Usage: /new <prompt>", reply_to_message_id=reply_to_message_id)
+            return
+        exit_code, output = run_bridge_command(["new", arg])
+        prefix = "New ok" if exit_code == 0 else f"New failed (exit {exit_code})"
+        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/archive":
+        argv = ["archive"]
+        if arg:
+            argv.append(arg)
+        exit_code, output = run_bridge_command(argv)
+        prefix = "Archive ok" if exit_code == 0 else f"Archive failed (exit {exit_code})"
+        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/delete_archive":
+        if not arg:
+            send_text(token, chat_id, "Usage: /delete_archive <ref>", reply_to_message_id=reply_to_message_id)
+            return
+        exit_code, output = run_bridge_command(["delete_archive", arg])
+        prefix = "Delete archive preview" if exit_code == 0 else f"Delete archive failed (exit {exit_code})"
+        message = (
+            f"{prefix}\n\n{output or '(no output)'}"
+            "\n\nTo actually delete it, run /confirm_delete_archive <thread_id>."
+        )
+        send_text(token, chat_id, message, reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/confirm_delete_archive":
+        if not arg:
+            send_text(token, chat_id, "Usage: /confirm_delete_archive <ref>", reply_to_message_id=reply_to_message_id)
+            return
+        exit_code, output = run_bridge_command(["delete_archive", "--confirm", arg])
+        prefix = "Delete archive ok" if exit_code == 0 else f"Delete archive failed (exit {exit_code})"
+        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+        return
+
     if command == "/doctor":
         exit_code, output = run_bridge_command(["doctor"])
         prefix = "Doctor" if exit_code == 0 else f"Doctor failed (exit {exit_code})"
@@ -976,12 +1011,6 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         exit_code, output = run_bridge_command(argv)
         prefix = "Status" if exit_code == 0 else f"Status failed (exit {exit_code})"
         send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/abort":
-        exit_code, output = abort_current_reply()
-        prefix = "Abort" if exit_code == 0 else f"Abort pending (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output}", reply_to_message_id=reply_to_message_id)
         return
 
     if command == "/use":
@@ -1007,7 +1036,14 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             send_text(token, chat_id, "Usage: /ask <prompt>", reply_to_message_id=reply_to_message_id)
             return
         if active_summary:
-            position = enqueue_pending_ask(chat_id, arg, reply_to_message_id, use_ipc=True)
+            position = enqueue_pending_ask(
+                chat_id,
+                arg,
+                reply_to_message_id,
+                target_thread_id=target_thread_id,
+                target_ref=target_ref,
+                target_label=target_label,
+            )
             send_text(
                 token,
                 chat_id,
@@ -1015,7 +1051,15 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 reply_to_message_id=reply_to_message_id,
             )
             return
-        start_ask_worker(token, chat_id, arg, reply_to_message_id, use_ipc=True)
+        start_ask_worker(
+            token,
+            chat_id,
+            arg,
+            reply_to_message_id,
+            target_thread_id=target_thread_id,
+            target_ref=target_ref,
+            target_label=target_label,
+        )
         return
 
     if command == "/ask_ipc":
@@ -1023,7 +1067,14 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             send_text(token, chat_id, "Usage: /ask_ipc <prompt>", reply_to_message_id=reply_to_message_id)
             return
         if active_summary:
-            position = enqueue_pending_ask(chat_id, arg, reply_to_message_id, use_ipc=True)
+            position = enqueue_pending_ask(
+                chat_id,
+                arg,
+                reply_to_message_id,
+                target_thread_id=target_thread_id,
+                target_ref=target_ref,
+                target_label=target_label,
+            )
             send_text(
                 token,
                 chat_id,
@@ -1031,7 +1082,241 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
                 reply_to_message_id=reply_to_message_id,
             )
             return
-        start_ask_worker(token, chat_id, arg, reply_to_message_id, use_ipc=True)
+        start_ask_worker(
+            token,
+            chat_id,
+            arg,
+            reply_to_message_id,
+            target_thread_id=target_thread_id,
+            target_ref=target_ref,
+            target_label=target_label,
+        )
+        return
+
+    send_text(token, chat_id, f"Unknown command: {command}", reply_to_message_id=reply_to_message_id)
+
+
+def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> None:
+    chat = message.get("chat") or {}
+    chat_id = int(chat.get("id"))
+    text = (message.get("text") or "").strip()
+    reply_to_message_id = message.get("message_id")
+
+    log_line(
+        f"handle_message chat_id={chat_id} allowed={sorted(allowed_chat_ids) if allowed_chat_ids else 'ALL'} "
+        f"text={text[:160].replace(chr(10), ' ')}"
+    )
+
+    if allowed_chat_ids and chat_id not in allowed_chat_ids:
+        log_line(f"ignored_message chat_id={chat_id} reason=not_allowed")
+        return
+    if not text:
+        log_line(f"ignored_message chat_id={chat_id} reason=no_text")
+        return
+
+    active_summary = get_active_job_summary()
+    target_thread_id, target_ref, target_label = resolve_selected_target()
+
+    if not text.startswith("/"):
+        start_or_queue_ask(
+            token,
+            chat_id,
+            text,
+            reply_to_message_id,
+            active_summary,
+            target_thread_id,
+            target_ref,
+            target_label,
+        )
+        return
+
+    parts = text.split(maxsplit=1)
+    command = parts[0].split("@", 1)[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if command in {"/start", "/help"}:
+        send_text(token, chat_id, build_help_message(), reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/restart_bot":
+        try:
+            started, detail = schedule_bot_restart()
+        except Exception:
+            log_line("restart_command_error\n" + traceback.format_exc())
+            send_text(
+                token,
+                chat_id,
+                "Bot restart failed.\n\n" + traceback.format_exc(),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        message_text = (
+            "Restarting Telegram bot.\n"
+            "텔레그램 봇을 재시작합니다.\n\n"
+            "Retry the last IPC ask after the bot comes back.\n"
+            "봇이 다시 올라오면 마지막 IPC 요청을 다시 보내세요."
+        )
+        if not started and detail:
+            message_text += f"\n\n{detail}"
+        send_text(token, chat_id, message_text, reply_to_message_id=reply_to_message_id)
+        return
+
+    if command in {"/chatid", "/whoami"}:
+        send_text(
+            token,
+            chat_id,
+            "\n".join(
+                [
+                    f"chat_id: {chat_id}",
+                    f"chat_type: {chat.get('type', '-')}",
+                    f"chat_title: {chat.get('title') or '-'}",
+                    "",
+                    "Copy into .env:",
+                    f"TELEGRAM_ALLOWED_CHAT_IDS={chat_id}",
+                ]
+            ),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    if command == "/list":
+        limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30)
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["list", "--limit", str(limit)],
+            "List",
+            "List failed",
+        )
+        return
+
+    if command == "/archived_list":
+        limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=50)
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["archived_list", "--limit", str(limit)],
+            "Archived list",
+            "Archived list failed",
+        )
+        return
+
+    if command == "/new":
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, "/new <prompt>")
+            return
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["new", arg],
+            "New ok",
+            "New failed",
+        )
+        return
+
+    if command == "/archive":
+        argv = ["archive"]
+        if arg:
+            argv.append(arg)
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            argv,
+            "Archive ok",
+            "Archive failed",
+        )
+        return
+
+    if command == "/delete_archive":
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, "/delete_archive <ref>")
+            return
+        exit_code, output = run_bridge_command(["delete_archive", arg])
+        prefix = "Delete archive preview" if exit_code == 0 else f"Delete archive failed (exit {exit_code})"
+        message_text = (
+            f"{prefix}\n\n{output or '(no output)'}"
+            "\n\nTo actually delete it, run /confirm_delete_archive <thread_id>."
+        )
+        send_text(token, chat_id, message_text, reply_to_message_id=reply_to_message_id)
+        return
+
+    if command == "/confirm_delete_archive":
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, "/confirm_delete_archive <ref>")
+            return
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["delete_archive", "--confirm", arg],
+            "Delete archive ok",
+            "Delete archive failed",
+        )
+        return
+
+    if command == "/doctor":
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["doctor"],
+            "Doctor",
+            "Doctor failed",
+        )
+        return
+
+    if command == "/status":
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            resolve_status_args(arg or None),
+            "Status",
+            "Status failed",
+        )
+        return
+
+    if command == "/use":
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, "/use <ref>")
+            return
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["use", arg],
+            "Use ok",
+            "Use failed",
+        )
+        return
+
+    if command in {"/open", "/open_abort"}:
+        send_text(
+            token,
+            chat_id,
+            "Removed. Use /use <ref> to pick the target thread, then send /ask or a plain message.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    if command in {"/ask", "/ask_ipc"}:
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, f"{command} <prompt>")
+            return
+        start_or_queue_ask(
+            token,
+            chat_id,
+            arg,
+            reply_to_message_id,
+            active_summary,
+            target_thread_id,
+            target_ref,
+            target_label,
+        )
         return
 
     send_text(token, chat_id, f"Unknown command: {command}", reply_to_message_id=reply_to_message_id)
