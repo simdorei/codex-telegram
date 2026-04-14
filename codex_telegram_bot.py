@@ -39,6 +39,8 @@ PENDING_ASKS_LOCK = threading.Lock()
 PENDING_ASKS: list[dict[str, object]] = []
 ASK_WAITERS_LOCK = threading.Lock()
 ASK_WAITERS: dict[int, dict[str, object]] = {}
+FOLLOW_WATCHERS_LOCK = threading.Lock()
+FOLLOW_WATCHERS: dict[int, dict[str, object]] = {}
 SINGLE_INSTANCE_MUTEX = None
 RESTART_LOCK = threading.Lock()
 RESTART_SCHEDULED = False
@@ -70,7 +72,20 @@ TELEGRAM_HELP_LINES = [
     "ai:1, ai:2, taxlab, other, 1, 2",
 ]
 CHOICE_LINE_RE = re.compile(r"^\s*(\d+)[\.\)]\s+(.*\S)\s*$")
-LIST_BUSY_RE = re.compile(r"\|\s*busy\s*\|")
+LIST_THREAD_LINE_RE = re.compile(r"^(\s*\*?\s*\d+\s*\|\s*[^|]+\|\s*)(busy|idle)(\s*\|.*)$")
+INTERACTIVE_CHOICE_TAG = "[choice_required]"
+INTERACTIVE_APPROVAL_TAG = "[approval_required]"
+INTERACTIVE_KIND_NONE = ""
+INTERACTIVE_KIND_CHOICE = "choice"
+INTERACTIVE_KIND_APPROVAL = "approval"
+# These labels match the Codex desktop ko-KR locale bundle:
+# execApprovalRequest.menu.runOnce, execApprovalRequest.reject,
+# requestInputPanel.otherPlaceholder
+APPROVAL_CHOICE_LABELS = [
+    "예",
+    "아니요",
+    "아니요, Codex에게 다르게 해야 할 내용을 설명해 주세요",
+]
 
 
 def acquire_single_instance_mutex(token: str | None = None) -> bool:
@@ -261,34 +276,148 @@ def extract_numbered_choices(text: str) -> list[str]:
     return choices
 
 
-def get_latest_choices_for_selected_thread(target_thread_id: str | None) -> tuple[str, list[str]]:
+def parse_interactive_notice(text: str) -> tuple[str, str, list[str]]:
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    if not lines:
+        return INTERACTIVE_KIND_NONE, "", []
+    first_line = lines[0].strip()
+    if first_line not in {INTERACTIVE_CHOICE_TAG, INTERACTIVE_APPROVAL_TAG}:
+        return INTERACTIVE_KIND_NONE, "", []
+
+    prompt_lines: list[str] = []
+    choices: list[str] = []
+    if first_line == INTERACTIVE_CHOICE_TAG:
+        for raw_line in lines[1:]:
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            match = CHOICE_LINE_RE.match(raw_line)
+            if match:
+                choice = str(match.group(2) or "").strip()
+                if choice:
+                    choices.append(choice)
+                continue
+            if not choices:
+                prompt_lines.append(stripped)
+        return INTERACTIVE_KIND_CHOICE, "\n".join(prompt_lines), choices
+
+    for raw_line in lines[1:]:
+        stripped = raw_line.strip()
+        if stripped:
+            prompt_lines.append(stripped)
+    return INTERACTIVE_KIND_APPROVAL, "\n".join(prompt_lines), list(APPROVAL_CHOICE_LABELS)
+
+
+def get_pending_interaction_for_thread(thread: bridge.ThreadInfo) -> tuple[str, str, list[str]]:
+    session_path = Path(thread.rollout_path)
+    if not session_path.exists():
+        return INTERACTIVE_KIND_NONE, "", []
+    try:
+        if not bridge.is_thread_busy(session_path):
+            return INTERACTIVE_KIND_NONE, "", []
+    except Exception:
+        return INTERACTIVE_KIND_NONE, "", []
+
+    pending_kind = INTERACTIVE_KIND_NONE
+    pending_prompt = ""
+    pending_choices: list[str] = []
+    try:
+        for event in bridge.iter_session_events(session_path):
+            payload = event.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+
+            if event.get("type") != "response_item":
+                continue
+
+            if payload.get("type") == "message":
+                text = bridge.extract_message_text(payload)
+                role = str(payload.get("role") or "").strip().lower()
+                if role == "user" and text:
+                    pending_prompt = ""
+                    pending_choices = []
+                continue
+
+            if payload.get("type") != "function_call":
+                continue
+
+            notice = bridge.build_interactive_notice_from_function_call(payload)
+            kind, prompt, choices = parse_interactive_notice(notice)
+            if choices:
+                pending_kind = kind
+                pending_prompt = prompt
+                pending_choices = choices
+    except Exception:
+        log_line("get_pending_interaction_for_thread_error\n" + traceback.format_exc())
+        return INTERACTIVE_KIND_NONE, "", []
+
+    return pending_kind, pending_prompt, pending_choices
+
+
+def get_latest_choices_for_selected_thread(target_thread_id: str | None) -> tuple[str, str, str, list[str]]:
     if not target_thread_id:
-        return "", []
+        return "", INTERACTIVE_KIND_NONE, "", []
     try:
         thread = bridge.choose_thread(target_thread_id, None)
     except Exception:
-        return "", []
+        return "", INTERACTIVE_KIND_NONE, "", []
     thread_ref = bridge.get_thread_workspace_ref(thread)
+    kind, prompt, choices = get_pending_interaction_for_thread(thread)
+    return thread_ref, kind, prompt, choices
+
+
+def thread_has_pending_choices(thread: bridge.ThreadInfo) -> bool:
+    _kind, _prompt, choices = get_pending_interaction_for_thread(thread)
+    return bool(choices)
+
+
+def get_thread_display_state(thread: bridge.ThreadInfo) -> str:
     session_path = Path(thread.rollout_path)
     if not session_path.exists():
-        return thread_ref, []
-    _last_user, last_assistant = bridge.get_last_user_and_assistant_messages(session_path)
-    return thread_ref, extract_numbered_choices(last_assistant)
+        return "idle"
+    try:
+        if not bridge.is_thread_busy(session_path):
+            return "idle"
+    except Exception:
+        log_line("get_thread_display_state_error\n" + traceback.format_exc())
+        return "idle"
+    return "waiting" if thread_has_pending_choices(thread) else "busy"
 
 
-def build_choices_text(thread_ref: str, choices: list[str]) -> str:
+def build_choices_text(thread_ref: str, prompt: str, choices: list[str]) -> str:
     if not choices:
-        return "No numbered choices found in the latest assistant message."
+        return "No active interactive choices found for the selected thread."
     lines = ["Choices", f"thread: {thread_ref or '-'}", ""]
+    if prompt:
+        lines.append(prompt)
+        lines.append("")
     for index, choice in enumerate(choices, start=1):
         lines.append(f"{index}. {choice}")
     lines.extend(["", "Reply with /choose <number> or /choose <text>."])
     return "\n".join(lines)
 
 
-def rewrite_list_output_for_telegram(output: str) -> str:
+def rewrite_list_output_for_telegram(output: str, limit: int) -> str:
     text = output or "(no output)"
-    return LIST_BUSY_RE.sub("| waiting |", text)
+    try:
+        threads = bridge.load_recent_threads(limit=limit)
+    except Exception:
+        log_line("rewrite_list_output_for_telegram_error\n" + traceback.format_exc())
+        return text
+
+    lines = text.splitlines()
+    thread_index = 0
+    rewritten: list[str] = []
+    for line in lines:
+        if thread_index < len(threads):
+            match = LIST_THREAD_LINE_RE.match(line)
+            if match:
+                state = get_thread_display_state(threads[thread_index])
+                rewritten.append(f"{match.group(1)}{state}{match.group(3)}")
+                thread_index += 1
+                continue
+        rewritten.append(line)
+    return "\n".join(rewritten)
 
 
 def resolve_restart_python_exe() -> Path:
@@ -361,10 +490,11 @@ class LineStream(io.TextIOBase):
 
 
 class TelegramAskRelay:
-    def __init__(self, token: str, chat_id: int, reply_to_message_id: int | None) -> None:
+    def __init__(self, token: str, chat_id: int, reply_to_message_id: int | None, thread_ref: str = "") -> None:
         self.token = token
         self.chat_id = chat_id
         self.reply_to_message_id = reply_to_message_id
+        self.thread_ref = thread_ref
         self.mode: str | None = None
         self.block_lines: list[str] = []
         self.sent_live = False
@@ -374,24 +504,21 @@ class TelegramAskRelay:
         self.saw_timeout = False
         self.last_choice_signature = ""
 
-    def _send_choices_if_detected(self, text: str) -> None:
-        choices = extract_numbered_choices(text)
+    def _send_choice_notice_if_detected(self, text: str) -> bool:
+        _kind, prompt, choices = parse_interactive_notice(text)
         if not choices:
-            return
-        signature = "\n".join(choices)
+            return False
+        signature = "\n".join([prompt, *choices])
         if signature == self.last_choice_signature:
-            return
+            return True
         self.last_choice_signature = signature
-        lines = ["Choices detected", ""]
-        for index, choice in enumerate(choices, start=1):
-            lines.append(f"{index}. {choice}")
-        lines.extend(["", "Reply with /choose <number> or /choose <text>."])
         send_text(
             self.token,
             self.chat_id,
-            "\n".join(lines),
+            build_choices_text(self.thread_ref, prompt, choices),
             reply_to_message_id=self.reply_to_message_id,
         )
+        return True
 
     def _send_block(self) -> None:
         text = "\n".join(self.block_lines).strip()
@@ -399,14 +526,18 @@ class TelegramAskRelay:
             self.block_lines = []
             return
         if self.mode == "commentary":
-            send_text(self.token, self.chat_id, f"In progress\n\n{text}", reply_to_message_id=self.reply_to_message_id)
-            self.sent_live = True
-            self._send_choices_if_detected(text)
+            if not self._send_choice_notice_if_detected(text):
+                send_text(self.token, self.chat_id, f"In progress\n\n{text}", reply_to_message_id=self.reply_to_message_id)
+                self.sent_live = True
+            else:
+                self.sent_live = True
         elif self.mode == "final":
-            send_text(self.token, self.chat_id, text, reply_to_message_id=self.reply_to_message_id)
-            self.sent_live = True
-            self.saw_final = True
-            self._send_choices_if_detected(text)
+            if not self._send_choice_notice_if_detected(text):
+                send_text(self.token, self.chat_id, text, reply_to_message_id=self.reply_to_message_id)
+                self.sent_live = True
+                self.saw_final = True
+            else:
+                self.sent_live = True
         elif self.mode == "timeout":
             send_text(self.token, self.chat_id, f"Timed out\n\n{text}", reply_to_message_id=self.reply_to_message_id)
             self.sent_live = True
@@ -686,7 +817,7 @@ def build_waiting_list_suffix(active_summary: str) -> str:
         lines.append(f"queued: {pending_count}")
     if not lines:
         return ""
-    return "\n\nWaiting\n" + "\n".join(lines)
+    return "\n\nActive\n" + "\n".join(lines)
 
 
 def get_busy_labels(limit: int = 50) -> list[str]:
@@ -702,6 +833,194 @@ def _clear_ask_waiter(chat_id: int, worker: threading.Thread) -> None:
         current = ASK_WAITERS.get(chat_id)
         if current and current.get("thread") is worker:
             ASK_WAITERS.pop(chat_id, None)
+
+
+def _clear_follow_watcher(chat_id: int, worker: threading.Thread) -> None:
+    with FOLLOW_WATCHERS_LOCK:
+        current = FOLLOW_WATCHERS.get(chat_id)
+        if current and current.get("thread") is worker:
+            FOLLOW_WATCHERS.pop(chat_id, None)
+
+
+def stop_follow_watcher(chat_id: int) -> None:
+    with FOLLOW_WATCHERS_LOCK:
+        current = FOLLOW_WATCHERS.pop(chat_id, None)
+    if not current:
+        return
+    stop_event = current.get("stop_event")
+    if isinstance(stop_event, threading.Event):
+        stop_event.set()
+
+
+def follow_thread_output(
+    token: str,
+    chat_id: int,
+    target_thread_id: str,
+    target_ref: str,
+    reply_to_message_id: int | None,
+    stop_event: threading.Event,
+    timeout_sec: float = 3600.0,
+) -> None:
+    worker = threading.current_thread()
+    seen_agent_messages: set[str] = set()
+    seen_choice_signatures: set[str] = set()
+    deadline = time.time() + timeout_sec
+    try:
+        target_thread = bridge.choose_thread(target_thread_id, None)
+        session_path = Path(target_thread.rollout_path)
+        if not session_path.exists():
+            return
+        cursor = session_path.stat().st_size
+        while time.time() < deadline and not stop_event.is_set():
+            events, cursor = bridge.read_new_session_events(session_path, cursor)
+            for event in events:
+                payload = event.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+
+                if event.get("type") == "event_msg" and payload.get("type") == "agent_message":
+                    if str(payload.get("phase", "") or "") == "final_answer":
+                        continue
+                    message = str(payload.get("message", "")).strip()
+                    if not message:
+                        continue
+                    seen_agent_messages.add(message)
+                    send_text(
+                        token,
+                        chat_id,
+                        f"In progress ({target_ref})\n\n{message}",
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                    continue
+
+                if event.get("type") == "response_item" and payload.get("type") == "message":
+                    text = bridge.extract_message_text(payload)
+                    role = str(payload.get("role") or "").strip().lower()
+                    phase = str(payload.get("phase") or "").strip().lower()
+                    if role != "assistant" or not text:
+                        continue
+                    if phase == "commentary":
+                        if text in seen_agent_messages:
+                            continue
+                        send_text(
+                            token,
+                            chat_id,
+                            f"In progress ({target_ref})\n\n{text}",
+                            reply_to_message_id=reply_to_message_id,
+                        )
+                        continue
+                    if phase == "final_answer":
+                        send_text(token, chat_id, text, reply_to_message_id=reply_to_message_id)
+                        return
+
+                if event.get("type") == "response_item" and payload.get("type") == "function_call":
+                    notice = bridge.build_interactive_notice_from_function_call(payload)
+                    _kind, prompt, choices = parse_interactive_notice(notice)
+                    if choices:
+                        signature = "\n".join([prompt, *choices])
+                        if signature and signature not in seen_choice_signatures:
+                            seen_choice_signatures.add(signature)
+                            send_text(
+                                token,
+                                chat_id,
+                                build_choices_text(target_ref, prompt, choices),
+                                reply_to_message_id=reply_to_message_id,
+                            )
+
+            if not bridge.is_thread_busy(session_path):
+                return
+            time.sleep(0.35)
+    except Exception:
+        log_line(
+            f"follow_thread_output_crash chat_id={chat_id} target_ref={target_ref}\n"
+            + traceback.format_exc()
+        )
+    finally:
+        _clear_follow_watcher(chat_id, worker)
+
+
+def ensure_follow_watcher(
+    token: str,
+    chat_id: int,
+    target_thread_id: str,
+    target_ref: str,
+    reply_to_message_id: int | None,
+) -> tuple[bool, str | None]:
+    with FOLLOW_WATCHERS_LOCK:
+        current = FOLLOW_WATCHERS.get(chat_id)
+        if current:
+            current_thread = current.get("thread")
+            current_target_thread_id = str(current.get("target_thread_id") or "")
+            if (
+                current_thread
+                and getattr(current_thread, "is_alive", lambda: False)()
+                and current_target_thread_id == target_thread_id
+            ):
+                return False, str(current.get("target_ref") or "")
+            current_stop_event = current.get("stop_event")
+            if isinstance(current_stop_event, threading.Event):
+                current_stop_event.set()
+            FOLLOW_WATCHERS.pop(chat_id, None)
+
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=follow_thread_output,
+            args=(token, chat_id, target_thread_id, target_ref, reply_to_message_id, stop_event),
+            daemon=True,
+            name=f"codex-follow-{chat_id}",
+        )
+        FOLLOW_WATCHERS[chat_id] = {
+            "thread": worker,
+            "stop_event": stop_event,
+            "target_thread_id": target_thread_id,
+            "target_ref": target_ref,
+        }
+        worker.start()
+        return True, None
+
+
+def maybe_follow_selected_thread(
+    token: str,
+    chat_id: int,
+    reply_to_message_id: int | None,
+) -> None:
+    target_thread_id, target_ref, _target_label = resolve_selected_target()
+    if not target_thread_id:
+        stop_follow_watcher(chat_id)
+        return
+    try:
+        target_thread = bridge.choose_thread(target_thread_id, None)
+    except Exception:
+        stop_follow_watcher(chat_id)
+        return
+
+    session_path = Path(target_thread.rollout_path)
+    if not session_path.exists() or not bridge.is_thread_busy(session_path):
+        stop_follow_watcher(chat_id)
+        return
+
+    started, existing_ref = ensure_follow_watcher(
+        token=token,
+        chat_id=chat_id,
+        target_thread_id=target_thread_id,
+        target_ref=target_ref,
+        reply_to_message_id=reply_to_message_id,
+    )
+    if not started:
+        return
+
+    send_text(
+        token,
+        chat_id,
+        "\n".join(
+            [
+                f"Following busy thread: {target_ref}",
+                "I'll forward in-progress updates here.",
+            ]
+        ),
+        reply_to_message_id=reply_to_message_id,
+    )
+    log_line(f"follow_watcher_start chat_id={chat_id} target_ref={target_ref} replaced={existing_ref or '-'}")
 
 
 def wait_for_selected_thread_to_clear(
@@ -801,7 +1120,6 @@ def run_ask_job(
     target_ref: str = "",
     target_label: str = "",
 ) -> None:
-    relay = TelegramAskRelay(token, chat_id, reply_to_message_id)
     if target_thread_id and (not target_ref or not target_label):
         try:
             target_thread = bridge.choose_thread(target_thread_id, None)
@@ -811,6 +1129,7 @@ def run_ask_job(
             pass
     elif not target_thread_id:
         target_thread_id, target_ref, target_label = resolve_selected_target()
+    relay = TelegramAskRelay(token, chat_id, reply_to_message_id, thread_ref=target_ref)
     try:
         log_line(
             f"ask_job_start chat_id={chat_id} "
@@ -1033,7 +1352,7 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
                 pass
         exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
         prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
-        display_output = rewrite_list_output_for_telegram(output or "(no output)")
+        display_output = rewrite_list_output_for_telegram(output or "(no output)", limit)
         waiting_suffix = build_waiting_list_suffix(active_summary)
         send_text(
             token,
@@ -1109,11 +1428,11 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
         return
 
     if command in {"/choices", "/options"}:
-        thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+        thread_ref, _choice_kind, choice_prompt, choices = get_latest_choices_for_selected_thread(target_thread_id)
         send_text(
             token,
             chat_id,
-            build_choices_text(thread_ref, choices),
+            build_choices_text(thread_ref, choice_prompt, choices),
             reply_to_message_id=reply_to_message_id,
         )
         return
@@ -1124,13 +1443,30 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
             return
         chosen_prompt = arg
         if arg.isdigit():
-            thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+            thread_ref, choice_kind, choice_prompt, choices = get_latest_choices_for_selected_thread(target_thread_id)
             index = int(arg)
+            if not choices:
+                send_text(
+                    token,
+                    chat_id,
+                    build_choices_text(thread_ref, choice_prompt, choices),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
             if index < 1 or index > len(choices):
                 send_text(
                     token,
                     chat_id,
-                    "Choice index is out of range.\n\n" + build_choices_text(thread_ref, choices),
+                    "Choice index is out of range.\n\n" + build_choices_text(thread_ref, choice_prompt, choices),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+            if choice_kind == INTERACTIVE_KIND_APPROVAL:
+                send_text(
+                    token,
+                    chat_id,
+                    "Approval choices are visible here, but this bot cannot submit the approval decision yet.\n\n"
+                    + build_choices_text(thread_ref, choice_prompt, choices),
                     reply_to_message_id=reply_to_message_id,
                 )
                 return
@@ -1154,6 +1490,8 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
         exit_code, output = run_bridge_command(["use", arg])
         prefix = "Use ok" if exit_code == 0 else f"Use failed (exit {exit_code})"
         send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+        if exit_code == 0:
+            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 
     if command in {"/open", "/open_abort"}:
@@ -1317,7 +1655,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30)
         exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
         prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
-        display_output = rewrite_list_output_for_telegram(output or "(no output)")
+        display_output = rewrite_list_output_for_telegram(output or "(no output)", limit)
         waiting_suffix = build_waiting_list_suffix(active_summary)
         send_text(
             token,
@@ -1417,11 +1755,11 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         return
 
     if command in {"/choices", "/options"}:
-        thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+        thread_ref, _choice_kind, choice_prompt, choices = get_latest_choices_for_selected_thread(target_thread_id)
         send_text(
             token,
             chat_id,
-            build_choices_text(thread_ref, choices),
+            build_choices_text(thread_ref, choice_prompt, choices),
             reply_to_message_id=reply_to_message_id,
         )
         return
@@ -1432,13 +1770,30 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             return
         chosen_prompt = arg
         if arg.isdigit():
-            thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+            thread_ref, choice_kind, choice_prompt, choices = get_latest_choices_for_selected_thread(target_thread_id)
             index = int(arg)
+            if not choices:
+                send_text(
+                    token,
+                    chat_id,
+                    build_choices_text(thread_ref, choice_prompt, choices),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
             if index < 1 or index > len(choices):
                 send_text(
                     token,
                     chat_id,
-                    "Choice index is out of range.\n\n" + build_choices_text(thread_ref, choices),
+                    "Choice index is out of range.\n\n" + build_choices_text(thread_ref, choice_prompt, choices),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+            if choice_kind == INTERACTIVE_KIND_APPROVAL:
+                send_text(
+                    token,
+                    chat_id,
+                    "Approval choices are visible here, but this bot cannot submit the approval decision yet.\n\n"
+                    + build_choices_text(thread_ref, choice_prompt, choices),
                     reply_to_message_id=reply_to_message_id,
                 )
                 return
@@ -1459,7 +1814,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         if not arg:
             send_usage(token, chat_id, reply_to_message_id, "/use <ref>")
             return
-        send_bridge_command_result(
+        exit_code, _output = send_bridge_command_result(
             token,
             chat_id,
             reply_to_message_id,
@@ -1467,6 +1822,8 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             "Use ok",
             "Use failed",
         )
+        if exit_code == 0:
+            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 
     if command in {"/open", "/open_abort"}:
