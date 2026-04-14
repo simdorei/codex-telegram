@@ -71,6 +71,44 @@ Optional:
 
 - `CODEX_BRIDGE_AUTO_START_TELEGRAM=0`
 
+### Find `CODEX_HOME` and `PYTHON_EXE` on Windows
+
+`CODEX_HOME` (default):
+
+```powershell
+Join-Path $env:USERPROFILE '.codex'
+Test-Path (Join-Path $env:USERPROFILE '.codex')
+```
+
+If that folder exists and you use the default Codex data location, you can either:
+
+- leave `CODEX_HOME=` empty, or
+- set it explicitly (recommended for multi-PC setup).
+
+`PYTHON_EXE`:
+
+```powershell
+py -3 -c "import sys; print(sys.executable)"
+```
+
+If `py` is not available:
+
+```powershell
+python -c "import sys; print(sys.executable)"
+```
+
+Example `.env` with explicit paths:
+
+```env
+TELEGRAM_BOT_TOKEN=123456:example-token
+TELEGRAM_ALLOWED_CHAT_IDS=123456789
+CODEX_HOME=C:\Users\your_user\.codex
+PYTHON_EXE=C:\python\python.exe
+CODEX_BRIDGE_AUTO_START_TELEGRAM=1
+```
+
+After editing `.env`, restart the running bridge/bot process so the new values are loaded.
+
 ## Main Commands
 
 - `list`: show recent active threads

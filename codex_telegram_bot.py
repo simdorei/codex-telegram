@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -54,6 +55,8 @@ TELEGRAM_HELP_LINES = [
     "/confirm_delete_archive <ref>",
     "/use <ref>",
     "/status [ref]",
+    "/choices",
+    "/choose <number|text>",
     "/doctor",
     "/ask <prompt>",
     "/ask_ipc <prompt> (alias)",
@@ -66,6 +69,7 @@ TELEGRAM_HELP_LINES = [
     "Thread refs follow the bridge format:",
     "ai:1, ai:2, taxlab, other, 1, 2",
 ]
+CHOICE_LINE_RE = re.compile(r"^\s*(\d+)[\.\)]\s+(.*\S)\s*$")
 
 
 def acquire_single_instance_mutex(token: str | None = None) -> bool:
@@ -242,6 +246,43 @@ def parse_bounded_int_arg(raw: str, *, default: int, minimum: int, maximum: int)
         return max(minimum, min(maximum, int(raw)))
     except ValueError:
         return default
+
+
+def extract_numbered_choices(text: str) -> list[str]:
+    choices: list[str] = []
+    for raw_line in (text or "").splitlines():
+        match = CHOICE_LINE_RE.match(raw_line)
+        if not match:
+            continue
+        choice = str(match.group(2) or "").strip()
+        if choice:
+            choices.append(choice)
+    return choices
+
+
+def get_latest_choices_for_selected_thread(target_thread_id: str | None) -> tuple[str, list[str]]:
+    if not target_thread_id:
+        return "", []
+    try:
+        thread = bridge.choose_thread(target_thread_id, None)
+    except Exception:
+        return "", []
+    thread_ref = bridge.get_thread_workspace_ref(thread)
+    session_path = Path(thread.rollout_path)
+    if not session_path.exists():
+        return thread_ref, []
+    _last_user, last_assistant = bridge.get_last_user_and_assistant_messages(session_path)
+    return thread_ref, extract_numbered_choices(last_assistant)
+
+
+def build_choices_text(thread_ref: str, choices: list[str]) -> str:
+    if not choices:
+        return "No numbered choices found in the latest assistant message."
+    lines = ["Choices", f"thread: {thread_ref or '-'}", ""]
+    for index, choice in enumerate(choices, start=1):
+        lines.append(f"{index}. {choice}")
+    lines.extend(["", "Reply with /choose <number> or /choose <text>."])
+    return "\n".join(lines)
 
 
 def resolve_restart_python_exe() -> Path:
@@ -530,6 +571,11 @@ def pop_pending_ask() -> dict[str, object] | None:
         return PENDING_ASKS.pop(0)
 
 
+def get_pending_queue_size() -> int:
+    with PENDING_ASKS_LOCK:
+        return len(PENDING_ASKS)
+
+
 def start_ask_worker(
     token: str,
     chat_id: int,
@@ -601,6 +647,18 @@ def start_next_pending_ask(token: str) -> bool:
         f"prompt={prompt[:120].replace(chr(10), ' ')}"
     )
     return True
+
+
+def build_waiting_list_suffix(active_summary: str) -> str:
+    pending_count = get_pending_queue_size()
+    lines: list[str] = []
+    if active_summary:
+        lines.append(f"active: {active_summary}")
+    if pending_count > 0:
+        lines.append(f"queued: {pending_count}")
+    if not lines:
+        return ""
+    return "\n\nWaiting\n" + "\n".join(lines)
 
 
 def get_busy_labels(limit: int = 50) -> list[str]:
@@ -881,6 +939,8 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
                     "/confirm_delete_archive <ref>",
                     "/use <ref>",
                     "/status [ref]",
+                    "/choices",
+                    "/choose <number|text>",
                     "/doctor",
                     "/ask <prompt>",
                     "/ask_ipc <prompt> (alias)",
@@ -945,7 +1005,13 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
                 pass
         exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
         prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+        waiting_suffix = build_waiting_list_suffix(active_summary)
+        send_text(
+            token,
+            chat_id,
+            f"{prefix}\n\n{output or '(no output)'}{waiting_suffix}",
+            reply_to_message_id=reply_to_message_id,
+        )
         return
 
     if command == "/archived_list":
@@ -1011,6 +1077,45 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
         exit_code, output = run_bridge_command(argv)
         prefix = "Status" if exit_code == 0 else f"Status failed (exit {exit_code})"
         send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
+        return
+
+    if command in {"/choices", "/options"}:
+        thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+        send_text(
+            token,
+            chat_id,
+            build_choices_text(thread_ref, choices),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    if command in {"/choose", "/pick"}:
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, "/choose <number|text>")
+            return
+        chosen_prompt = arg
+        if arg.isdigit():
+            thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+            index = int(arg)
+            if index < 1 or index > len(choices):
+                send_text(
+                    token,
+                    chat_id,
+                    "Choice index is out of range.\n\n" + build_choices_text(thread_ref, choices),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+            chosen_prompt = choices[index - 1]
+        start_or_queue_ask(
+            token,
+            chat_id,
+            chosen_prompt,
+            reply_to_message_id,
+            active_summary,
+            target_thread_id,
+            target_ref,
+            target_label,
+        )
         return
 
     if command == "/use":
@@ -1181,13 +1286,14 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
 
     if command == "/list":
         limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30)
-        send_bridge_command_result(
+        exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
+        prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
+        waiting_suffix = build_waiting_list_suffix(active_summary)
+        send_text(
             token,
             chat_id,
-            reply_to_message_id,
-            ["list", "--limit", str(limit)],
-            "List",
-            "List failed",
+            f"{prefix}\n\n{output or '(no output)'}{waiting_suffix}",
+            reply_to_message_id=reply_to_message_id,
         )
         return
 
@@ -1277,6 +1383,45 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             resolve_status_args(arg or None),
             "Status",
             "Status failed",
+        )
+        return
+
+    if command in {"/choices", "/options"}:
+        thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+        send_text(
+            token,
+            chat_id,
+            build_choices_text(thread_ref, choices),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    if command in {"/choose", "/pick"}:
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, "/choose <number|text>")
+            return
+        chosen_prompt = arg
+        if arg.isdigit():
+            thread_ref, choices = get_latest_choices_for_selected_thread(target_thread_id)
+            index = int(arg)
+            if index < 1 or index > len(choices):
+                send_text(
+                    token,
+                    chat_id,
+                    "Choice index is out of range.\n\n" + build_choices_text(thread_ref, choices),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+            chosen_prompt = choices[index - 1]
+        start_or_queue_ask(
+            token,
+            chat_id,
+            chosen_prompt,
+            reply_to_message_id,
+            active_summary,
+            target_thread_id,
+            target_ref,
+            target_label,
         )
         return
 

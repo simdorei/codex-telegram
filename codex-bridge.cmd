@@ -27,18 +27,33 @@ if exist "%PYTHON_EXE%" goto after_python
 
 where py >nul 2>nul
 if %errorlevel%==0 (
-  py -3 "%SCRIPT%" %*
-  exit /b %errorlevel%
+  set "PY_LAUNCHER=py -3"
+  goto after_launcher
 )
 
 where python >nul 2>nul
 if %errorlevel%==0 (
-  python "%SCRIPT%" %*
-  exit /b %errorlevel%
+  set "PY_LAUNCHER=python"
+  goto after_launcher
 )
 
 echo ERROR: Python executable not found.
 exit /b 1
+
+:after_launcher
+if /I "%~1"=="--bot-only" (
+  if not exist "%TELEGRAM_PY%" (
+    echo ERROR: Telegram bot script not found: "%TELEGRAM_PY%"
+    exit /b 1
+  )
+  shift
+  %PY_LAUNCHER% "%TELEGRAM_PY%" %*
+  exit /b %errorlevel%
+)
+
+if "%AUTO_START_TELEGRAM%"=="1" if "%~1"=="" call :start_telegram_launcher
+%PY_LAUNCHER% "%SCRIPT%" %*
+exit /b %errorlevel%
 
 :after_python
 if /I "%~1"=="--bot-only" (
@@ -75,4 +90,15 @@ if /I "%TELEGRAM_PYTHON_EXE:~-11%"=="pythonw.exe" (
 ) else (
   start "Codex Telegram Bot" /min "%TELEGRAM_PYTHON_EXE%" "%TELEGRAM_PY%" --skip-old-updates
 )
+exit /b 0
+
+:start_telegram_launcher
+if not exist "%TELEGRAM_PY%" exit /b 0
+
+set "HAS_TELEGRAM_TOKEN="
+if defined TELEGRAM_BOT_TOKEN set "HAS_TELEGRAM_TOKEN=1"
+if not defined HAS_TELEGRAM_TOKEN findstr /R /I /C:"^[ ]*TELEGRAM_BOT_TOKEN[ ]*=" "%ENV_FILE%" >nul 2>nul && set "HAS_TELEGRAM_TOKEN=1"
+if not defined HAS_TELEGRAM_TOKEN exit /b 0
+
+start "Codex Telegram Bot" /min %PY_LAUNCHER% "%TELEGRAM_PY%" --skip-old-updates
 exit /b 0
