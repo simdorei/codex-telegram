@@ -22,3 +22,39 @@
 - Unresolved:
   - `/choose 1/2` still does not submit an approval decision.
   - approval submission needs the underlying request id and a safe bridge path to `item/commandExecution/requestApproval`.
+
+## 2026-04-15 14:08:08 +09:00
+- Goal: make Telegram-side approval replies usable enough for smoke tests and leave the current failure mode documented before pushing.
+- Findings:
+  - Approval prompts are now detected as `waiting-approval` and are visible in Telegram `/list`.
+  - Plain `1` no longer falls through to a normal ask when there is a matching waiting approval thread; it routes into the approval-reply path first.
+  - The approval path progressed through these concrete failures:
+    - `unknown UI automation error`
+    - `APPROVAL_CONTROL_NOT_FOUND`
+    - `SUBMIT_NOT_FOUND`
+    - `Permission approval UI action ran, but the thread is still waiting-approval`
+  - This means option `1` selection is at least partially reaching the desktop approval UI, but the final submit/accept handshake is still not clearing the live prompt.
+  - `/use <ref>` output was reordered so interactive request details print before `[last_user]` and `[last_assistant]`, because the previous ordering made the pending request effectively invisible in Telegram.
+- Changes:
+  - Fixed the Windows PowerShell 5.1 parser issue in the approval UI fallback (`??` removal).
+  - Added session-based interactive request extraction and waiting-state display helpers.
+  - Routed Telegram plain text like `1/3/cancel` toward the interactive reply path before normal ask dispatch.
+  - Improved approval UI automation matching with:
+    - broader option matching (`1. 예`, `예`, `1. Yes`, `Yes`, `^1.`)
+    - root-element fallback scanning
+    - debug candidate summary on control lookup failure
+    - Enter-key fallback after option-1 selection when the submit button is not found
+- Validation:
+  - Python `compile()` checks for `codex_desktop_bridge.py` and `codex_telegram_bot.py`
+  - local `command_use()` smoke check with synthetic `waiting-approval` data confirmed the interactive block now prints before message history
+  - Telegram logs confirmed the approval reply path is invoked for `1`
+  - latest reproduced outcomes in Telegram logs:
+    - `Permission approval UI submit failed: SUBMIT_NOT_FOUND`
+    - `Permission approval UI action ran, but the thread is still waiting-approval`
+- Current status:
+  - `waiting-approval` detection works
+  - Telegram reply routing for approval choices works
+  - actual approval completion is still unresolved
+  - visible-console restart path for the bot remains unstable; the reliable restart path is still the headless network-enabled one
+- Next focused step:
+  - inspect the live approval dialog more directly and match the real post-selection submit/accept control or action, instead of assuming button-name parity with the screenshot text.

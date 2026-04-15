@@ -14,6 +14,7 @@ flags because the Codex Desktop UI can change.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -809,6 +810,122 @@ def build_interactive_notice_from_function_call(payload: dict) -> str:
     return ""
 
 
+def classify_interactive_function_call(payload: dict | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    name = str(payload.get("name") or "").strip()
+    args = parse_function_call_arguments(payload)
+    if name == "request_user_input":
+        return "waiting-input"
+    if str(args.get("sandbox_permissions") or "").strip().lower() == "require_escalated":
+        return "waiting-approval"
+    return None
+
+
+def get_pending_interactive_function_call_from_session(
+    session_path: Path,
+    *,
+    recent_limit: int = 256,
+) -> dict | None:
+    recent_events: deque[dict] = deque(maxlen=max(32, recent_limit))
+    try:
+        for event in iter_session_events(session_path):
+            recent_events.append(event)
+    except OSError:
+        return None
+
+    completed_call_ids: set[str] = set()
+    for event in reversed(recent_events):
+        payload = event.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        if event.get("type") != "response_item":
+            continue
+
+        payload_type = str(payload.get("type") or "").strip()
+        if payload_type == "function_call_output":
+            call_id = str(payload.get("call_id") or "").strip()
+            if call_id:
+                completed_call_ids.add(call_id)
+            continue
+        if payload_type != "function_call":
+            continue
+
+        state = classify_interactive_function_call(payload)
+        if not state:
+            continue
+
+        call_id = str(payload.get("call_id") or "").strip()
+        if call_id and call_id in completed_call_ids:
+            continue
+        return payload
+
+    return None
+
+
+def get_pending_interactive_state_from_session(session_path: Path, *, recent_limit: int = 256) -> str | None:
+    payload = get_pending_interactive_function_call_from_session(
+        session_path,
+        recent_limit=recent_limit,
+    )
+    return classify_interactive_function_call(payload)
+
+
+def get_pending_permission_approval_from_session(
+    session_path: Path,
+    *,
+    recent_limit: int = 256,
+) -> dict | None:
+    payload = get_pending_interactive_function_call_from_session(
+        session_path,
+        recent_limit=recent_limit,
+    )
+    if classify_interactive_function_call(payload) != "waiting-approval":
+        return None
+    args = parse_function_call_arguments(payload or {})
+    if str(args.get("sandbox_permissions") or "").strip().lower() != "require_escalated":
+        return None
+    return {
+        "call_id": str((payload or {}).get("call_id") or "").strip(),
+        "tool_name": str((payload or {}).get("name") or "").strip(),
+        "question": str(args.get("justification") or "").strip(),
+    }
+
+
+def get_pending_interactive_display_lines(
+    session_path: Path,
+    *,
+    recent_limit: int = 256,
+) -> tuple[str | None, list[str]]:
+    payload = get_pending_interactive_function_call_from_session(
+        session_path,
+        recent_limit=recent_limit,
+    )
+    state = classify_interactive_function_call(payload)
+    if not state or not isinstance(payload, dict):
+        return None, []
+    notice = build_interactive_notice_from_function_call(payload)
+    lines = [line.strip() for line in notice.splitlines() if line.strip()]
+    if lines and lines[0].startswith("[") and lines[0].endswith("]"):
+        lines = lines[1:]
+    return state, lines
+
+
+def get_pending_interactive_summary(session_path: Path, *, limit: int = 100) -> str:
+    state, lines = get_pending_interactive_display_lines(session_path)
+    if not state or not lines:
+        return ""
+    if state == "waiting-approval":
+        if len(lines) >= 2 and lines[0].lower().startswith("tool:"):
+            return collapse_list_text(f"{lines[0]} | {lines[1]}", limit=limit)
+        return collapse_list_text(lines[0], limit=limit)
+    question = lines[0]
+    option_lines = [line for line in lines[1:] if re.match(r"^\d+[\.\)]\s+", line)]
+    if option_lines:
+        return collapse_list_text(f"{question} | {' / '.join(option_lines[:2])}", limit=limit)
+    return collapse_list_text(question, limit=limit)
+
+
 def iter_session_events(session_path: Path) -> Iterator[dict]:
     with session_path.open("r", encoding="utf-8") as handle:
         for raw in handle:
@@ -984,6 +1101,83 @@ def get_busy_threads(limit: int = 50) -> list[ThreadInfo]:
     return busy_threads
 
 
+def classify_thread_status(status_payload: dict | None) -> str | None:
+    if not isinstance(status_payload, dict):
+        return None
+    status_type = str(status_payload.get("type") or "").strip()
+    if not status_type:
+        return None
+    if status_type != "active":
+        return "busy" if status_type not in {"idle", "notLoaded"} else None
+
+    active_flags = {
+        str(flag).strip()
+        for flag in (status_payload.get("activeFlags") or [])
+        if str(flag).strip()
+    }
+    if "waitingOnUserInput" in active_flags:
+        return "waiting-input"
+    if "waitingOnApproval" in active_flags:
+        return "waiting-approval"
+    return "busy"
+
+
+def get_thread_busy_state(
+    thread: ThreadInfo,
+    *,
+    client: "CodexAppServerSidecar | None" = None,
+    allow_resume: bool = False,
+) -> str:
+    session_path = Path(thread.rollout_path)
+    if not session_path.exists() or not is_thread_busy(session_path):
+        return "idle"
+
+    own_client = False
+    if client is None:
+        try:
+            client = CodexAppServerSidecar()
+            own_client = True
+        except Exception:
+            client = None
+
+    try:
+        if client is not None:
+            thread_payload = (client.read_thread(thread.id, include_turns=False).get("thread") or {})
+            if get_sidecar_thread_status_type(thread_payload) == "notLoaded" and allow_resume:
+                thread_payload = ensure_thread_loaded_via_sidecar(client, thread.id)
+            classified = classify_thread_status(thread_payload.get("status") if isinstance(thread_payload, dict) else None)
+            if classified:
+                return classified
+    except Exception:
+        pass
+    finally:
+        if own_client and client is not None:
+            client.close()
+
+    interactive_state = get_pending_interactive_state_from_session(session_path)
+    if interactive_state:
+        return interactive_state
+
+    return "busy"
+
+
+def describe_thread_busy_state(state: str) -> str:
+    if state == "waiting-input":
+        return (
+            "The selected thread is waiting on a follow-up choice or input in Codex Desktop. "
+            "Open the thread in the app and respond there first."
+        )
+    if state == "waiting-approval":
+        return (
+            "The selected thread is waiting on an approval prompt in Codex Desktop. "
+            "Open the thread in the app and approve, reject, or cancel it first."
+        )
+    return (
+        "The selected thread is still busy. This often means the same Codex thread is currently active "
+        "or another task is still running. Wait, switch to another thread, or pass --force-while-busy."
+    )
+
+
 def read_new_session_events(session_path: Path, start_offset: int) -> tuple[list[dict], int]:
     events = []
     if not session_path.exists():
@@ -1092,6 +1286,25 @@ def _record_owner_client_from_ipc_message(message: dict, owner_clients: dict[str
     source_client_id = str(message.get("sourceClientId") or "").strip()
     if conversation_id and source_client_id:
         owner_clients[conversation_id] = source_client_id
+
+
+def _extract_thread_snapshot_from_ipc_message(message: dict, thread_id: str) -> tuple[dict, str] | None:
+    if message.get("type") != "broadcast" or message.get("method") != "thread-stream-state-changed":
+        return None
+    params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return None
+    conversation_id = str(params.get("conversationId") or "").strip()
+    if conversation_id != thread_id:
+        return None
+    change = params.get("change") or {}
+    if not isinstance(change, dict) or str(change.get("type") or "").strip() != "snapshot":
+        return None
+    conversation_state = change.get("conversationState") or {}
+    if not isinstance(conversation_state, dict):
+        return None
+    owner_client_id = str(message.get("sourceClientId") or "").strip()
+    return conversation_state, owner_client_id
 
 
 def _read_ipc_response(
@@ -1222,6 +1435,57 @@ def _request_start_turn_via_ipc(
     }
 
 
+def _request_submit_user_input_via_ipc(
+    handle: int,
+    source_client_id: str,
+    thread_id: str,
+    request_id: str,
+    response_payload: dict,
+    timeout_sec: float,
+    owner_clients: dict[str, str],
+) -> dict:
+    owner_client_id = owner_clients.get(thread_id)
+    request = {
+        "type": "request",
+        "requestId": str(uuid.uuid4()),
+        "sourceClientId": source_client_id,
+        "version": 1,
+        "method": "thread-follower-submit-user-input",
+        "params": {
+            "conversationId": thread_id,
+            "requestId": request_id,
+            "response": response_payload,
+        },
+    }
+    if owner_client_id:
+        request["targetClientId"] = owner_client_id
+    _write_ipc_message(handle, request)
+    response = _read_ipc_response(
+        handle,
+        request["requestId"],
+        timeout_sec=timeout_sec,
+        owner_clients=owner_clients,
+    )
+    if response.get("resultType") != "success":
+        error = str(response.get("error") or "unknown error")
+        if "no-client-found" in error:
+            raise IPCNoClientFoundError(error)
+        raise RuntimeError(f"IPC submit-user-input failed: {error}")
+    payload = response.get("result") or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("IPC submit-user-input returned an invalid payload.")
+    payload.setdefault(
+        "owner_client_id",
+        str(
+            response.get("handledByClientId")
+            or owner_clients.get(thread_id)
+            or owner_client_id
+            or ""
+        ).strip(),
+    )
+    return payload
+
+
 def start_turn_via_ipc(
     thread: ThreadInfo,
     prompt: str,
@@ -1291,6 +1555,576 @@ def start_turn_via_ipc(
                     owner_clients[thread.id] = discovered_owner
     finally:
         kernel32.CloseHandle(handle)
+
+
+def submit_user_input_via_ipc(
+    thread: ThreadInfo,
+    request_id: str,
+    response_payload: dict,
+    timeout_sec: float = 6.0,
+) -> dict:
+    handle = _open_codex_ipc_pipe()
+    owner_clients: dict[str, str] = {}
+    try:
+        source_client_id = _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
+        discovered_owner = _discover_owner_client_for_thread(
+            handle,
+            thread.id,
+            timeout_sec=max(0.75, min(timeout_sec, 2.5)),
+        )
+        if discovered_owner:
+            owner_clients[thread.id] = discovered_owner
+        result = _request_submit_user_input_via_ipc(
+            handle,
+            source_client_id,
+            thread_id=thread.id,
+            request_id=request_id,
+            response_payload=response_payload,
+            timeout_sec=timeout_sec,
+            owner_clients=owner_clients,
+        )
+        result.setdefault("request_id", request_id)
+        return result
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _request_submit_approval_decision_via_ipc(
+    handle: int,
+    source_client_id: str,
+    thread_id: str,
+    request_id: str,
+    decision_payload: object,
+    timeout_sec: float,
+    owner_clients: dict[str, str],
+    *,
+    method: str,
+    use_target_client: bool = True,
+) -> dict:
+    owner_client_id = owner_clients.get(thread_id)
+    request = {
+        "type": "request",
+        "requestId": str(uuid.uuid4()),
+        "sourceClientId": source_client_id,
+        "version": 1,
+        "method": method,
+        "params": {
+            "conversationId": thread_id,
+            "requestId": request_id,
+            "decision": decision_payload,
+        },
+    }
+    if use_target_client and owner_client_id:
+        request["targetClientId"] = owner_client_id
+    _write_ipc_message(handle, request)
+    response = _read_ipc_response(
+        handle,
+        request["requestId"],
+        timeout_sec=timeout_sec,
+        owner_clients=owner_clients,
+    )
+    if response.get("resultType") != "success":
+        error = str(response.get("error") or "unknown error")
+        if "no-client-found" in error:
+            raise IPCNoClientFoundError(error)
+        raise RuntimeError(f"IPC approval decision failed: {error}")
+    payload = response.get("result") or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("IPC approval decision returned an invalid payload.")
+    payload.setdefault(
+        "owner_client_id",
+        str(
+            response.get("handledByClientId")
+            or owner_clients.get(thread_id)
+            or owner_client_id
+            or ""
+        ).strip(),
+    )
+    return payload
+
+
+def submit_approval_decision_via_ipc(
+    thread: ThreadInfo,
+    request_id: str,
+    decision_payload: object,
+    request_kind: str,
+    timeout_sec: float = 6.0,
+    *,
+    use_target_client: bool = True,
+) -> dict:
+    method = {
+        "commandExecution": "thread-follower-command-approval-decision",
+        "fileChange": "thread-follower-file-approval-decision",
+    }.get(request_kind)
+    if not method:
+        raise RuntimeError(f"Unsupported approval request kind: {request_kind}")
+
+    handle = _open_codex_ipc_pipe()
+    owner_clients: dict[str, str] = {}
+    try:
+        source_client_id = _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
+        discovered_owner = _discover_owner_client_for_thread(
+            handle,
+            thread.id,
+            timeout_sec=max(0.75, min(timeout_sec, 2.5)),
+        )
+        if discovered_owner:
+            owner_clients[thread.id] = discovered_owner
+        result = _request_submit_approval_decision_via_ipc(
+            handle,
+            source_client_id,
+            thread_id=thread.id,
+            request_id=request_id,
+            decision_payload=decision_payload,
+            timeout_sec=timeout_sec,
+            owner_clients=owner_clients,
+            method=method,
+            use_target_client=use_target_client,
+        )
+        result.setdefault("request_id", request_id)
+        result.setdefault("request_kind", request_kind)
+        return result
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _extract_pending_approval_request(conversation_state: dict, thread_id: str) -> dict | None:
+    requests = conversation_state.get("requests") or []
+    if not isinstance(requests, list):
+        return None
+
+    kind_by_method = {
+        "item/commandExecution/requestApproval": "commandExecution",
+        "item/fileChange/requestApproval": "fileChange",
+    }
+    for request in reversed(requests):
+        if not isinstance(request, dict):
+            continue
+        method = str(request.get("method") or "").strip()
+        request_kind = kind_by_method.get(method)
+        if request_kind is None:
+            continue
+        params = request.get("params") or {}
+        if not isinstance(params, dict):
+            continue
+        request_thread_id = str(params.get("threadId") or thread_id).strip()
+        if request_thread_id and request_thread_id != thread_id:
+            continue
+        request_id = str(request.get("id") or "").strip()
+        if not request_id:
+            continue
+        return {
+            "thread_id": thread_id,
+            "request_id": request_id,
+            "request_kind": request_kind,
+            "method": method,
+            "item_id": str(params.get("itemId") or "").strip(),
+            "reason": str(params.get("reason") or "").strip(),
+        }
+    return None
+
+
+def get_pending_approval_request_via_ipc(
+    thread: ThreadInfo,
+    timeout_sec: float = 6.0,
+) -> dict | None:
+    handle = _open_codex_ipc_pipe()
+    owner_clients: dict[str, str] = {}
+    try:
+        _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
+        deadline = time.time() + max(timeout_sec, 0.0)
+        while time.time() < deadline:
+            try:
+                message = _read_ipc_message(
+                    handle,
+                    max(PIPE_PEEK_RETRY_SEC, deadline - time.time()),
+                )
+            except TimeoutError:
+                break
+            _record_owner_client_from_ipc_message(message, owner_clients)
+            snapshot = _extract_thread_snapshot_from_ipc_message(message, thread.id)
+            if snapshot is None:
+                continue
+            conversation_state, owner_client_id = snapshot
+            if owner_client_id:
+                owner_clients[thread.id] = owner_client_id
+            pending_request = _extract_pending_approval_request(conversation_state, thread.id)
+            if pending_request is None:
+                return None
+            pending_request.setdefault(
+                "owner_client_id",
+                owner_clients.get(thread.id) or owner_client_id or "",
+            )
+            return pending_request
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _extract_pending_user_input_request(conversation_state: dict, thread_id: str) -> dict | None:
+    requests = conversation_state.get("requests") or []
+    if not isinstance(requests, list):
+        return None
+
+    for request in reversed(requests):
+        if not isinstance(request, dict):
+            continue
+        method = str(request.get("method") or "").strip()
+        if method != "item/tool/requestUserInput":
+            continue
+        params = request.get("params") or {}
+        if not isinstance(params, dict):
+            continue
+        request_thread_id = str(params.get("threadId") or thread_id).strip()
+        if request_thread_id and request_thread_id != thread_id:
+            continue
+        questions_payload = params.get("questions") or []
+        if not isinstance(questions_payload, list) or not questions_payload:
+            continue
+
+        questions: list[dict[str, object]] = []
+        for question in questions_payload:
+            if not isinstance(question, dict):
+                continue
+            options_payload = question.get("options") or []
+            options: list[dict[str, str]] = []
+            if isinstance(options_payload, list):
+                for option in options_payload:
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get("label") or "").strip()
+                    description = str(option.get("description") or "").strip()
+                    if not label:
+                        continue
+                    options.append(
+                        {
+                            "label": label,
+                            "description": description,
+                        }
+                    )
+            questions.append(
+                {
+                    "id": str(question.get("id") or "").strip(),
+                    "header": str(question.get("header") or "").strip(),
+                    "question": str(question.get("question") or "").strip(),
+                    "is_other": question.get("isOther") is True,
+                    "is_secret": question.get("isSecret") is True,
+                    "options": options,
+                }
+            )
+        if not questions:
+            continue
+
+        return {
+            "thread_id": thread_id,
+            "request_id": str(request.get("id") or "").strip(),
+            "turn_id": str(params.get("turnId") or "").strip(),
+            "item_id": str(params.get("itemId") or "").strip(),
+            "questions": questions,
+        }
+
+    return None
+
+
+def get_pending_user_input_request_via_ipc(
+    thread: ThreadInfo,
+    timeout_sec: float = 6.0,
+) -> dict | None:
+    handle = _open_codex_ipc_pipe()
+    owner_clients: dict[str, str] = {}
+    try:
+        _initialize_ipc_client(handle, owner_clients, timeout_sec=min(timeout_sec, 3.0))
+        deadline = time.time() + max(timeout_sec, 0.0)
+        while time.time() < deadline:
+            try:
+                message = _read_ipc_message(
+                    handle,
+                    max(PIPE_PEEK_RETRY_SEC, deadline - time.time()),
+                )
+            except TimeoutError:
+                break
+            _record_owner_client_from_ipc_message(message, owner_clients)
+            snapshot = _extract_thread_snapshot_from_ipc_message(message, thread.id)
+            if snapshot is None:
+                continue
+            conversation_state, owner_client_id = snapshot
+            if owner_client_id:
+                owner_clients[thread.id] = owner_client_id
+            pending_request = _extract_pending_user_input_request(conversation_state, thread.id)
+            if pending_request is None:
+                return None
+            pending_request.setdefault(
+                "owner_client_id",
+                owner_clients.get(thread.id) or owner_client_id or "",
+            )
+            return pending_request
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _split_reply_input_values(raw_value: str) -> list[str]:
+    values = [part.strip() for part in str(raw_value).split("|")]
+    return [value for value in values if value]
+
+
+def _resolve_reply_input_answers(question: dict, raw_value: str) -> list[str]:
+    values = _split_reply_input_values(raw_value)
+    if not values:
+        raise RuntimeError("Answer text was empty.")
+    options = question.get("options") or []
+    option_labels = [
+        str(option.get("label") or "").strip()
+        for option in options
+        if str(option.get("label") or "").strip()
+    ]
+    resolved: list[str] = []
+    for value in values:
+        if option_labels and value.isdigit():
+            option_index = int(value) - 1
+            if 0 <= option_index < len(option_labels):
+                resolved.append(option_labels[option_index])
+                continue
+        matched_label = next(
+            (label for label in option_labels if label.lower() == value.lower()),
+            None,
+        )
+        if matched_label is not None:
+            resolved.append(matched_label)
+            continue
+        resolved.append(value)
+    return resolved
+
+
+def build_reply_input_response_payload(
+    pending_request: dict,
+    answer_text: str,
+) -> tuple[dict, dict[str, list[str]]]:
+    questions = pending_request.get("questions") or []
+    if not isinstance(questions, list) or not questions:
+        raise RuntimeError("No pending input questions were available to answer.")
+
+    question_map: dict[str, dict] = {}
+    for index, question in enumerate(questions, start=1):
+        question_id = str((question or {}).get("id") or "").strip()
+        if not question_id:
+            raise RuntimeError(f"Pending input question {index} did not include an id.")
+        question_map[question_id] = question
+
+    normalized = answer_text.strip()
+    if not normalized:
+        raise RuntimeError("Answer text was empty.")
+
+    answers_by_question: dict[str, list[str]] = {}
+    if len(question_map) == 1 and "=" not in normalized:
+        only_question_id = next(iter(question_map))
+        answers_by_question[only_question_id] = _resolve_reply_input_answers(
+            question_map[only_question_id],
+            normalized,
+        )
+    else:
+        assignments: dict[str, str] = {}
+        for segment in normalized.split(";"):
+            segment = segment.strip()
+            if not segment:
+                continue
+            if "=" not in segment:
+                raise RuntimeError(
+                    "Multi-question replies must use question_id=value; other_id=value format."
+                )
+            question_id, raw_value = segment.split("=", 1)
+            question_id = question_id.strip()
+            raw_value = raw_value.strip()
+            if not question_id:
+                raise RuntimeError("A reply_input assignment was missing the question id.")
+            assignments[question_id] = raw_value
+
+        missing_question_ids = [
+            question_id for question_id in question_map if question_id not in assignments
+        ]
+        if missing_question_ids:
+            raise RuntimeError(
+                "Missing answers for question ids: " + ", ".join(missing_question_ids)
+            )
+
+        unknown_question_ids = [
+            question_id for question_id in assignments if question_id not in question_map
+        ]
+        if unknown_question_ids:
+            raise RuntimeError(
+                "Unknown question ids: " + ", ".join(unknown_question_ids)
+            )
+
+        for question_id, raw_value in assignments.items():
+            answers_by_question[question_id] = _resolve_reply_input_answers(
+                question_map[question_id],
+                raw_value,
+            )
+
+    response_payload = {
+        "answers": {
+            question_id: {"answers": values}
+            for question_id, values in answers_by_question.items()
+        }
+    }
+    return response_payload, answers_by_question
+
+
+def build_approval_decision_payload(answer_text: str) -> tuple[str, str]:
+    normalized = str(answer_text).strip()
+    lowered = normalized.lower()
+    if normalized == "1" or lowered in {"approve", "approved", "accept", "yes", "y", "ok", "예", "네", "승인"}:
+        return ("accept", "accept")
+    if normalized == "2":
+        raise RuntimeError(
+            "Approval option 2 (approve and remember / don't ask again) is not supported in the Telegram bridge yet. "
+            "Use Codex Desktop for that choice."
+        )
+    if normalized == "3" or lowered in {"decline", "reject", "no", "n", "아니요", "거절"}:
+        return ("decline", "decline")
+    if lowered in {"cancel", "skip", "dismiss", "건너뛰기", "취소"}:
+        return ("cancel", "cancel")
+    raise RuntimeError(
+        "Unrecognized approval reply. Use 1 to approve, 3 to decline, or cancel to skip. "
+        "Option 2 still requires Codex Desktop."
+    )
+
+
+def _build_approval_decision_candidate_payloads(decision_action: str) -> list[object]:
+    candidates: list[object] = [decision_action]
+    if decision_action == "accept":
+        candidates.append({"action": "accept", "content": {}, "_meta": None})
+    else:
+        candidates.append({"action": decision_action, "content": None, "_meta": None})
+    return candidates
+
+
+def reply_to_pending_user_input(
+    thread: ThreadInfo,
+    answer_text: str,
+    timeout_sec: float = 6.0,
+) -> dict:
+    pending_request = get_pending_user_input_request_via_ipc(thread, timeout_sec=timeout_sec)
+    if pending_request is None:
+        busy_state = get_thread_busy_state(thread, allow_resume=True)
+        if busy_state == "waiting-input":
+            raise RuntimeError(
+                "The thread still looks like waiting-input, but no pending input request snapshot "
+                "was received over IPC. Open the thread once in Codex Desktop and retry."
+            )
+        raise RuntimeError("No pending user input request is active for the selected thread.")
+
+    request_id = str(pending_request.get("request_id") or "").strip()
+    if not request_id:
+        raise RuntimeError("The pending input request did not include a request id.")
+
+    response_payload, answers_by_question = build_reply_input_response_payload(
+        pending_request,
+        answer_text,
+    )
+    result = submit_user_input_via_ipc(
+        thread,
+        request_id,
+        response_payload,
+        timeout_sec=timeout_sec,
+    )
+    result.setdefault("request_id", request_id)
+    result["answers_by_question"] = answers_by_question
+    return result
+
+
+def reply_to_pending_approval(
+    thread: ThreadInfo,
+    answer_text: str,
+    timeout_sec: float = 6.0,
+) -> dict:
+    session_path = Path(thread.rollout_path)
+    permission_prompt = get_pending_permission_approval_from_session(session_path)
+    if permission_prompt is not None:
+        _decision_payload, decision_action = build_approval_decision_payload(answer_text)
+        result = submit_permission_approval_via_ui(decision_action)
+        deadline = time.time() + max(timeout_sec, 8.0)
+        last_state = "waiting-approval"
+        while time.time() < deadline:
+            time.sleep(0.5)
+            last_state = get_thread_busy_state(thread, allow_resume=True)
+            if last_state != "waiting-approval":
+                result["verification_busy_state"] = last_state
+                result["request_id"] = permission_prompt.get("call_id") or ""
+                return result
+        raise RuntimeError(
+            "Permission approval UI action ran, but the thread is still waiting-approval.\n"
+            f"thread: {thread.id}\n"
+            f"call_id: {permission_prompt.get('call_id') or '-'}\n"
+            f"tool: {permission_prompt.get('tool_name') or '-'}\n"
+            f"verification_busy_state: {last_state}"
+        )
+
+    pending_request = get_pending_approval_request_via_ipc(thread, timeout_sec=timeout_sec)
+    if pending_request is None:
+        busy_state = get_thread_busy_state(thread, allow_resume=True)
+        if busy_state == "waiting-approval":
+            raise RuntimeError(
+                "The thread still looks like waiting-approval, but no pending approval request snapshot "
+                "was received over IPC. Open the thread once in Codex Desktop and retry."
+            )
+        raise RuntimeError("No pending approval request is active for the selected thread.")
+
+    request_id = str(pending_request.get("request_id") or "").strip()
+    if not request_id:
+        raise RuntimeError("The pending approval request did not include a request id.")
+
+    request_kind = str(pending_request.get("request_kind") or "").strip()
+    if not request_kind:
+        raise RuntimeError("The pending approval request did not include a request kind.")
+
+    _decision_payload, decision_action = build_approval_decision_payload(answer_text)
+    last_result: dict | None = None
+    attempts: list[str] = []
+    payload_candidates = _build_approval_decision_candidate_payloads(decision_action)
+
+    for payload_index, candidate_payload in enumerate(payload_candidates, start=1):
+        for use_target_client in (True, False):
+            if not use_target_client and not str(pending_request.get("owner_client_id") or "").strip():
+                continue
+            result = submit_approval_decision_via_ipc(
+                thread,
+                request_id,
+                candidate_payload,
+                request_kind,
+                timeout_sec=timeout_sec,
+                use_target_client=use_target_client,
+            )
+            last_result = result
+            attempts.append(
+                f"payload#{payload_index}="
+                f"{'string' if isinstance(candidate_payload, str) else 'object'}"
+                f"/target={'owner' if use_target_client else 'broadcast'}"
+            )
+            time.sleep(0.75)
+            busy_state = get_thread_busy_state(thread, allow_resume=True)
+            if busy_state != "waiting-approval":
+                result.setdefault("request_id", request_id)
+                result["decision_action"] = decision_action
+                result["request_kind"] = request_kind
+                result["verification_busy_state"] = busy_state
+                result["attempts"] = attempts
+                return result
+
+    failure_lines = [
+        "Approval submit was acknowledged, but the thread is still waiting-approval.",
+        f"thread: {thread.id}",
+        f"request_id: {request_id}",
+        f"request_kind: {request_kind}",
+    ]
+    if attempts:
+        failure_lines.extend(["", "attempts:"])
+        failure_lines.extend(f"- {entry}" for entry in attempts)
+    if last_result:
+        handled_by = str(last_result.get("owner_client_id") or "").strip()
+        if handled_by:
+            failure_lines.extend(["", f"handled_by_client: {handled_by}"])
+    raise RuntimeError("\n".join(failure_lines))
 
 
 def resolve_codex_app_server_executable() -> str:
@@ -2145,6 +2979,7 @@ public static class Native {
 '@
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type $code
 $script:result = [IntPtr]::Zero
 $cb = [Native+EnumWindowsProc]{
@@ -3154,6 +3989,290 @@ def click_window(window: WindowInfo, x_ratio: float, y_offset: int) -> tuple[int
     return x, y
 
 
+def submit_permission_approval_via_ui(decision_action: str) -> dict:
+    if decision_action == "decline":
+        raise RuntimeError(
+            "Decline for shell permission approvals still needs the Codex Desktop text explanation flow. "
+            "Use Codex Desktop for option 3, or send cancel here."
+        )
+
+    action_arg = {
+        "accept": "accept",
+        "cancel": "cancel",
+    }.get(decision_action)
+    if not action_arg:
+        raise RuntimeError(f"Unsupported permission approval decision: {decision_action}")
+
+    focus_window(find_codex_window())
+    script = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$decision = [string]$env:CODEX_APPROVAL_DECISION
+$decision = $decision.Trim().ToLowerInvariant()
+if (-not $decision) { Write-Output 'NO_DECISION'; exit 2 }
+
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+public static class Native {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+}
+'@
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type $code
+
+function Normalize-Name {
+  param([string]$Name)
+  if (-not $Name) { return '' }
+  return (($Name -replace "`r|`n", ' ') -replace '\s+', ' ').Trim()
+}
+
+function Get-CodexWindowHandle {
+  $script:result = [IntPtr]::Zero
+  $cb = [Native+EnumWindowsProc]{
+    param($hwnd, $lParam)
+    if (-not [Native]::IsWindowVisible($hwnd)) { return $true }
+    $len = [Native]::GetWindowTextLength($hwnd)
+    if ($len -le 0) { return $true }
+    $sb = New-Object System.Text.StringBuilder ($len + 1)
+    [void][Native]::GetWindowText($hwnd, $sb, $sb.Capacity)
+    $title = $sb.ToString()
+    if ($title -like '*Codex*') {
+      $script:result = $hwnd
+      return $false
+    }
+    return $true
+  }
+  [void][Native]::EnumWindows($cb, [IntPtr]::Zero)
+  return $script:result
+}
+
+function Find-CodexAutomationWindow {
+  param($Handle)
+  $cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty,
+    [int]$Handle
+  )
+  return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    $cond
+  )
+}
+
+function Get-AllElements {
+  param($Root)
+  return $Root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition
+  )
+}
+
+function Find-ElementByNeedles {
+  param($Elements, [string[]]$Needles, [string[]]$RejectNeedles)
+  for ($i = 0; $i -lt $Elements.Count; $i++) {
+    $el = $Elements.Item($i)
+    try {
+      $name = Normalize-Name $el.Current.Name
+      if (-not $name) { continue }
+      $hit = $false
+      foreach ($needle in $Needles) {
+        if ($needle -and $name -like "*$needle*") { $hit = $true; break }
+      }
+      if (-not $hit) { continue }
+      $reject = $false
+      foreach ($needle in $RejectNeedles) {
+        if ($needle -and $name -like "*$needle*") { $reject = $true; break }
+      }
+      if ($reject) { continue }
+      return $el
+    } catch {}
+  }
+  return $null
+}
+
+function Find-ElementByRegexes {
+  param($Elements, [string[]]$Regexes, [string[]]$RejectRegexes)
+  for ($i = 0; $i -lt $Elements.Count; $i++) {
+    $el = $Elements.Item($i)
+    try {
+      $name = Normalize-Name $el.Current.Name
+      if (-not $name) { continue }
+      $reject = $false
+      foreach ($rx in $RejectRegexes) {
+        if ($rx -and ($name -match $rx)) { $reject = $true; break }
+      }
+      if ($reject) { continue }
+      foreach ($rx in $Regexes) {
+        if ($rx -and ($name -match $rx)) { return $el }
+      }
+    } catch {}
+  }
+  return $null
+}
+
+function Get-DebugCandidateSummary {
+  param($Elements)
+  $names = New-Object 'System.Collections.Generic.List[string]'
+  for ($i = 0; $i -lt $Elements.Count; $i++) {
+    $el = $Elements.Item($i)
+    try {
+      $name = Normalize-Name $el.Current.Name
+      if (-not $name) { continue }
+      if ($name -match '제출|Submit|^1[\.\)]|^2[\.\)]|^3[\.\)]|예|Yes|아니요|No|건너뛰기|Skip|Cancel|다시 묻지 않기') {
+        if (-not $names.Contains($name)) {
+          [void]$names.Add($name)
+        }
+      }
+    } catch {}
+  }
+  if ($names.Count -le 0) { return '' }
+  return ($names | Select-Object -First 12) -join ' || '
+}
+
+function Invoke-Element {
+  param($Element)
+  if (-not $Element) { return $false }
+  try {
+    $invoke = $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($invoke) {
+      $invoke.Invoke()
+      return $true
+    }
+  } catch {}
+  try {
+    $selection = $Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    if ($selection) {
+      $selection.Select()
+      return $true
+    }
+  } catch {}
+  try {
+    $legacy = $Element.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+    if ($legacy) {
+      $legacy.DoDefaultAction()
+      return $true
+    }
+  } catch {}
+  try {
+    $rect = $Element.Current.BoundingRectangle
+    if ($rect.Width -gt 1 -and $rect.Height -gt 1) {
+      $x = [int]($rect.Left + ($rect.Width / 2))
+      $y = [int]($rect.Top + ($rect.Height / 2))
+      [void][Native]::SetCursorPos($x, $y)
+      Start-Sleep -Milliseconds 80
+      [Native]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+      [Native]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+      return $true
+    }
+  } catch {}
+  return $false
+}
+
+$handle = Get-CodexWindowHandle
+if ($handle -eq [IntPtr]::Zero) { Write-Output 'NO_CODEX_WINDOW'; exit 3 }
+[void][Native]::ShowWindow($handle, 9)
+[void][Native]::SetForegroundWindow($handle)
+[void][Native]::BringWindowToTop($handle)
+Start-Sleep -Milliseconds 200
+$win = Find-CodexAutomationWindow $handle
+if (-not $win) { $win = [System.Windows.Automation.AutomationElement]::RootElement }
+$rootElement = [System.Windows.Automation.AutomationElement]::RootElement
+
+for ($attempt = 0; $attempt -lt 5; $attempt++) {
+  $all = Get-AllElements $win
+  $allFallback = $null
+  if ($decision -eq 'cancel') {
+    $cancel = Find-ElementByNeedles $all @('건너뛰기', 'Skip', 'Cancel') @()
+    if (-not $cancel -and $win -ne $rootElement) {
+      $allFallback = Get-AllElements $rootElement
+      $cancel = Find-ElementByNeedles $allFallback @('건너뛰기', 'Skip', 'Cancel') @()
+    }
+    if ($cancel -and (Invoke-Element $cancel)) {
+      Write-Output 'ACTION=cancel'
+      exit 0
+    }
+  } else {
+    $option = Find-ElementByNeedles $all @('1. 예', '예', '1. Yes', 'Yes') @('다시 묻지 않기', "don't ask again", '아니요')
+    if (-not $option) {
+      $option = Find-ElementByRegexes $all @('^1[\.\)]\s*', '^(예|Yes)$') @('다시 묻지 않기', "don't ask again", '아니요', '^2[\.\)]', '^3[\.\)]')
+    }
+    if (-not $option -and $win -ne $rootElement) {
+      if (-not $allFallback) { $allFallback = Get-AllElements $rootElement }
+      $option = Find-ElementByNeedles $allFallback @('1. 예', '예', '1. Yes', 'Yes') @('다시 묻지 않기', "don't ask again", '아니요')
+      if (-not $option) {
+        $option = Find-ElementByRegexes $allFallback @('^1[\.\)]\s*', '^(예|Yes)$') @('다시 묻지 않기', "don't ask again", '아니요', '^2[\.\)]', '^3[\.\)]')
+      }
+    }
+    if ($option -and (Invoke-Element $option)) {
+      Start-Sleep -Milliseconds 180
+      $all = Get-AllElements $win
+      $submit = Find-ElementByNeedles $all @('제출', 'Submit') @()
+      if (-not $submit) {
+        $submit = Find-ElementByRegexes $all @('^(제출|Submit)$') @()
+      }
+      if (-not $submit -and $win -ne $rootElement) {
+        if (-not $allFallback) { $allFallback = Get-AllElements $rootElement }
+        $submit = Find-ElementByNeedles $allFallback @('제출', 'Submit') @()
+        if (-not $submit) {
+          $submit = Find-ElementByRegexes $allFallback @('^(제출|Submit)$') @()
+        }
+      }
+      if ($submit -and (Invoke-Element $submit)) {
+        Write-Output 'ACTION=accept'
+        exit 0
+      }
+      [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+      Start-Sleep -Milliseconds 180
+      Write-Output 'ACTION=accept-enter'
+      exit 0
+    }
+  }
+  Start-Sleep -Milliseconds 180
+}
+
+if ($allFallback) {
+  $debugSummary = Get-DebugCandidateSummary $allFallback
+} else {
+  $debugSummary = Get-DebugCandidateSummary $all
+}
+if ($debugSummary) {
+  Write-Output ("APPROVAL_CONTROL_NOT_FOUND " + $debugSummary)
+} else {
+  Write-Output 'APPROVAL_CONTROL_NOT_FOUND'
+}
+exit 6
+"""
+    env = os.environ.copy()
+    env["CODEX_APPROVAL_DECISION"] = action_arg
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        cwd=str(SCRIPT_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        details = stdout or stderr or "unknown UI automation error"
+        raise RuntimeError(f"Permission approval UI submit failed: {details}")
+    return {
+        "decision_action": decision_action,
+        "request_kind": "permission",
+        "ui_result": stdout or "ok",
+    }
+
+
 def send_prompt_to_codex(
     prompt: str,
     click_x_ratio: float,
@@ -3187,29 +4306,46 @@ def send_prompt_to_codex(
 def print_thread_list(threads: list[ThreadInfo]) -> None:
     selected_thread_id = get_selected_thread_id()
     workspace_refs = build_workspace_ref_map(threads)
-    for index, thread in enumerate(threads, start=1):
-        marker = "*" if thread.id == selected_thread_id else " "
-        ui_name = get_thread_ui_name(thread.id, thread)
-        summary = collapse_list_text(ui_name or thread.title, limit=70)
-        workspace = workspace_refs.get(thread.id, get_thread_workspace_name(thread))
-        busy = is_thread_busy(Path(thread.rollout_path))
-        state = "busy" if busy else "idle"
-        context_usage = get_thread_context_usage(thread)
-        if context_usage is None:
-            ctx_display = "-/-"
-        else:
-            ctx_display = (
-                f"{format_token_k(context_usage.last_input_tokens)}/"
-                f"{format_token_k(context_usage.peak_input_tokens)}"
+    sidecar: CodexAppServerSidecar | None = None
+    try:
+        for index, thread in enumerate(threads, start=1):
+            marker = "*" if thread.id == selected_thread_id else " "
+            ui_name = get_thread_ui_name(thread.id, thread)
+            summary = collapse_list_text(ui_name or thread.title, limit=70)
+            workspace = workspace_refs.get(thread.id, get_thread_workspace_name(thread))
+            session_path = Path(thread.rollout_path)
+            busy = session_path.exists() and is_thread_busy(session_path)
+            state = "idle"
+            if busy:
+                if sidecar is None:
+                    try:
+                        sidecar = CodexAppServerSidecar()
+                    except Exception:
+                        sidecar = None
+                state = get_thread_busy_state(thread, client=sidecar, allow_resume=True) if sidecar else "busy"
+            context_usage = get_thread_context_usage(thread)
+            if context_usage is None:
+                ctx_display = "-/-"
+            else:
+                ctx_display = (
+                    f"{format_token_k(context_usage.last_input_tokens)}/"
+                    f"{format_token_k(context_usage.peak_input_tokens)}"
+                )
+            used_display = format_token_k(thread.tokens_used)
+            rec_display = "archive" if should_recommend_archive(thread, context_usage) else "-"
+            line = (
+                f"{marker}{index:>2} | {workspace:<12} | {state:<16} | "
+                f"ctx {ctx_display:>15} | used {used_display:>7} | rec {rec_display:<7} | "
+                f"{thread.id} | {format_timestamp(thread.updated_at)} | {summary}"
             )
-        used_display = format_token_k(thread.tokens_used)
-        rec_display = "archive" if should_recommend_archive(thread, context_usage) else "-"
-        line = (
-            f"{marker}{index:>2} | {workspace:<12} | {state:<4} | "
-            f"ctx {ctx_display:>15} | used {used_display:>7} | rec {rec_display:<7} | "
-            f"{thread.id} | {format_timestamp(thread.updated_at)} | {summary}"
-        )
-        print(make_console_safe_text(line))
+            print(make_console_safe_text(line))
+            if state.startswith("waiting-"):
+                interactive_summary = get_pending_interactive_summary(session_path)
+                if interactive_summary:
+                    print(make_console_safe_text(f"     | request      | {interactive_summary}"))
+    finally:
+        if sidecar is not None:
+            sidecar.close()
 
 
 def print_archived_thread_list(threads: list[ThreadInfo]) -> None:
@@ -3240,7 +4376,8 @@ def command_status(args: argparse.Namespace) -> int:
     thread = choose_thread(args.thread_id, args.cwd)
     session_path = Path(thread.rollout_path)
     last_user, last_assistant = get_last_user_and_assistant_messages(session_path)
-    busy = is_thread_busy(session_path)
+    busy_state = get_thread_busy_state(thread, allow_resume=True)
+    busy = busy_state != "idle"
     slot = get_thread_slot(thread)
     ui_name = get_thread_ui_name(thread.id, thread)
     context_usage = get_thread_context_usage(thread)
@@ -3264,6 +4401,7 @@ def command_status(args: argparse.Namespace) -> int:
         print("context_usage: -")
     print(f"ui_slot: {slot if slot is not None else '-'}")
     print(f"busy: {busy}")
+    print(f"busy_state: {busy_state}")
     print(f"session_path: {session_path}")
     print("")
     if last_user:
@@ -3427,9 +4565,7 @@ def command_archive(args: argparse.Namespace) -> int:
 
     session_path = Path(thread.rollout_path)
     if session_path.exists() and is_thread_busy(session_path):
-        raise RuntimeError(
-            "The selected thread is still busy. Wait for it to finish before archiving it."
-        )
+        raise RuntimeError(describe_thread_busy_state(get_thread_busy_state(thread, allow_resume=True)))
 
     with CodexAppServerSidecar() as client:
         client.archive_thread(thread.id)
@@ -3502,7 +4638,13 @@ def command_use(args: argparse.Namespace) -> int:
     set_selected_thread_id(thread.id)
     session_path = Path(thread.rollout_path)
     last_user, last_assistant = get_last_user_and_assistant_messages(session_path)
+    interactive_state, interactive_lines = get_pending_interactive_display_lines(session_path)
     print(f"selected_thread: {thread.id}")
+    if interactive_lines:
+        print("")
+        print(f"[{interactive_state}]")
+        for line in interactive_lines:
+            print(line)
     if last_user:
         print("")
         print("[last_user]")
@@ -3638,10 +4780,7 @@ def command_ask(args: argparse.Namespace) -> int:
         )
 
     if is_thread_busy(session_path) and not args.force_while_busy:
-        raise RuntimeError(
-            "The selected thread is still busy. This often means the same Codex thread is currently active "
-            "or another task is still running. Wait, switch to another thread, or pass --force-while-busy."
-        )
+        raise RuntimeError(describe_thread_busy_state(get_thread_busy_state(thread, allow_resume=True)))
 
     start_offset = session_path.stat().st_size
     recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
