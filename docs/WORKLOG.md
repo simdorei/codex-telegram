@@ -58,3 +58,61 @@
   - visible-console restart path for the bot remains unstable; the reliable restart path is still the headless network-enabled one
 - Next focused step:
   - inspect the live approval dialog more directly and match the real post-selection submit/accept control or action, instead of assuming button-name parity with the screenshot text.
+
+## 2026-04-18 00:24:00 +09:00
+- Goal: switch the approval bridge away from the failing submit-button assumption and leave the current state ready for the next smoke test.
+- Findings:
+  - User confirmed the current Codex Desktop approval UI semantics more precisely:
+    - `1` = immediate approve
+    - `2` = immediate approve + remember
+    - free-text input + submit = decline with reason
+  - This means the earlier `SUBMIT_NOT_FOUND` path was likely wrong for options `1/2`; those rows should be clicked directly instead of selecting then searching for a separate submit button.
+  - `waiting-approval` detection and Telegram routing are still the right base:
+    - `/list` shows the waiting state
+    - plain Telegram `1/2/cancel` is routed into the approval reply path before a normal ask
+  - Bot process inspection/restart from the shell still hits Windows process-access limits unless run with elevated permission.
+- Changes:
+  - Added `CODEX_DESKTOP_EXE` discovery + persistence support so the desktop app path can be auto-found and stored in local `.env`.
+  - Added bridge/Telegram commands for desktop discovery and restart:
+    - `discover_codex`
+    - `restart_codex`
+    - `/discover_codex`
+    - `/restart_codex`
+  - Added a new approval UI path `submit_permission_approval_via_ui_row_select()` and switched the live approval caller to it.
+  - The new row-select path keeps:
+    - text reply => decline message paste + Enter
+    - `cancel` => skip/cancel control search
+    - `1` => row `1` click/invoke
+    - `2` => row `2` click/invoke
+  - Telegram approval help text now says:
+    - `1`
+    - `2`
+    - `cancel`
+    - or a plain-text decline reason
+    instead of the previous `1/3/cancel` guidance.
+- Validation:
+  - source `compile()` checks for:
+    - `codex_desktop_bridge.py`
+    - `codex_telegram_bot.py`
+  - local classification check:
+    - `1 -> ('accept', '')`
+    - `2 -> ('accept-remember', '')`
+    - `cancel -> ('cancel', '')`
+    - arbitrary text -> `('decline-message', <text>)`
+  - `discover_codex` previously resolved and persisted the desktop executable path into local `.env`.
+- Current status:
+  - approval handling is now split into two paths:
+    - legacy `submit_permission_approval_via_ui()` still exists but is no longer the active caller for permission prompts
+    - new `submit_permission_approval_via_ui_row_select()` is the active caller
+  - the row-select path is implemented but not yet re-smoked end-to-end after the latest patch
+  - tracked files currently modified and not yet pushed:
+    - `codex_desktop_bridge.py`
+    - `codex_telegram_bot.py`
+- Next focused step:
+  - cleanly restart the Telegram bot so the new approval text/routing is live
+  - trigger a fresh approval prompt
+  - test in this order:
+    - `1` approve row-select
+    - `2` approve+remember row-select
+    - plain-text decline reason
+  - decide whether the new path actually clears `waiting-approval` before making any broader cleanup.

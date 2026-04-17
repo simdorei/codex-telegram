@@ -69,7 +69,223 @@ def resolve_state_db_path(codex_home: Path) -> Path:
     return codex_home / "state_5.sqlite"
 
 
+def get_optional_env_file_path(name: str) -> Path | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if path.exists() and path.is_file():
+        return path
+    return None
+
+
+def normalize_executable_candidate(raw: str) -> Path | None:
+    cleaned = str(raw or "").strip().strip('"').strip("'")
+    if not cleaned:
+        return None
+    if cleaned.lower().endswith(".exe,0"):
+        cleaned = cleaned[:-2]
+    if "," in cleaned and cleaned.lower().endswith(".exe"):
+        cleaned = cleaned.split(",", 1)[0].strip()
+    path = Path(cleaned).expanduser()
+    if path.exists() and path.is_file():
+        return path
+    return None
+
+
+def read_registry_string(root, subkey: str, value_name: str = "") -> str:
+    if winreg is None:
+        return ""
+    try:
+        with winreg.OpenKey(root, subkey) as handle:
+            value, _ = winreg.QueryValueEx(handle, value_name)
+    except OSError:
+        return ""
+    return str(value or "").strip()
+
+
+def iter_codex_desktop_registry_candidates() -> Iterator[tuple[str, Path]]:
+    if winreg is None:
+        return
+
+    app_paths = (
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths\Codex.exe"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\App Paths\Codex.exe"),
+    )
+    for root, subkey in app_paths:
+        candidate = normalize_executable_candidate(read_registry_string(root, subkey))
+        if candidate is not None:
+            yield (f"registry:{subkey}", candidate)
+
+    uninstall_roots = (
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    )
+    for root, base_subkey in uninstall_roots:
+        try:
+            with winreg.OpenKey(root, base_subkey) as base_handle:
+                subkey_count, _, _ = winreg.QueryInfoKey(base_handle)
+                subkeys = [winreg.EnumKey(base_handle, index) for index in range(subkey_count)]
+        except OSError:
+            continue
+        for child_name in subkeys:
+            child_subkey = f"{base_subkey}\\{child_name}"
+            display_name = read_registry_string(root, child_subkey, "DisplayName")
+            if "codex" not in display_name.lower():
+                continue
+            display_icon = normalize_executable_candidate(read_registry_string(root, child_subkey, "DisplayIcon"))
+            if display_icon is not None:
+                yield (f"registry:{child_subkey}:DisplayIcon", display_icon)
+            install_location = read_registry_string(root, child_subkey, "InstallLocation")
+            install_path = normalize_executable_candidate(str(Path(install_location) / "Codex.exe")) if install_location else None
+            if install_path is not None:
+                yield (f"registry:{child_subkey}:InstallLocation", install_path)
+
+
+def iter_default_codex_desktop_candidates() -> Iterator[tuple[str, Path]]:
+    raw_candidates = [
+        os.environ.get("LOCALAPPDATA", "").strip(),
+        os.environ.get("ProgramFiles", "").strip(),
+        os.environ.get("ProgramFiles(x86)", "").strip(),
+    ]
+    seen: set[str] = set()
+    for base in raw_candidates:
+        if not base:
+            continue
+        candidate = Path(base) / "Programs" / "Codex" / "Codex.exe"
+        normalized = str(candidate).lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists() and candidate.is_file():
+            yield (f"default:{candidate.parent}", candidate)
+        candidate = Path(base) / "Codex" / "Codex.exe"
+        normalized = str(candidate).lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists() and candidate.is_file():
+            yield (f"default:{candidate.parent}", candidate)
+
+
+def get_window_process_id(hwnd: int) -> int | None:
+    pid = wt.DWORD(0)
+    user32.GetWindowThreadProcessId(wt.HWND(hwnd), ctypes.byref(pid))
+    if not pid.value:
+        return None
+    return int(pid.value)
+
+
+def query_process_image_path(pid: int) -> Path | None:
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        size = wt.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        ok = kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
+        if not ok:
+            return None
+        candidate = Path(buffer.value)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def detect_running_codex_desktop_executable() -> tuple[Path | None, str]:
+    try:
+        window = find_codex_window()
+    except Exception:
+        return (None, "")
+    pid = get_window_process_id(window.hwnd)
+    if not pid:
+        return (None, "")
+    candidate = query_process_image_path(pid)
+    if candidate is None:
+        return (None, "")
+    return (candidate, f"window-pid:{pid}")
+
+
+def run_powershell_capture(command: str) -> str:
+    powershell_exe = (
+        shutil.which("powershell.exe")
+        or shutil.which("powershell")
+        or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    completed = subprocess.run(
+        [powershell_exe, "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
+
+
+def detect_codex_desktop_executable_via_powershell() -> tuple[Path | None, str]:
+    process_path = normalize_executable_candidate(
+        run_powershell_capture(
+            "Get-Process -Name Codex -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.Path } "
+            "| Select-Object -First 1 -ExpandProperty Path"
+        )
+    )
+    if process_path is not None:
+        return (process_path, "powershell:Get-Process")
+
+    install_root = run_powershell_capture(
+        "Get-AppxPackage OpenAI.Codex -ErrorAction SilentlyContinue "
+        "| Select-Object -First 1 -ExpandProperty InstallLocation"
+    )
+    if install_root:
+        candidate = normalize_executable_candidate(str(Path(install_root) / "app" / "Codex.exe"))
+        if candidate is not None:
+            return (candidate, "powershell:Get-AppxPackage")
+
+    return (None, "")
+
+
+def persist_env_value(path: Path, key: str, value: str) -> bool:
+    path = Path(path)
+    newline = "\n"
+    lines: list[str] = []
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        newline = "\r\n" if "\r\n" in text else "\n"
+        lines = text.splitlines()
+    found = False
+    changed = False
+    for index, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in raw_line:
+            continue
+        existing_key, _, _ = raw_line.partition("=")
+        if existing_key.strip() != key:
+            continue
+        found = True
+        replacement = f"{key}={value}"
+        if raw_line != replacement:
+            lines[index] = replacement
+            changed = True
+        break
+    if not found:
+        lines.append(f"{key}={value}")
+        changed = True
+    if not changed:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(newline.join(lines) + newline, encoding="utf-8")
+    return True
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
+BRIDGE_ENV_PATH = SCRIPT_DIR / ".env"
 CODEX_HOME = get_env_path("CODEX_HOME", Path.home() / ".codex")
 GLOBAL_STATE_PATH = get_env_path("CODEX_GLOBAL_STATE", CODEX_HOME / ".codex-global-state.json")
 STATE_DB_PATH = resolve_state_db_path(CODEX_HOME)
@@ -79,18 +295,22 @@ LOG_DB_PATH = get_env_path("CODEX_LOG_DB", CODEX_HOME / "logs_2.sqlite")
 ARCHIVED_SESSIONS_DIR = get_env_path("CODEX_ARCHIVED_SESSIONS_DIR", CODEX_HOME / "archived_sessions")
 MAINTENANCE_BACKUP_ROOT = get_env_path("CODEX_MAINTENANCE_BACKUP_ROOT", CODEX_HOME / "maintenance_backups")
 CODEX_IPC_PIPE = r"\\.\pipe\codex-ipc"
-CODEX_APP_SERVER_EXE = os.environ.get("CODEX_EXE", "").strip()
+CODEX_APP_SERVER_EXE_ENV = "CODEX_EXE"
+CODEX_DESKTOP_EXE_ENV = "CODEX_DESKTOP_EXE"
+CODEX_APP_SERVER_EXE = os.environ.get(CODEX_APP_SERVER_EXE_ENV, "").strip()
 SINGLE_BACKUP_LOG_LIMIT_BYTES = 500 * 1024
 IPC_PROBE_LOG_PATH = SCRIPT_DIR / "_ipc_probe_log.jsonl"
 HIGH_CONTEXT_INPUT_RATIO_THRESHOLD = 0.60
 CRITICAL_CONTEXT_INPUT_RATIO_THRESHOLD = 0.80
 ARCHIVE_RECOMMEND_TOKENS_USED_THRESHOLD = 50_000_000
 ARCHIVE_RECOMMEND_CONTEXT_TOKENS_THRESHOLD = 200_000
+LIVE_APPROVAL_CACHE_MAX_AGE_SEC = 120.0
 BACKGROUND_WATCHERS: dict[str, threading.Thread] = {}
 BACKGROUND_WATCHERS_LOCK = threading.Lock()
 PRINT_LOCK = threading.Lock()
 ULONG_PTR = wt.WPARAM
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 SW_RESTORE = 9
 CF_UNICODETEXT = 13
@@ -326,6 +546,91 @@ def set_selected_thread_id(thread_id: str | None) -> None:
         data["selected_thread_id"] = thread_id
     else:
         data.pop("selected_thread_id", None)
+    save_bridge_state(data)
+
+
+def cache_live_approval_request(pending_request: dict) -> None:
+    thread_id = str(pending_request.get("thread_id") or "").strip()
+    if not thread_id:
+        return
+    request_kind = str(pending_request.get("request_kind") or "").strip()
+    if request_kind not in {"commandExecution", "fileChange"}:
+        return
+    request_id = pending_request.get("request_id")
+    if request_id is None:
+        return
+
+    data = load_bridge_state()
+    cached_requests = data.get("recent_live_approval_requests")
+    if not isinstance(cached_requests, dict):
+        cached_requests = {}
+
+    cached_requests[thread_id] = {
+        "captured_at": time.time(),
+        "request_id": request_id,
+        "request_kind": request_kind,
+        "method": str(pending_request.get("method") or "").strip(),
+        "item_id": str(pending_request.get("item_id") or "").strip(),
+        "reason": str(pending_request.get("reason") or "").strip(),
+        "owner_client_id": str(pending_request.get("owner_client_id") or "").strip(),
+    }
+    data["recent_live_approval_requests"] = cached_requests
+    save_bridge_state(data)
+
+
+def get_cached_live_approval_request(
+    thread_id: str,
+    *,
+    max_age_sec: float = LIVE_APPROVAL_CACHE_MAX_AGE_SEC,
+) -> dict | None:
+    data = load_bridge_state()
+    cached_requests = data.get("recent_live_approval_requests")
+    if not isinstance(cached_requests, dict):
+        return None
+
+    cached = cached_requests.get(thread_id)
+    if not isinstance(cached, dict):
+        return None
+
+    captured_at = cached.get("captured_at")
+    try:
+        captured_at_value = float(captured_at)
+    except (TypeError, ValueError):
+        captured_at_value = 0.0
+    if captured_at_value <= 0.0 or (time.time() - captured_at_value) > max_age_sec:
+        return None
+
+    request_id = cached.get("request_id")
+    if request_id is None:
+        return None
+
+    request_kind = str(cached.get("request_kind") or "").strip()
+    if request_kind not in {"commandExecution", "fileChange"}:
+        return None
+
+    return {
+        "thread_id": thread_id,
+        "request_id": request_id,
+        "request_kind": request_kind,
+        "method": str(cached.get("method") or "").strip(),
+        "item_id": str(cached.get("item_id") or "").strip(),
+        "reason": str(cached.get("reason") or "").strip(),
+        "owner_client_id": str(cached.get("owner_client_id") or "").strip(),
+    }
+
+
+def clear_cached_live_approval_request(thread_id: str) -> None:
+    data = load_bridge_state()
+    cached_requests = data.get("recent_live_approval_requests")
+    if not isinstance(cached_requests, dict):
+        return
+    if thread_id not in cached_requests:
+        return
+    cached_requests.pop(thread_id, None)
+    if cached_requests:
+        data["recent_live_approval_requests"] = cached_requests
+    else:
+        data.pop("recent_live_approval_requests", None)
     save_bridge_state(data)
 
 
@@ -911,8 +1216,12 @@ def get_pending_interactive_display_lines(
     return state, lines
 
 
-def get_pending_interactive_summary(session_path: Path, *, limit: int = 100) -> str:
-    state, lines = get_pending_interactive_display_lines(session_path)
+def summarize_interactive_lines(
+    state: str | None,
+    lines: list[str],
+    *,
+    limit: int = 100,
+) -> str:
     if not state or not lines:
         return ""
     if state == "waiting-approval":
@@ -924,6 +1233,11 @@ def get_pending_interactive_summary(session_path: Path, *, limit: int = 100) -> 
     if option_lines:
         return collapse_list_text(f"{question} | {' / '.join(option_lines[:2])}", limit=limit)
     return collapse_list_text(question, limit=limit)
+
+
+def get_pending_interactive_summary(session_path: Path, *, limit: int = 100) -> str:
+    state, lines = get_pending_interactive_display_lines(session_path)
+    return summarize_interactive_lines(state, lines, limit=limit)
 
 
 def iter_session_events(session_path: Path) -> Iterator[dict]:
@@ -1593,7 +1907,7 @@ def _request_submit_approval_decision_via_ipc(
     handle: int,
     source_client_id: str,
     thread_id: str,
-    request_id: str,
+    request_id: object,
     decision_payload: object,
     timeout_sec: float,
     owner_clients: dict[str, str],
@@ -1645,7 +1959,7 @@ def _request_submit_approval_decision_via_ipc(
 
 def submit_approval_decision_via_ipc(
     thread: ThreadInfo,
-    request_id: str,
+    request_id: object,
     decision_payload: object,
     request_kind: str,
     timeout_sec: float = 6.0,
@@ -1681,7 +1995,7 @@ def submit_approval_decision_via_ipc(
             method=method,
             use_target_client=use_target_client,
         )
-        result.setdefault("request_id", request_id)
+        result.setdefault("request_id", str(request_id))
         result.setdefault("request_kind", request_kind)
         return result
     finally:
@@ -1710,12 +2024,15 @@ def _extract_pending_approval_request(conversation_state: dict, thread_id: str) 
         request_thread_id = str(params.get("threadId") or thread_id).strip()
         if request_thread_id and request_thread_id != thread_id:
             continue
-        request_id = str(request.get("id") or "").strip()
+        raw_request_id = request.get("id")
+        if raw_request_id is None:
+            continue
+        request_id = str(raw_request_id).strip()
         if not request_id:
             continue
         return {
             "thread_id": thread_id,
-            "request_id": request_id,
+            "request_id": raw_request_id,
             "request_kind": request_kind,
             "method": method,
             "item_id": str(params.get("itemId") or "").strip(),
@@ -1750,15 +2067,48 @@ def get_pending_approval_request_via_ipc(
                 owner_clients[thread.id] = owner_client_id
             pending_request = _extract_pending_approval_request(conversation_state, thread.id)
             if pending_request is None:
-                return None
+                continue
             pending_request.setdefault(
                 "owner_client_id",
                 owner_clients.get(thread.id) or owner_client_id or "",
             )
+            cache_live_approval_request(pending_request)
             return pending_request
         return None
     finally:
         kernel32.CloseHandle(handle)
+
+
+def get_live_pending_approval_display_lines(
+    thread: ThreadInfo,
+    *,
+    timeout_sec: float = 1.0,
+    reason_limit: int = 160,
+) -> tuple[str | None, list[str]]:
+    pending_request = get_pending_approval_request_via_ipc(thread, timeout_sec=timeout_sec)
+    if pending_request is None:
+        return None, []
+
+    lines: list[str] = []
+    request_kind = str(pending_request.get("request_kind") or "").strip()
+    if request_kind:
+        lines.append(f"kind: {request_kind}")
+
+    reason = collapse_list_text(str(pending_request.get("reason") or "").strip(), limit=reason_limit)
+    if reason:
+        lines.append(reason)
+
+    lines.extend(
+        [
+            "1. yes",
+            "2. yes + do not ask again in this session",
+            "3. reject + submit reason",
+        ]
+    )
+
+    if not lines:
+        lines.append("Approval request is pending.")
+    return "waiting-approval", lines
 
 
 def _extract_pending_user_input_request(conversation_state: dict, thread_id: str) -> dict | None:
@@ -1976,27 +2326,19 @@ def build_approval_decision_payload(answer_text: str) -> tuple[str, str]:
     if normalized == "1" or lowered in {"approve", "approved", "accept", "yes", "y", "ok", "예", "네", "승인"}:
         return ("accept", "accept")
     if normalized == "2":
-        raise RuntimeError(
-            "Approval option 2 (approve and remember / don't ask again) is not supported in the Telegram bridge yet. "
-            "Use Codex Desktop for that choice."
-        )
+        return ("acceptForSession", "acceptForSession")
     if normalized == "3" or lowered in {"decline", "reject", "no", "n", "아니요", "거절"}:
         return ("decline", "decline")
     if lowered in {"cancel", "skip", "dismiss", "건너뛰기", "취소"}:
         return ("cancel", "cancel")
     raise RuntimeError(
-        "Unrecognized approval reply. Use 1 to approve, 3 to decline, or cancel to skip. "
-        "Option 2 still requires Codex Desktop."
+        "Unrecognized approval reply. Use 1 to approve, 2 to approve for this session, "
+        "3 to decline, or cancel to skip."
     )
 
 
-def _build_approval_decision_candidate_payloads(decision_action: str) -> list[object]:
-    candidates: list[object] = [decision_action]
-    if decision_action == "accept":
-        candidates.append({"action": "accept", "content": {}, "_meta": None})
-    else:
-        candidates.append({"action": decision_action, "content": None, "_meta": None})
-    return candidates
+def _build_approval_decision_candidate_payloads(decision_payload: str) -> list[object]:
+    return [decision_payload]
 
 
 def reply_to_pending_user_input(
@@ -2039,29 +2381,32 @@ def reply_to_pending_approval(
     timeout_sec: float = 6.0,
 ) -> dict:
     session_path = Path(thread.rollout_path)
-    permission_prompt = get_pending_permission_approval_from_session(session_path)
-    if permission_prompt is not None:
-        _decision_payload, decision_action = build_approval_decision_payload(answer_text)
-        result = submit_permission_approval_via_ui(decision_action)
-        deadline = time.time() + max(timeout_sec, 8.0)
-        last_state = "waiting-approval"
-        while time.time() < deadline:
-            time.sleep(0.5)
-            last_state = get_thread_busy_state(thread, allow_resume=True)
-            if last_state != "waiting-approval":
-                result["verification_busy_state"] = last_state
-                result["request_id"] = permission_prompt.get("call_id") or ""
-                return result
-        raise RuntimeError(
-            "Permission approval UI action ran, but the thread is still waiting-approval.\n"
-            f"thread: {thread.id}\n"
-            f"call_id: {permission_prompt.get('call_id') or '-'}\n"
-            f"tool: {permission_prompt.get('tool_name') or '-'}\n"
-            f"verification_busy_state: {last_state}"
-        )
-
     pending_request = get_pending_approval_request_via_ipc(thread, timeout_sec=timeout_sec)
     if pending_request is None:
+        busy_state = get_thread_busy_state(thread, allow_resume=True)
+        if busy_state == "waiting-approval":
+            pending_request = get_cached_live_approval_request(thread.id)
+    if pending_request is None:
+        permission_prompt = get_pending_permission_approval_from_session(session_path)
+        if permission_prompt is not None:
+            result = submit_permission_approval_via_ui_row_select(answer_text)
+            deadline = time.time() + max(timeout_sec, 8.0)
+            last_state = "waiting-approval"
+            while time.time() < deadline:
+                time.sleep(0.5)
+                last_state = get_thread_busy_state(thread, allow_resume=True)
+                if last_state != "waiting-approval":
+                    result["verification_busy_state"] = last_state
+                    result["request_id"] = permission_prompt.get("call_id") or ""
+                    return result
+            raise RuntimeError(
+                "Permission approval UI action ran, but the thread is still waiting-approval.\n"
+                f"thread: {thread.id}\n"
+                f"call_id: {permission_prompt.get('call_id') or '-'}\n"
+                f"tool: {permission_prompt.get('tool_name') or '-'}\n"
+                f"verification_busy_state: {last_state}"
+            )
+
         busy_state = get_thread_busy_state(thread, allow_resume=True)
         if busy_state == "waiting-approval":
             raise RuntimeError(
@@ -2070,7 +2415,8 @@ def reply_to_pending_approval(
             )
         raise RuntimeError("No pending approval request is active for the selected thread.")
 
-    request_id = str(pending_request.get("request_id") or "").strip()
+    raw_request_id = pending_request.get("request_id")
+    request_id = str(raw_request_id or "").strip()
     if not request_id:
         raise RuntimeError("The pending approval request did not include a request id.")
 
@@ -2078,10 +2424,10 @@ def reply_to_pending_approval(
     if not request_kind:
         raise RuntimeError("The pending approval request did not include a request kind.")
 
-    _decision_payload, decision_action = build_approval_decision_payload(answer_text)
+    decision_payload, decision_action = build_approval_decision_payload(answer_text)
     last_result: dict | None = None
     attempts: list[str] = []
-    payload_candidates = _build_approval_decision_candidate_payloads(decision_action)
+    payload_candidates = _build_approval_decision_candidate_payloads(decision_payload)
 
     for payload_index, candidate_payload in enumerate(payload_candidates, start=1):
         for use_target_client in (True, False):
@@ -2089,7 +2435,7 @@ def reply_to_pending_approval(
                 continue
             result = submit_approval_decision_via_ipc(
                 thread,
-                request_id,
+                raw_request_id,
                 candidate_payload,
                 request_kind,
                 timeout_sec=timeout_sec,
@@ -2104,6 +2450,7 @@ def reply_to_pending_approval(
             time.sleep(0.75)
             busy_state = get_thread_busy_state(thread, allow_resume=True)
             if busy_state != "waiting-approval":
+                clear_cached_live_approval_request(thread.id)
                 result.setdefault("request_id", request_id)
                 result["decision_action"] = decision_action
                 result["request_kind"] = request_kind
@@ -2142,6 +2489,67 @@ def resolve_codex_app_server_executable() -> str:
             return resolved
 
     return bundled_name
+
+
+def discover_codex_desktop_executable() -> tuple[Path | None, str]:
+    env_path = get_optional_env_file_path(CODEX_DESKTOP_EXE_ENV)
+    if env_path is not None:
+        return (env_path, f"env:{CODEX_DESKTOP_EXE_ENV}")
+
+    running_path, running_source = detect_running_codex_desktop_executable()
+    if running_path is not None:
+        return (running_path, running_source)
+
+    powershell_path, powershell_source = detect_codex_desktop_executable_via_powershell()
+    if powershell_path is not None:
+        return (powershell_path, powershell_source)
+
+    for source, candidate in iter_codex_desktop_registry_candidates():
+        return (candidate, source)
+
+    for source, candidate in iter_default_codex_desktop_candidates():
+        return (candidate, source)
+
+    return (None, "")
+
+
+def ensure_codex_desktop_executable_configured() -> tuple[Path, str, bool]:
+    discovered_path, source = discover_codex_desktop_executable()
+    if discovered_path is None:
+        raise RuntimeError(
+            "Codex Desktop executable could not be discovered. "
+            "Set CODEX_DESKTOP_EXE in .env or install Codex Desktop in the default Windows location."
+        )
+    updated = persist_env_value(BRIDGE_ENV_PATH, CODEX_DESKTOP_EXE_ENV, str(discovered_path))
+    os.environ[CODEX_DESKTOP_EXE_ENV] = str(discovered_path)
+    return (discovered_path, source or "discovered", updated)
+
+
+def stop_codex_desktop_processes(executable_path: Path) -> tuple[bool, str]:
+    taskkill = shutil.which("taskkill") or "taskkill"
+    completed = subprocess.run(
+        [taskkill, "/IM", executable_path.name, "/F"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    details = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part).strip()
+    stopped = completed.returncode == 0
+    return (stopped, details or "-")
+
+
+def start_codex_desktop_process(executable_path: Path) -> subprocess.Popen[str]:
+    creationflags = 0
+    creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return subprocess.Popen(
+        [str(executable_path)],
+        cwd=str(executable_path.parent),
+        close_fds=True,
+        creationflags=creationflags,
+        text=True,
+    )
 
 
 class CodexAppServerSidecar:
@@ -2401,6 +2809,14 @@ def scrub_bridge_state_deleted_thread(thread_id: str) -> list[str]:
     if data.get("selected_thread_id") == thread_id:
         data.pop("selected_thread_id", None)
         changed.append("selected_thread_id")
+    recent_live_approval_requests = data.get("recent_live_approval_requests")
+    if isinstance(recent_live_approval_requests, dict) and thread_id in recent_live_approval_requests:
+        recent_live_approval_requests.pop(thread_id, None)
+        if recent_live_approval_requests:
+            data["recent_live_approval_requests"] = recent_live_approval_requests
+        else:
+            data.pop("recent_live_approval_requests", None)
+        changed.append("recent_live_approval_requests")
     recent_ui_thread = data.get("recent_ui_thread")
     if isinstance(recent_ui_thread, dict) and str(recent_ui_thread.get("thread_id") or "") == thread_id:
         data.pop("recent_ui_thread", None)
@@ -3989,15 +4405,49 @@ def click_window(window: WindowInfo, x_ratio: float, y_offset: int) -> tuple[int
     return x, y
 
 
-def submit_permission_approval_via_ui(decision_action: str) -> dict:
-    if decision_action == "decline":
-        raise RuntimeError(
-            "Decline for shell permission approvals still needs the Codex Desktop text explanation flow. "
-            "Use Codex Desktop for option 3, or send cancel here."
-        )
+def classify_permission_approval_ui_reply(answer_text: str) -> tuple[str, str]:
+    normalized = str(answer_text or "").strip()
+    lowered = normalized.lower()
+    if normalized == "1" or lowered in {"approve", "approved", "accept", "yes", "y", "ok", "예", "네", "승인"}:
+        return ("accept", "")
+    if normalized == "2":
+        return ("accept-remember", "")
+    if lowered in {"cancel", "skip", "dismiss", "건너뛰기", "취소"}:
+        return ("cancel", "")
+    if normalized == "3":
+        raise RuntimeError("Option 3 needs a decline message. Send the reason text itself in Telegram.")
+    if normalized:
+        return ("decline-message", normalized)
+    raise RuntimeError("Approval reply is empty. Send 1, 2, cancel, or a decline message.")
+
+
+def submit_permission_approval_via_ui(answer_text: str) -> dict:
+    decision_action, decline_message = classify_permission_approval_ui_reply(answer_text)
+    if decision_action == "decline-message":
+        original_clipboard = get_clipboard_text()
+        try:
+            focus_window(find_codex_window())
+            set_clipboard_text(decline_message)
+            time.sleep(0.1)
+            send_hotkey(VK_CONTROL, VK_V)
+            time.sleep(0.2)
+            send_key_event(VK_RETURN, keyup=False)
+            send_key_event(VK_RETURN, keyup=True)
+        finally:
+            if original_clipboard is not None:
+                try:
+                    set_clipboard_text(original_clipboard)
+                except Exception:
+                    pass
+        return {
+            "decision_action": decision_action,
+            "request_kind": "permission",
+            "ui_result": "ACTION=decline-message",
+        }
 
     action_arg = {
         "accept": "accept",
+        "accept-remember": "accept-remember",
         "cancel": "cancel",
     }.get(decision_action)
     if not action_arg:
@@ -4273,6 +4723,294 @@ exit 6
     }
 
 
+
+
+def submit_permission_approval_via_ui_row_select(answer_text: str) -> dict:
+    decision_action, decline_message = classify_permission_approval_ui_reply(answer_text)
+    action_arg = {
+        "accept": "accept",
+        "accept-remember": "accept-remember",
+        "cancel": "cancel",
+        "decline-message": "decline-message",
+    }.get(decision_action)
+    if not action_arg:
+        raise RuntimeError(f"Unsupported permission approval decision: {decision_action}")
+
+    focus_window(find_codex_window())
+    script = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$decision = [string]$env:CODEX_APPROVAL_DECISION
+$decision = $decision.Trim().ToLowerInvariant()
+if (-not $decision) { Write-Output 'NO_DECISION'; exit 2 }
+
+$code = @"
+using System;
+using System.Runtime.InteropServices;
+public static class Native {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int maxCount);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+}
+"@
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type $code
+
+function Normalize-Name {
+  param([string]$Name)
+  if (-not $Name) { return '' }
+  return (($Name -replace "`r|`n", ' ') -replace '\s+', ' ').Trim()
+}
+
+function Get-CodexWindowHandle {
+  $script:result = [IntPtr]::Zero
+  $cb = [Native+EnumWindowsProc]{
+    param($hwnd, $lParam)
+    if (-not [Native]::IsWindowVisible($hwnd)) { return $true }
+    $len = [Native]::GetWindowTextLength($hwnd)
+    if ($len -le 0) { return $true }
+    $sb = New-Object System.Text.StringBuilder ($len + 1)
+    [void][Native]::GetWindowText($hwnd, $sb, $sb.Capacity)
+    $title = $sb.ToString()
+    if ($title -like '*Codex*') {
+      $script:result = $hwnd
+      return $false
+    }
+    return $true
+  }
+  [void][Native]::EnumWindows($cb, [IntPtr]::Zero)
+  return $script:result
+}
+
+function Find-CodexAutomationWindow {
+  param($Handle)
+  $cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty,
+    [int]$Handle
+  )
+  return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    $cond
+  )
+}
+
+function Get-AllElements {
+  param($Root)
+  return $Root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition
+  )
+}
+
+function Find-ElementByNeedles {
+  param($Elements, [string[]]$Needles)
+  for ($i = 0; $i -lt $Elements.Count; $i++) {
+    $el = $Elements.Item($i)
+    try {
+      $name = Normalize-Name $el.Current.Name
+      if (-not $name) { continue }
+      foreach ($needle in $Needles) {
+        if ($needle -and $name -like "*$needle*") { return $el }
+      }
+    } catch {}
+  }
+  return $null
+}
+
+function Find-ElementByRegexes {
+  param($Elements, [string[]]$Regexes, [string[]]$RejectRegexes)
+  for ($i = 0; $i -lt $Elements.Count; $i++) {
+    $el = $Elements.Item($i)
+    try {
+      $name = Normalize-Name $el.Current.Name
+      if (-not $name) { continue }
+      $reject = $false
+      foreach ($rx in $RejectRegexes) {
+        if ($rx -and ($name -match $rx)) { $reject = $true; break }
+      }
+      if ($reject) { continue }
+      foreach ($rx in $Regexes) {
+        if ($rx -and ($name -match $rx)) { return $el }
+      }
+    } catch {}
+  }
+  return $null
+}
+
+function Get-DebugCandidateSummary {
+  param($Elements)
+  $names = New-Object 'System.Collections.Generic.List[string]'
+  for ($i = 0; $i -lt $Elements.Count; $i++) {
+    $el = $Elements.Item($i)
+    try {
+      $name = Normalize-Name $el.Current.Name
+      if (-not $name) { continue }
+      if ($name -match '^1[\.\)]|^2[\.\)]|^3[\.\)]|Yes|Skip|Cancel|remember|ask again') {
+        if (-not $names.Contains($name)) {
+          [void]$names.Add($name)
+        }
+      }
+    } catch {}
+  }
+  if ($names.Count -le 0) { return '' }
+  return ($names | Select-Object -First 12) -join ' || '
+}
+
+function Invoke-Element {
+  param($Element)
+  if (-not $Element) { return $false }
+  try {
+    $invoke = $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($invoke) {
+      $invoke.Invoke()
+      return $true
+    }
+  } catch {}
+  try {
+    $selection = $Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+    if ($selection) {
+      $selection.Select()
+      return $true
+    }
+  } catch {}
+  try {
+    $legacy = $Element.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+    if ($legacy) {
+      $legacy.DoDefaultAction()
+      return $true
+    }
+  } catch {}
+  try {
+    $rect = $Element.Current.BoundingRectangle
+    if ($rect.Width -gt 1 -and $rect.Height -gt 1) {
+      $x = [int]($rect.Left + ($rect.Width / 2))
+      $y = [int]($rect.Top + ($rect.Height / 2))
+      [void][Native]::SetCursorPos($x, $y)
+      Start-Sleep -Milliseconds 80
+      [Native]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+      [Native]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+      return $true
+    }
+  } catch {}
+  return $false
+}
+
+$handle = Get-CodexWindowHandle
+if ($handle -eq [IntPtr]::Zero) { Write-Output 'NO_CODEX_WINDOW'; exit 3 }
+[void][Native]::ShowWindow($handle, 9)
+[void][Native]::SetForegroundWindow($handle)
+[void][Native]::BringWindowToTop($handle)
+Start-Sleep -Milliseconds 200
+$win = Find-CodexAutomationWindow $handle
+if (-not $win) { $win = [System.Windows.Automation.AutomationElement]::RootElement }
+$rootElement = [System.Windows.Automation.AutomationElement]::RootElement
+
+for ($attempt = 0; $attempt -lt 5; $attempt++) {
+  $all = Get-AllElements $win
+  $allFallback = $null
+
+  if ($decision -eq 'cancel') {
+    $targetNeedles = @('Skip', 'Cancel')
+    $targetRegexes = @()
+    $rejectRegexes = @()
+  } elseif ($decision -eq 'decline-message') {
+    $targetNeedles = @()
+    $targetRegexes = @('^3[\.\)]\s*')
+    $rejectRegexes = @('^1[\.\)]\s*', '^2[\.\)]\s*')
+  } elseif ($decision -eq 'accept-remember') {
+    $targetNeedles = @("don''t ask again", 'remember')
+    $targetRegexes = @('^2[\.\)]\s*')
+    $rejectRegexes = @('^1[\.\)]\s*', '^3[\.\)]\s*')
+  } else {
+    $targetNeedles = @('1. Yes', 'Yes')
+    $targetRegexes = @('^1[\.\)]\s*')
+    $rejectRegexes = @('^2[\.\)]\s*', '^3[\.\)]\s*')
+  }
+
+  if ($targetRegexes.Count -gt 0) {
+    $option = Find-ElementByRegexes $all $targetRegexes $rejectRegexes
+  } else {
+    $option = $null
+  }
+  if (-not $option) {
+    $option = Find-ElementByNeedles $all $targetNeedles
+  }
+  if (-not $option -and $win -ne $rootElement) {
+    if (-not $allFallback) { $allFallback = Get-AllElements $rootElement }
+    if ($targetRegexes.Count -gt 0) {
+      $option = Find-ElementByRegexes $allFallback $targetRegexes $rejectRegexes
+    }
+    if (-not $option) {
+      $option = Find-ElementByNeedles $allFallback $targetNeedles
+    }
+  }
+
+  if ($option -and (Invoke-Element $option)) {
+    Start-Sleep -Milliseconds 180
+    Write-Output ("ACTION=" + $decision)
+    exit 0
+  }
+
+  Start-Sleep -Milliseconds 180
+}
+
+if ($allFallback) {
+  $debugSummary = Get-DebugCandidateSummary $allFallback
+} else {
+  $debugSummary = Get-DebugCandidateSummary $all
+}
+if ($debugSummary) {
+  Write-Output ("APPROVAL_CONTROL_NOT_FOUND " + $debugSummary)
+} else {
+  Write-Output 'APPROVAL_CONTROL_NOT_FOUND'
+}
+exit 6
+"""
+    env = os.environ.copy()
+    env["CODEX_APPROVAL_DECISION"] = action_arg
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        cwd=str(SCRIPT_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        details = stdout or stderr or "unknown UI automation error"
+        raise RuntimeError(f"Permission approval UI submit failed: {details}")
+    if decision_action == "decline-message":
+        original_clipboard = get_clipboard_text()
+        try:
+            focus_window(find_codex_window())
+            time.sleep(0.2)
+            set_clipboard_text(decline_message)
+            time.sleep(0.1)
+            send_hotkey(VK_CONTROL, VK_V)
+            time.sleep(0.2)
+            send_key_event(VK_RETURN, keyup=False)
+            send_key_event(VK_RETURN, keyup=True)
+        finally:
+            if original_clipboard is not None:
+                try:
+                    set_clipboard_text(original_clipboard)
+                except Exception:
+                    pass
+    return {
+        "decision_action": decision_action,
+        "request_kind": "permission",
+        "ui_result": stdout or "ok",
+    }
+
 def send_prompt_to_codex(
     prompt: str,
     click_x_ratio: float,
@@ -4340,7 +5078,15 @@ def print_thread_list(threads: list[ThreadInfo]) -> None:
             )
             print(make_console_safe_text(line))
             if state.startswith("waiting-"):
-                interactive_summary = get_pending_interactive_summary(session_path)
+                interactive_summary = ""
+                if state == "waiting-approval":
+                    live_state, live_lines = get_live_pending_approval_display_lines(
+                        thread,
+                        timeout_sec=0.75,
+                    )
+                    interactive_summary = summarize_interactive_lines(live_state, live_lines)
+                if not interactive_summary:
+                    interactive_summary = get_pending_interactive_summary(session_path)
                 if interactive_summary:
                     print(make_console_safe_text(f"     | request      | {interactive_summary}"))
     finally:
@@ -4478,6 +5224,44 @@ def command_doctor(args: argparse.Namespace) -> int:
     else:
         print("busy_threads: -")
 
+    desktop_exe, desktop_source = discover_codex_desktop_executable()
+    print(f"codex_desktop_exe: {desktop_exe or '-'}")
+    print(f"codex_desktop_exe_source: {desktop_source or '-'}")
+
+    return 0
+
+
+def command_discover_codex(args: argparse.Namespace) -> int:
+    codex_exe, source, updated = ensure_codex_desktop_executable_configured()
+    print(f"codex_desktop_exe: {codex_exe}")
+    print(f"source: {source}")
+    print(f"env_path: {BRIDGE_ENV_PATH}")
+    print(f"env_updated: {updated}")
+    return 0
+
+
+def command_restart_codex(args: argparse.Namespace) -> int:
+    codex_exe, source, updated = ensure_codex_desktop_executable_configured()
+    stopped, stop_details = stop_codex_desktop_processes(codex_exe)
+    time.sleep(max(0.0, float(args.stop_wait)))
+    proc = start_codex_desktop_process(codex_exe)
+    time.sleep(max(0.0, float(args.start_wait)))
+    exit_code = proc.poll()
+    if exit_code is not None:
+        raise RuntimeError(f"Codex Desktop exited immediately after launch. exit_code={exit_code}")
+    print(f"codex_desktop_exe: {codex_exe}")
+    print(f"source: {source}")
+    print(f"env_updated: {updated}")
+    print(f"stopped_existing: {stopped}")
+    print(f"stop_details: {make_console_safe_text(stop_details)}")
+    print(f"started_pid: {proc.pid}")
+    try:
+        window = find_codex_window()
+        print("window_found: True")
+        print(f"window_title: {make_console_safe_text(window.title)}")
+    except Exception as exc:
+        print("window_found: False")
+        print(f"window_error: {make_console_safe_text(str(exc))}")
     return 0
 
 
@@ -4638,13 +5422,16 @@ def command_use(args: argparse.Namespace) -> int:
     set_selected_thread_id(thread.id)
     session_path = Path(thread.rollout_path)
     last_user, last_assistant = get_last_user_and_assistant_messages(session_path)
-    interactive_state, interactive_lines = get_pending_interactive_display_lines(session_path)
+    interactive_state = None
+    interactive_lines: list[str] = []
+    if get_thread_busy_state(thread, allow_resume=True) == "waiting-approval":
+        interactive_state, interactive_lines = get_live_pending_approval_display_lines(
+            thread,
+            timeout_sec=1.0,
+        )
+    if not interactive_lines:
+        interactive_state, interactive_lines = get_pending_interactive_display_lines(session_path)
     print(f"selected_thread: {thread.id}")
-    if interactive_lines:
-        print("")
-        print(f"[{interactive_state}]")
-        for line in interactive_lines:
-            print(line)
     if last_user:
         print("")
         print("[last_user]")
@@ -4653,10 +5440,42 @@ def command_use(args: argparse.Namespace) -> int:
         print("")
         print("[last_assistant]")
         print(last_assistant)
+    if interactive_lines:
+        print("")
+        print(f"[{interactive_state}]")
+        for line in interactive_lines:
+            print(line)
     print("")
     print(f"title: {format_title_preview(thread.title)}")
     print(f"ui_name: {get_thread_ui_name(thread.id, thread) or '-'}")
     print(f"cwd: {thread.cwd}")
+    return 0
+
+
+def command_approval_reply(args: argparse.Namespace) -> int:
+    if getattr(args, "thread_ref", None):
+        thread = resolve_thread_ref(args.thread_ref)
+    else:
+        thread = choose_thread(args.thread_id, args.cwd)
+
+    result = reply_to_pending_approval(
+        thread,
+        args.answer,
+        timeout_sec=args.timeout,
+    )
+    print(f"thread_id: {thread.id}")
+    print(f"thread_ref: {get_thread_workspace_ref(thread)}")
+    print(f"decision_action: {result.get('decision_action') or '-'}")
+    print(f"request_kind: {result.get('request_kind') or '-'}")
+    print(f"request_id: {result.get('request_id') or '-'}")
+    verification_busy_state = str(result.get("verification_busy_state") or "").strip()
+    if verification_busy_state:
+        print(f"verification_busy_state: {verification_busy_state}")
+    attempts = result.get("attempts") or []
+    if attempts:
+        print("attempts:")
+        for entry in attempts:
+            print(f"- {entry}")
     return 0
 
 
@@ -4974,6 +5793,30 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--limit", type=int, default=5, help="Max busy threads to print.")
     doctor_parser.set_defaults(func=command_doctor)
 
+    discover_codex_parser = subparsers.add_parser(
+        "discover_codex",
+        help="Discover the Codex Desktop executable and store it in .env.",
+    )
+    discover_codex_parser.set_defaults(func=command_discover_codex)
+
+    restart_codex_parser = subparsers.add_parser(
+        "restart_codex",
+        help="Restart the Codex Desktop app using the discovered executable path.",
+    )
+    restart_codex_parser.add_argument(
+        "--stop-wait",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after terminating the old Codex Desktop process.",
+    )
+    restart_codex_parser.add_argument(
+        "--start-wait",
+        type=float,
+        default=2.0,
+        help="Seconds to wait after launching Codex Desktop before reporting status.",
+    )
+    restart_codex_parser.set_defaults(func=command_restart_codex)
+
     focus_parser = subparsers.add_parser(
         "focus",
         help="Focus the Codex Desktop window.",
@@ -5073,6 +5916,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     use_parser.add_argument("--clear", action="store_true", help="Clear the persisted selection.")
     use_parser.set_defaults(func=command_use)
+
+    approval_reply_parser = subparsers.add_parser(
+        "approval_reply",
+        help="Submit a pending approval reply for the selected thread.",
+        parents=[common_parser],
+    )
+    approval_reply_parser.add_argument(
+        "answer",
+        help="Approval reply text such as 1, 3, cancel, or a decline reason.",
+    )
+    approval_reply_parser.add_argument(
+        "thread_ref",
+        nargs="?",
+        help="Optional workspace name, list index, `other`, or exact thread id.",
+    )
+    approval_reply_parser.add_argument("--timeout", type=float, default=8.0)
+    approval_reply_parser.set_defaults(func=command_approval_reply)
 
     ask_parser = subparsers.add_parser(
         "ask",

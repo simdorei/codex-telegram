@@ -24,6 +24,23 @@ No third-party Python packages are required.
 - `codex-telegram-bot.cmd`: Telegram-only launcher
 - `.env.example`: local environment template
 
+## Current Version
+
+- Patch level: `2026.04.18-1`
+- This README reflects the current bridge and Telegram patch set in this workspace.
+
+## Current Patch Summary
+
+Compared with the last committed baseline, the current patch set adds or stabilizes:
+
+- thread creation from bridge and Telegram via `new` and `/new`
+- archive move flow via `archive`, `/archive`, and `archived_list`
+- archived-thread deletion flow via `delete_archive`, `/delete_archive`, and `/confirm_delete_archive`
+- target-thread binding without opening UI via `use` and `/use`
+- Codex Desktop executable discovery and restart via `discover_codex`, `/discover_codex`, `restart_codex`, and `/restart_codex`
+- Telegram live approval handling for `waiting-approval` threads with visible `1 / 2 / 3` choices
+- Telegram follow-up delivery after approval replies so the post-approval result message is forwarded back into chat
+
 ## Quick Start
 
 1. Clone the repository.
@@ -51,6 +68,7 @@ Example `.env`:
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_CHAT_IDS=
 CODEX_HOME=
+CODEX_DESKTOP_EXE=
 PYTHON_EXE=
 CODEX_BRIDGE_AUTO_START_TELEGRAM=1
 ```
@@ -60,6 +78,7 @@ Important variables:
 - `TELEGRAM_BOT_TOKEN`: required for Telegram mode
 - `TELEGRAM_ALLOWED_CHAT_IDS`: optional allowlist of Telegram chat IDs
 - `CODEX_HOME`: override default Codex state directory if needed
+- `CODEX_DESKTOP_EXE`: optional override for the Codex Desktop app executable. `/discover_codex` or `/restart_codex` auto-save it into `.env` when discovery succeeds.
 - `PYTHON_EXE`: force a specific Python interpreter
 - `CODEX_BRIDGE_AUTO_START_TELEGRAM`: set `0` to disable bot auto-start
 
@@ -128,9 +147,15 @@ Recommended Telegram workflow:
 2. `/use <ref>`
 3. 일반 텍스트 또는 `/ask <prompt>` 전송
 
-Plain text messages are treated like `/ask <message>`.
+Plain text messages are treated like `/ask <message>`, except for interactive states:
 
-일반 텍스트 메시지는 `/ask <message>`처럼 처리됩니다.
+- if the selected thread is `waiting-input`, plain text replies to that prompt
+- if the selected thread is `waiting-approval`, reply with the visible `1`, `2`, or `3` option
+
+일반 텍스트 메시지는 기본적으로 `/ask <message>`처럼 처리되지만, 상호작용 상태에서는 다르게 동작합니다.
+
+- 선택한 스레드가 `waiting-input`이면 일반 텍스트가 그 입력에 대한 답변으로 전달됩니다.
+- 선택한 스레드가 `waiting-approval`이면 `1`, `3`, `cancel`로 응답합니다.
 
 Telegram no longer uses `/open`. Use `/use` to bind the target thread, then ask against that selected thread.
 
@@ -140,7 +165,7 @@ Telegram no longer uses `/open`. Use `/use` to bind the target thread, then ask 
 
 | Command | English | 한국어 |
 | --- | --- | --- |
-| `/list [limit]` | Show recent active threads. | 최근 활성 스레드를 보여줍니다. |
+| `/list [limit]` | Show recent active threads and states such as `idle`, `busy`, `waiting-input`, `waiting-approval`. | 최근 활성 스레드와 상태(`idle`, `busy`, `waiting-input`, `waiting-approval`)를 보여줍니다. |
 | `/archived_list [limit]` | Show archived threads. | 보관된 스레드를 보여줍니다. |
 | `/new <prompt>` | Create a new thread and send the first prompt. | 새 스레드를 만들고 첫 질문을 보냅니다. |
 | `/archive [ref]` | Archive the selected thread or a specific ref. | 선택된 스레드 또는 지정한 ref를 보관합니다. |
@@ -148,8 +173,6 @@ Telegram no longer uses `/open`. Use `/use` to bind the target thread, then ask 
 | `/confirm_delete_archive <ref>` | Actually delete the archived thread locally. | 보관 스레드를 로컬에서 실제 삭제합니다. |
 | `/use <ref>` | Persist the default target thread without opening UI. | UI를 열지 않고 기본 대상 스레드를 선택합니다. |
 | `/status [ref]` | Show status for the current or specified thread. | 현재 또는 지정한 스레드 상태를 보여줍니다. |
-| `/choices` | Show detected numbered choices from the latest assistant reply. | Show detected numbered choices. |
-| `/choose <number\|text>` | Send a selected choice (or direct text) as the next ask. | Send selected choice as next ask. |
 | `/doctor` | Print bridge diagnostics. | 브리지 진단 정보를 출력합니다. |
 | `/ask <prompt>` | Send a prompt through the default IPC path. | 기본 IPC 경로로 질문을 보냅니다. |
 | `/ask_ipc <prompt>` | Alias of `/ask`. | `/ask`의 별칭입니다. |
@@ -160,11 +183,20 @@ Telegram notes:
 
 - Default Telegram `ask` uses IPC, not UI paste.
 - If an older thread is not currently loaded by Codex Desktop, IPC can still fail once. Open that thread once in the app and retry.
+- Live `waiting-approval` prompts are shown in Telegram with visible `1 / 2 / 3` options.
+- Current tested Telegram approval flow is the live `commandExecution` prompt path.
 
 추가 메모:
 
 - 텔레그램의 기본 `ask`는 UI 복붙이 아니라 IPC를 사용합니다.
 - 아주 오래된 스레드가 데스크톱 앱에 아직 로드되지 않은 경우, 앱에서 한 번 열어 준 뒤 다시 시도해야 할 수 있습니다.
+- 승인 옵션 `2`(다시 묻지 않기 포함 승인)는 아직 Codex Desktop에서 처리해야 합니다.
+- 텔레그램에서의 승인 완료는 아직 실험적입니다. 스레드가 계속 `waiting-approval`이면 데스크톱에서 마무리하세요.
+
+Additional Telegram commands:
+
+- `/discover_codex`: discover the Codex Desktop executable and persist `CODEX_DESKTOP_EXE` into `.env`
+- `/restart_codex`: restart the Codex Desktop app using the discovered `CODEX_DESKTOP_EXE` path
 
 ## Thread References
 

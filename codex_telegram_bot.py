@@ -58,14 +58,16 @@ TELEGRAM_HELP_LINES = [
     "/use <ref>",
     "/status [ref]",
     "/doctor",
+    "/discover_codex",
     "/ask <prompt>",
     "/ask_ipc <prompt> (alias)",
     "/restart_bot",
+    "/restart_codex",
     "/chatid",
     "",
     "Plain text works like /ask <message>.",
     "If the selected thread is waiting-input, plain text replies to that prompt.",
-    "If the selected thread is waiting-approval, reply with 1, 3, or cancel.",
+    "If the selected thread is waiting-approval, follow the shown options.",
     "일반 텍스트 메시지는 /ask <message>처럼 동작합니다.",
     "",
     "Thread refs follow the bridge format:",
@@ -292,21 +294,60 @@ def build_interactive_waiting_text(thread_ref: str, state: str, prompt: str) -> 
         return "\n".join(lines)
     if state == INTERACTIVE_STATE_APPROVAL:
         lines = ["Waiting approval", f"thread: {thread_ref or '-'}", ""]
+        prompt_lines = [line.strip() for line in (prompt or "").splitlines() if line.strip()]
+        prompt_has_options = any(re.match(r"^\d+[\.\)]\s+", line) for line in prompt_lines)
         if prompt:
-            lines.extend([prompt, ""])
+            lines.extend(prompt_lines)
+            lines.append("")
+        if prompt_has_options:
+            lines.append("Reply here with 1, 2, or 3.")
+            return "\n".join(lines)
         lines.extend(
             [
-                "1. approve",
-                "2. approve and remember (Desktop only)",
-                "3. decline",
-                "cancel. skip / cancel",
+                "1. yes",
+                "2. yes + do not ask again in this session",
+                "3. reject + submit reason",
                 "",
-                "Reply here with 1, 3, or cancel.",
-                "Option 2 still requires Codex Desktop.",
+                "Reply here with 1, 2, or 3.",
             ]
         )
         return "\n".join(lines)
     return ""
+
+
+def get_current_interactive_prompt(thread: bridge.ThreadInfo) -> tuple[str, str]:
+    session_path = Path(thread.rollout_path)
+    try:
+        busy_state = bridge.get_thread_busy_state(thread, allow_resume=True)
+    except Exception:
+        return INTERACTIVE_STATE_NONE, ""
+
+    if busy_state == INTERACTIVE_STATE_APPROVAL:
+        live_state, live_lines = bridge.get_live_pending_approval_display_lines(
+            thread,
+            timeout_sec=0.75,
+        )
+        if live_state and live_lines:
+            return live_state, "\n".join(line for line in live_lines if line)
+
+    if not session_path.exists():
+        return INTERACTIVE_STATE_NONE, ""
+
+    session_state, session_lines = bridge.get_pending_interactive_display_lines(session_path)
+    if not session_state or not session_lines:
+        return INTERACTIVE_STATE_NONE, ""
+    return session_state, "\n".join(line for line in session_lines if line)
+
+
+def get_current_interactive_prompt_for_ref(thread_ref: str) -> tuple[str, str]:
+    normalized_ref = str(thread_ref or "").strip()
+    if not normalized_ref:
+        return INTERACTIVE_STATE_NONE, ""
+    try:
+        thread = bridge.resolve_thread_ref(normalized_ref)
+    except Exception:
+        return INTERACTIVE_STATE_NONE, ""
+    return get_current_interactive_prompt(thread)
 
 
 def rewrite_list_output_for_telegram(output: str) -> str:
@@ -343,25 +384,19 @@ def schedule_bot_restart() -> tuple[bool, str]:
             return False, "Restart already scheduled."
         restart_exe = resolve_restart_python_exe()
         script_path = SCRIPT_DIR / "codex_telegram_bot.py"
-        cmd_exe = Path(os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe"))
         creationflags = 0
-        creationflags |= getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         release_single_instance_mutex()
         subprocess.Popen(
-            [
-                str(cmd_exe),
-                "/k",
-                f'"{restart_exe}" "{script_path}" --skip-old-updates',
-            ],
+            [str(restart_exe), str(script_path), "--skip-old-updates"],
             cwd=str(SCRIPT_DIR),
             creationflags=creationflags,
             close_fds=True,
         )
         RESTART_SCHEDULED = True
         log_line(
-            f"restart_scheduled launcher={cmd_exe} exe={restart_exe} "
-            f"script={script_path} args=--skip-old-updates"
+            f"restart_scheduled exe={restart_exe} script={script_path} args=--skip-old-updates"
         )
         threading.Thread(
             target=_exit_after_restart_delay,
@@ -416,6 +451,12 @@ class TelegramAskRelay:
         state, prompt = parse_interactive_notice(text)
         if not state:
             return False
+        if state == INTERACTIVE_STATE_APPROVAL:
+            current_state, current_prompt = get_current_interactive_prompt_for_ref(self.thread_ref)
+            if current_state != INTERACTIVE_STATE_APPROVAL or not current_prompt:
+                return True
+            state = current_state
+            prompt = current_prompt
         signature = "\n".join([state, prompt])
         if signature == self.last_interactive_signature:
             return True
@@ -518,6 +559,38 @@ def run_bridge_command(argv: list[str]) -> tuple[int, str]:
     return exit_code, combined
 
 
+def run_bridge_script_subprocess(argv: list[str], timeout_sec: float) -> tuple[int, str]:
+    bridge_script = SCRIPT_DIR / "codex_desktop_bridge.py"
+    python_exe = resolve_restart_python_exe()
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            [str(python_exe), str(bridge_script), *argv],
+            cwd=str(SCRIPT_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            creationflags=creationflags,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = str(exc.stdout or "").strip()
+        stderr = str(exc.stderr or "").strip()
+        combined = stdout
+        if stderr:
+            combined = f"{combined}\n{stderr}".strip()
+        message = combined or f"Bridge subprocess timed out after {timeout_sec:.1f}s."
+        return 124, message
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    combined = stdout
+    if stderr:
+        combined = f"{combined}\n{stderr}".strip()
+    return completed.returncode, combined
+
+
 def run_bridge_command_stream(argv: list[str], on_line) -> tuple[int, str]:
     parser = bridge.build_parser()
     stream = LineStream(on_line)
@@ -541,6 +614,19 @@ def resolve_status_args(ref: str | None) -> list[str]:
         return ["status"]
     thread = bridge.resolve_thread_ref(ref)
     return ["status", "--thread-id", thread.id]
+
+
+def parse_bridge_key_value_output(output: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = key.strip().lower().replace(" ", "_")
+        if normalized_key:
+            fields[normalized_key] = value.strip()
+    return fields
 
 
 def get_active_job_summary() -> str:
@@ -633,9 +719,20 @@ def resolve_interactive_reply_target(
     if candidate[0]:
         return candidate
 
-    try:
-        bridge.build_approval_decision_payload(prompt)
-    except Exception:
+    normalized_prompt = str(prompt).strip()
+    lowered_prompt = normalized_prompt.lower()
+    approval_like = normalized_prompt in {"1", "2", "3"} or lowered_prompt in {
+        "approve",
+        "approved",
+        "accept",
+        "yes",
+        "y",
+        "ok",
+        "cancel",
+        "skip",
+        "dismiss",
+    }
+    if not approval_like:
         return None, "", ""
 
     try:
@@ -696,13 +793,26 @@ def maybe_submit_waiting_input_reply(
         return False
 
     if busy_state == INTERACTIVE_STATE_APPROVAL:
-        try:
-            result = bridge.reply_to_pending_approval(
-                target_thread,
+        log_line(
+            f"approval_reply_start chat_id={chat_id} thread={target_thread.id} "
+            f"ref={target_ref or bridge.get_thread_workspace_ref(target_thread)} prompt={prompt[:80]}"
+        )
+        exit_code, output = run_bridge_script_subprocess(
+            [
+                "approval_reply",
+                "--thread-id",
+                target_thread.id,
+                "--timeout",
+                "8.0",
                 prompt,
-                timeout_sec=8.0,
-            )
-        except Exception as exc:
+            ],
+            timeout_sec=12.0,
+        )
+        log_line(
+            f"approval_reply_finish chat_id={chat_id} thread={target_thread.id} "
+            f"exit_code={exit_code} preview={(output or '(no output)')[:160]}"
+        )
+        if exit_code != 0:
             send_text(
                 token,
                 chat_id,
@@ -711,20 +821,21 @@ def maybe_submit_waiting_input_reply(
                         "Waiting approval reply failed.",
                         f"thread: {target_ref or bridge.get_thread_workspace_ref(target_thread)}",
                         "",
-                        str(exc),
+                        output or "(no output)",
                     ]
                 ),
                 reply_to_message_id=reply_to_message_id,
             )
             return True
 
+        result = parse_bridge_key_value_output(output)
         lines = [
             "Approval submitted.",
-            f"thread: {target_ref or bridge.get_thread_workspace_ref(target_thread)}",
+            f"thread: {target_ref or result.get('thread_ref') or bridge.get_thread_workspace_ref(target_thread)}",
             f"decision: {result.get('decision_action') or '-'}",
         ]
         request_kind = str(result.get("request_kind") or "").strip()
-        if request_kind:
+        if request_kind and request_kind != "-":
             lines.append(f"kind: {request_kind}")
         send_text(
             token,
@@ -732,7 +843,13 @@ def maybe_submit_waiting_input_reply(
             "\n".join(lines),
             reply_to_message_id=reply_to_message_id,
         )
-        maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
+        ensure_follow_watcher(
+            token=token,
+            chat_id=chat_id,
+            target_thread_id=target_thread.id,
+            target_ref=target_ref or result.get("thread_ref") or bridge.get_thread_workspace_ref(target_thread),
+            reply_to_message_id=reply_to_message_id,
+        )
         return True
 
     if busy_state != INTERACTIVE_STATE_INPUT:
@@ -973,6 +1090,29 @@ def stop_follow_watcher(chat_id: int) -> None:
         stop_event.set()
 
 
+def send_latest_assistant_reply_if_changed(
+    token: str,
+    chat_id: int,
+    session_path: Path,
+    reply_to_message_id: int | None,
+    baseline_last_assistant: str,
+    seen_agent_messages: set[str],
+) -> bool:
+    try:
+        _last_user, last_assistant = bridge.get_last_user_and_assistant_messages(session_path)
+    except Exception:
+        log_line("follow_latest_assistant_error\n" + traceback.format_exc())
+        return False
+
+    latest_text = str(last_assistant or "").strip()
+    baseline_text = str(baseline_last_assistant or "").strip()
+    if not latest_text or latest_text == baseline_text or latest_text in seen_agent_messages:
+        return False
+
+    send_text(token, chat_id, latest_text, reply_to_message_id=reply_to_message_id)
+    return True
+
+
 def follow_thread_output(
     token: str,
     chat_id: int,
@@ -991,6 +1131,18 @@ def follow_thread_output(
         session_path = Path(target_thread.rollout_path)
         if not session_path.exists():
             return
+        _last_user, baseline_last_assistant = bridge.get_last_user_and_assistant_messages(session_path)
+        current_state, current_prompt = get_current_interactive_prompt(target_thread)
+        if current_state:
+            signature = "\n".join([current_state, current_prompt])
+            if signature and signature not in seen_interactive_signatures:
+                seen_interactive_signatures.add(signature)
+                send_text(
+                    token,
+                    chat_id,
+                    build_interactive_waiting_text(target_ref, current_state, current_prompt),
+                    reply_to_message_id=reply_to_message_id,
+                )
         cursor = session_path.stat().st_size
         while time.time() < deadline and not stop_event.is_set():
             events, cursor = bridge.read_new_session_events(session_path, cursor)
@@ -1037,6 +1189,8 @@ def follow_thread_output(
                 if event.get("type") == "response_item" and payload.get("type") == "function_call":
                     notice = bridge.build_interactive_notice_from_function_call(payload)
                     state, prompt = parse_interactive_notice(notice)
+                    if state == INTERACTIVE_STATE_APPROVAL:
+                        continue
                     if state:
                         signature = "\n".join([state, prompt])
                         if signature and signature not in seen_interactive_signatures:
@@ -1048,7 +1202,31 @@ def follow_thread_output(
                                 reply_to_message_id=reply_to_message_id,
                             )
 
+            current_state, current_prompt = get_current_interactive_prompt(target_thread)
+            if current_state:
+                signature = "\n".join([current_state, current_prompt])
+                if signature and signature not in seen_interactive_signatures:
+                    seen_interactive_signatures.add(signature)
+                    send_text(
+                        token,
+                        chat_id,
+                        build_interactive_waiting_text(target_ref, current_state, current_prompt),
+                        reply_to_message_id=reply_to_message_id,
+                    )
+
             if not bridge.is_thread_busy(session_path):
+                idle_grace_deadline = time.time() + 4.5
+                while time.time() < idle_grace_deadline and not stop_event.is_set():
+                    if send_latest_assistant_reply_if_changed(
+                        token,
+                        chat_id,
+                        session_path,
+                        reply_to_message_id,
+                        baseline_last_assistant,
+                        seen_agent_messages,
+                    ):
+                        return
+                    time.sleep(0.35)
                 return
             time.sleep(0.35)
     except Exception:
@@ -1712,6 +1890,17 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         send_text(token, chat_id, message_text, reply_to_message_id=reply_to_message_id)
         return
 
+    if command == "/restart_codex":
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["restart_codex"],
+            "Codex restart ok",
+            "Codex restart failed",
+        )
+        return
+
     if command in {"/chatid", "/whoami"}:
         send_text(
             token,
@@ -1819,6 +2008,17 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             ["doctor"],
             "Doctor",
             "Doctor failed",
+        )
+        return
+
+    if command == "/discover_codex":
+        send_bridge_command_result(
+            token,
+            chat_id,
+            reply_to_message_id,
+            ["discover_codex"],
+            "Codex path ok",
+            "Codex path failed",
         )
         return
 
