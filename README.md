@@ -1,6 +1,8 @@
-# Codex Desktop Bridge
+# codex-bridge-telegram
 
-Unofficial Windows bridge for controlling the Codex Desktop app without using Codex CLI.
+Unofficial Windows bridge and Telegram control layer for the Codex Desktop app without using Codex CLI.
+
+This repository is the `codex-bridge-telegram` project: a local Codex Desktop bridge plus a Telegram bot adapter for thread control, archive actions, and approval handling.
 
 It works by combining:
 
@@ -19,7 +21,7 @@ No third-party Python packages are required.
 ## Repository Layout
 
 - `codex_desktop_bridge.py`: local thread discovery, window activation, ask/watch flow
-- `codex_telegram_bot.py`: Telegram adapter that runs the bridge in-process
+- `codex_telegram_bot.py`: Telegram adapter for the `codex-bridge-telegram` flow
 - `codex-bridge.cmd`: main launcher
 - `codex-telegram-bot.cmd`: Telegram-only launcher
 - `.env.example`: local environment template
@@ -155,7 +157,7 @@ Plain text messages are treated like `/ask <message>`, except for interactive st
 일반 텍스트 메시지는 기본적으로 `/ask <message>`처럼 처리되지만, 상호작용 상태에서는 다르게 동작합니다.
 
 - 선택한 스레드가 `waiting-input`이면 일반 텍스트가 그 입력에 대한 답변으로 전달됩니다.
-- 선택한 스레드가 `waiting-approval`이면 `1`, `3`, `cancel`로 응답합니다.
+- 선택한 스레드가 `waiting-approval`이면 화면에 보이는 `1`, `2`, `3` 중 하나로 응답합니다.
 
 Telegram no longer uses `/open`. Use `/use` to bind the target thread, then ask against that selected thread.
 
@@ -176,6 +178,8 @@ Telegram no longer uses `/open`. Use `/use` to bind the target thread, then ask 
 | `/doctor` | Print bridge diagnostics. | 브리지 진단 정보를 출력합니다. |
 | `/ask <prompt>` | Send a prompt through the default IPC path. | 기본 IPC 경로로 질문을 보냅니다. |
 | `/ask_ipc <prompt>` | Alias of `/ask`. | `/ask`의 별칭입니다. |
+| `/discover_codex` | Discover the Codex Desktop executable and persist it into `.env`. | Codex Desktop 실행 파일을 찾아 `.env`에 저장합니다. |
+| `/restart_codex` | Restart the Codex Desktop app using the saved executable path. | 저장된 실행 파일 경로를 사용해 Codex Desktop 앱을 재시작합니다. |
 | `/restart_bot` | Restart only the Telegram bot process. | 텔레그램 봇 프로세스만 재시작합니다. |
 | `/chatid` | Show the current Telegram chat id. | 현재 텔레그램 chat id를 보여줍니다. |
 
@@ -190,8 +194,8 @@ Telegram notes:
 
 - 텔레그램의 기본 `ask`는 UI 복붙이 아니라 IPC를 사용합니다.
 - 아주 오래된 스레드가 데스크톱 앱에 아직 로드되지 않은 경우, 앱에서 한 번 열어 준 뒤 다시 시도해야 할 수 있습니다.
-- 승인 옵션 `2`(다시 묻지 않기 포함 승인)는 아직 Codex Desktop에서 처리해야 합니다.
-- 텔레그램에서의 승인 완료는 아직 실험적입니다. 스레드가 계속 `waiting-approval`이면 데스크톱에서 마무리하세요.
+- `waiting-approval` 상태의 live 승인 프롬프트는 텔레그램에서도 `1 / 2 / 3` 선택지로 그대로 표시됩니다.
+- 현재 확인된 텔레그램 승인 경로는 live `commandExecution` 프롬프트 기준입니다.
 
 Additional Telegram commands:
 
