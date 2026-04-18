@@ -38,10 +38,12 @@ Compared with the last committed baseline, the current patch set adds or stabili
 - thread creation from bridge and Telegram via `new` and `/new`
 - archive move flow via `archive`, `/archive`, and `archived_list`
 - archived-thread deletion flow via `delete_archive`, `/delete_archive`, and `/confirm_delete_archive`
-- target-thread binding without opening UI via `use` and `/use`
+- split thread targeting between `use`/`/use` and `open`/`/open`
 - Codex Desktop executable discovery and restart via `discover_codex`, `/discover_codex`, `restart_codex`, and `/restart_codex`
 - Telegram live approval handling for `waiting-approval` threads with visible `1 / 2 / 3` choices
 - Telegram follow-up delivery after approval replies so the post-approval result message is forwarded back into chat
+- Telegram follow mode now forwards approval prompts directly instead of requiring a manual `/list` and `/use` refresh
+- after `/restart_codex`, reopen the target thread with `/open <ref>` before asking if you need visible-thread/live IPC recovery
 
 ## Quick Start
 
@@ -141,7 +143,8 @@ Recommended Telegram workflow:
 
 1. `/list`
 2. `/use <ref>`
-3. Send plain text or `/ask <prompt>`
+3. Optional: `/open <ref>` if you need the visible Codex UI thread, or if you just ran `/restart_codex`
+4. Send plain text or `/ask <prompt>`
 
 권장 텔레그램 흐름:
 
@@ -159,7 +162,9 @@ Plain text messages are treated like `/ask <message>`, except for interactive st
 - 선택한 스레드가 `waiting-input`이면 일반 텍스트가 그 입력에 대한 답변으로 전달됩니다.
 - 선택한 스레드가 `waiting-approval`이면 화면에 보이는 `1`, `2`, `3` 중 하나로 응답합니다.
 
-Telegram no longer uses `/open`. Use `/use` to bind the target thread, then ask against that selected thread.
+`/use` only stores the default target thread. `/open` actually opens that thread in the visible Codex UI.
+
+After `/restart_codex`, run `/open <ref>` again before asking if you want live IPC / follow / approval visibility to recover reliably. `/use` alone does not reopen the Codex UI thread after restart.
 
 텔레그램에서는 더 이상 `/open`을 쓰지 않습니다. `/use`로 대상 스레드를 선택한 뒤 그 스레드에 질문을 보냅니다.
 
@@ -187,7 +192,10 @@ Telegram notes:
 
 - Default Telegram `ask` uses IPC, not UI paste.
 - If an older thread is not currently loaded by Codex Desktop, IPC can still fail once. Open that thread once in the app and retry.
+- `/use <ref>` keeps the target binding only. `/open <ref>` is the command that reopens the visible Codex UI thread.
+- After `/restart_codex`, reopen the target thread with `/open <ref>` before asking if you need live IPC / follow / approval recovery.
 - Live `waiting-approval` prompts are shown in Telegram with visible `1 / 2 / 3` options.
+- When a followed thread enters `waiting-approval`, the approval prompt is forwarded into Telegram directly.
 - Current tested Telegram approval flow is the live `commandExecution` prompt path.
 
 추가 메모:
@@ -199,6 +207,8 @@ Telegram notes:
 
 Additional Telegram commands:
 
+- `/open <ref>`: open the target thread in the visible Codex UI and make it the selected thread
+- `/open_abort <ref>`: abort the current reply if needed, then open the target thread in the visible Codex UI
 - `/discover_codex`: discover the Codex Desktop executable and persist `CODEX_DESKTOP_EXE` into `.env`
 - `/restart_codex`: restart the Codex Desktop app using the discovered `CODEX_DESKTOP_EXE` path
 
@@ -225,16 +235,22 @@ Main REPL commands:
 
 - `list`
 - `archived_list`
+- `discover_codex`
+- `restart_codex`
 - `open <ref>`
 - `open --abort <ref>`
 - `use <ref>`
 - `new "..."`
 - `archive <ref>`
 - `delete_archive <ref>`
+- `approval_reply <answer> [ref]`
 - `ask "..."`
 - `status`
 - `doctor`
 - `tail --only-new`
+- `focus`
+- `help`
+- `exit`
 
 Default REPL behavior:
 
@@ -242,6 +258,7 @@ Default REPL behavior:
 - default `ask` uses IPC
 - `open` changes the visible Codex thread
 - `use` only changes the persisted target thread
+- after `restart_codex`, use `open <ref>` again if you need visible-thread/live IPC recovery
 
 `list` output fields:
 

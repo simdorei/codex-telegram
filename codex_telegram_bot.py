@@ -55,6 +55,8 @@ TELEGRAM_HELP_LINES = [
     "/archive [ref]",
     "/delete_archive <ref>",
     "/confirm_delete_archive <ref>",
+    "/open <ref>",
+    "/open_abort <ref>",
     "/use <ref>",
     "/status [ref]",
     "/doctor",
@@ -453,10 +455,9 @@ class TelegramAskRelay:
             return False
         if state == INTERACTIVE_STATE_APPROVAL:
             current_state, current_prompt = get_current_interactive_prompt_for_ref(self.thread_ref)
-            if current_state != INTERACTIVE_STATE_APPROVAL or not current_prompt:
-                return True
-            state = current_state
-            prompt = current_prompt
+            if current_state == INTERACTIVE_STATE_APPROVAL and current_prompt:
+                state = current_state
+                prompt = current_prompt
         signature = "\n".join([state, prompt])
         if signature == self.last_interactive_signature:
             return True
@@ -1189,9 +1190,12 @@ def follow_thread_output(
                 if event.get("type") == "response_item" and payload.get("type") == "function_call":
                     notice = bridge.build_interactive_notice_from_function_call(payload)
                     state, prompt = parse_interactive_notice(notice)
-                    if state == INTERACTIVE_STATE_APPROVAL:
-                        continue
                     if state:
+                        if state == INTERACTIVE_STATE_APPROVAL:
+                            current_state, current_prompt = get_current_interactive_prompt(target_thread)
+                            if current_state == INTERACTIVE_STATE_APPROVAL and current_prompt:
+                                state = current_state
+                                prompt = current_prompt
                         signature = "\n".join([state, prompt])
                         if signature and signature not in seen_interactive_signatures:
                             seen_interactive_signatures.add(signature)
@@ -1583,6 +1587,8 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
                     "/archive [ref]",
                     "/delete_archive <ref>",
                     "/confirm_delete_archive <ref>",
+                    "/open <ref>",
+                    "/open_abort <ref>",
                     "/use <ref>",
                     "/status [ref]",
                     "/doctor",
@@ -1736,12 +1742,23 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
         return
 
     if command in {"/open", "/open_abort"}:
+        if not arg:
+            send_text(token, chat_id, f"Usage: {command} <ref>", reply_to_message_id=reply_to_message_id)
+            return
+        argv = ["open"]
+        if command == "/open_abort":
+            argv.append("--abort")
+        argv.append(arg)
+        exit_code, output = run_bridge_command(argv)
+        prefix = "Open ok" if exit_code == 0 else f"Open failed (exit {exit_code})"
         send_text(
             token,
             chat_id,
-            "Removed. Use /use <ref> to pick the target thread, then send /ask or a plain message.",
+            f"{prefix}\n\n{output or '(no output)'}",
             reply_to_message_id=reply_to_message_id,
         )
+        if exit_code == 0:
+            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 
     if command == "/ask":
@@ -2050,12 +2067,23 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         return
 
     if command in {"/open", "/open_abort"}:
-        send_text(
+        if not arg:
+            send_usage(token, chat_id, reply_to_message_id, f"{command} <ref>")
+            return
+        argv = ["open"]
+        if command == "/open_abort":
+            argv.append("--abort")
+        argv.append(arg)
+        exit_code, _output = send_bridge_command_result(
             token,
             chat_id,
-            "Removed. Use /use <ref> to pick the target thread, then send /ask or a plain message.",
-            reply_to_message_id=reply_to_message_id,
+            reply_to_message_id,
+            argv,
+            "Open ok",
+            "Open failed",
         )
+        if exit_code == 0:
+            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 
     if command in {"/ask", "/ask_ipc"}:
