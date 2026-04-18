@@ -34,7 +34,7 @@ LOG_PATH = SCRIPT_DIR / "codex_telegram_bot.log"
 PROBE_LOG_PATH = SCRIPT_DIR / "_ipc_probe_log.jsonl"
 TELEGRAM_MAX_LEN = 3900
 ACTIVE_JOB_LOCK = threading.Lock()
-ACTIVE_JOB: dict[str, object] = {"thread": None, "chat_id": None, "summary": ""}
+ACTIVE_JOB: dict[str, object] = {"thread": None, "chat_id": None, "summary": "", "target_thread_id": None}
 PENDING_ASKS_LOCK = threading.Lock()
 PENDING_ASKS: list[dict[str, object]] = []
 ASK_WAITERS_LOCK = threading.Lock()
@@ -462,6 +462,11 @@ class TelegramAskRelay:
         if signature == self.last_interactive_signature:
             return True
         self.last_interactive_signature = signature
+        log_line(
+            f"relay_interactive_notice chat_id={self.chat_id} "
+            f"thread={self.thread_ref or '-'} state={state} "
+            f"reply_to={self.reply_to_message_id or '-'}"
+        )
         send_text(
             self.token,
             self.chat_id,
@@ -494,6 +499,16 @@ class TelegramAskRelay:
             self.saw_timeout = True
         self.block_lines = []
 
+    def _flush_interactive_block_if_ready(self, line: str) -> None:
+        if line != "":
+            return
+        text = "\n".join(self.block_lines).strip()
+        state, _prompt = parse_interactive_notice(text)
+        if state:
+            # Approval/input notices need to go out immediately; otherwise the ask
+            # can block waiting for a reply while Telegram still holds the notice.
+            self._send_block()
+
     def feed_line(self, line: str) -> None:
         if line.startswith("[commentary]"):
             self._send_block()
@@ -524,6 +539,7 @@ class TelegramAskRelay:
 
         if self.mode in {"commentary", "final", "timeout"}:
             self.block_lines.append(line)
+            self._flush_interactive_block_if_ready(line)
             return
 
         if line.startswith("target_thread:") or line.startswith("title:") or line.startswith("ui_name:") or line.startswith("cwd:"):
@@ -630,6 +646,33 @@ def parse_bridge_key_value_output(output: str) -> dict[str, str]:
     return fields
 
 
+def command_output_has_interactive_prompt(output: str) -> bool:
+    text = str(output or "")
+    return "[waiting-input]" in text or "[waiting-approval]" in text
+
+
+def looks_like_approval_reply(prompt: str) -> bool:
+    normalized_prompt = str(prompt).strip()
+    lowered_prompt = normalized_prompt.lower()
+    return normalized_prompt in {"1", "2", "3"} or lowered_prompt in {
+        "approve",
+        "approved",
+        "accept",
+        "yes",
+        "y",
+        "ok",
+        "cancel",
+        "skip",
+        "dismiss",
+    }
+
+
+def should_attach_follow_after_command(output: str, active_summary: str) -> bool:
+    if active_summary:
+        return False
+    return not command_output_has_interactive_prompt(output)
+
+
 def get_active_job_summary() -> str:
     with ACTIVE_JOB_LOCK:
         thread = ACTIVE_JOB.get("thread")
@@ -639,11 +682,30 @@ def get_active_job_summary() -> str:
     return ""
 
 
-def set_active_job(thread: threading.Thread | None, chat_id: int | None = None, summary: str = "") -> None:
+def has_active_job_for_chat(chat_id: int, target_thread_id: str | None = None) -> bool:
+    with ACTIVE_JOB_LOCK:
+        thread = ACTIVE_JOB.get("thread")
+        active_chat_id = ACTIVE_JOB.get("chat_id")
+        active_target_thread_id = str(ACTIVE_JOB.get("target_thread_id") or "").strip() or None
+    return bool(
+        active_chat_id == chat_id
+        and thread
+        and getattr(thread, "is_alive", lambda: False)()
+        and (target_thread_id is None or active_target_thread_id == target_thread_id)
+    )
+
+
+def set_active_job(
+    thread: threading.Thread | None,
+    chat_id: int | None = None,
+    summary: str = "",
+    target_thread_id: str | None = None,
+) -> None:
     with ACTIVE_JOB_LOCK:
         ACTIVE_JOB["thread"] = thread
         ACTIVE_JOB["chat_id"] = chat_id
         ACTIVE_JOB["summary"] = summary
+        ACTIVE_JOB["target_thread_id"] = target_thread_id
 
 
 def resolve_selected_target() -> tuple[str | None, str, str]:
@@ -720,19 +782,7 @@ def resolve_interactive_reply_target(
     if candidate[0]:
         return candidate
 
-    normalized_prompt = str(prompt).strip()
-    lowered_prompt = normalized_prompt.lower()
-    approval_like = normalized_prompt in {"1", "2", "3"} or lowered_prompt in {
-        "approve",
-        "approved",
-        "accept",
-        "yes",
-        "y",
-        "ok",
-        "cancel",
-        "skip",
-        "dismiss",
-    }
+    approval_like = looks_like_approval_reply(prompt)
     if not approval_like:
         return None, "", ""
 
@@ -844,13 +894,14 @@ def maybe_submit_waiting_input_reply(
             "\n".join(lines),
             reply_to_message_id=reply_to_message_id,
         )
-        ensure_follow_watcher(
-            token=token,
-            chat_id=chat_id,
-            target_thread_id=target_thread.id,
-            target_ref=target_ref or result.get("thread_ref") or bridge.get_thread_workspace_ref(target_thread),
-            reply_to_message_id=reply_to_message_id,
-        )
+        if not has_active_job_for_chat(chat_id, target_thread.id):
+            ensure_follow_watcher(
+                token=token,
+                chat_id=chat_id,
+                target_thread_id=target_thread.id,
+                target_ref=target_ref or result.get("thread_ref") or bridge.get_thread_workspace_ref(target_thread),
+                reply_to_message_id=reply_to_message_id,
+            )
         return True
 
     if busy_state != INTERACTIVE_STATE_INPUT:
@@ -898,7 +949,8 @@ def maybe_submit_waiting_input_reply(
         "\n".join(lines),
         reply_to_message_id=reply_to_message_id,
     )
-    maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
+    if not has_active_job_for_chat(chat_id, target_thread.id):
+        maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
     return True
 
 
@@ -1003,6 +1055,7 @@ def start_ask_worker(
             ACTIVE_JOB["summary"] = f"Running ask on {target_ref}: {prompt[:120]}"
         else:
             ACTIVE_JOB["summary"] = f"Running ask: {prompt[:120]}"
+        ACTIVE_JOB["target_thread_id"] = target_thread_id
     worker.start()
     start_label = "Queued ask started." if queued else "Ask started."
     send_text(token, chat_id, f"{start_label}\n\n{prompt}", reply_to_message_id=reply_to_message_id)
@@ -1138,6 +1191,11 @@ def follow_thread_output(
             signature = "\n".join([current_state, current_prompt])
             if signature and signature not in seen_interactive_signatures:
                 seen_interactive_signatures.add(signature)
+                log_line(
+                    f"follow_interactive_notice chat_id={chat_id} "
+                    f"target_ref={target_ref} state={current_state} source=start "
+                    f"reply_to={reply_to_message_id or '-'}"
+                )
                 send_text(
                     token,
                     chat_id,
@@ -1196,14 +1254,19 @@ def follow_thread_output(
                             if current_state == INTERACTIVE_STATE_APPROVAL and current_prompt:
                                 state = current_state
                                 prompt = current_prompt
-                        signature = "\n".join([state, prompt])
-                        if signature and signature not in seen_interactive_signatures:
-                            seen_interactive_signatures.add(signature)
-                            send_text(
-                                token,
-                                chat_id,
-                                build_interactive_waiting_text(target_ref, state, prompt),
-                                reply_to_message_id=reply_to_message_id,
+                    signature = "\n".join([state, prompt])
+                    if signature and signature not in seen_interactive_signatures:
+                        seen_interactive_signatures.add(signature)
+                        log_line(
+                            f"follow_interactive_notice chat_id={chat_id} "
+                            f"target_ref={target_ref} state={state} source=event "
+                            f"reply_to={reply_to_message_id or '-'}"
+                        )
+                        send_text(
+                            token,
+                            chat_id,
+                            build_interactive_waiting_text(target_ref, state, prompt),
+                            reply_to_message_id=reply_to_message_id,
                             )
 
             current_state, current_prompt = get_current_interactive_prompt(target_thread)
@@ -1211,6 +1274,11 @@ def follow_thread_output(
                 signature = "\n".join([current_state, current_prompt])
                 if signature and signature not in seen_interactive_signatures:
                     seen_interactive_signatures.add(signature)
+                    log_line(
+                        f"follow_interactive_notice chat_id={chat_id} "
+                        f"target_ref={target_ref} state={current_state} source=poll "
+                        f"reply_to={reply_to_message_id or '-'}"
+                    )
                     send_text(
                         token,
                         chat_id,
@@ -1302,6 +1370,8 @@ def maybe_follow_selected_thread(
         stop_follow_watcher(chat_id)
         return
 
+    current_state, _current_prompt = get_current_interactive_prompt(target_thread)
+
     started, existing_ref = ensure_follow_watcher(
         token=token,
         chat_id=chat_id,
@@ -1312,17 +1382,18 @@ def maybe_follow_selected_thread(
     if not started:
         return
 
-    send_text(
-        token,
-        chat_id,
-        "\n".join(
-            [
-                f"Following busy thread: {target_ref}",
-                "I'll forward in-progress updates here.",
-            ]
-        ),
-        reply_to_message_id=reply_to_message_id,
-    )
+    if not current_state:
+        send_text(
+            token,
+            chat_id,
+            "\n".join(
+                [
+                    f"Following busy thread: {target_ref}",
+                    "I'll forward in-progress updates here.",
+                ]
+            ),
+            reply_to_message_id=reply_to_message_id,
+        )
     log_line(f"follow_watcher_start chat_id={chat_id} target_ref={target_ref} replaced={existing_ref or '-'}")
 
 
@@ -1737,7 +1808,7 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
         exit_code, output = run_bridge_command(["use", arg])
         prefix = "Use ok" if exit_code == 0 else f"Use failed (exit {exit_code})"
         send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        if exit_code == 0:
+        if exit_code == 0 and should_attach_follow_after_command(output, active_summary):
             maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 
@@ -1757,7 +1828,7 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
             f"{prefix}\n\n{output or '(no output)'}",
             reply_to_message_id=reply_to_message_id,
         )
-        if exit_code == 0:
+        if exit_code == 0 and should_attach_follow_after_command("", active_summary):
             maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 
@@ -1855,6 +1926,12 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             target_ref,
             target_label,
         )
+        if looks_like_approval_reply(text) and not interactive_thread_id:
+            log_line(
+                f"approval_like_message_without_interactive_target chat_id={chat_id} "
+                f"selected_ref={target_ref or '-'} active_summary={'yes' if active_summary else 'no'} "
+                f"prompt={text[:80]}"
+            )
         if maybe_submit_waiting_input_reply(
             token,
             chat_id,
@@ -2054,7 +2131,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
         if not arg:
             send_usage(token, chat_id, reply_to_message_id, "/use <ref>")
             return
-        exit_code, _output = send_bridge_command_result(
+        exit_code, output = send_bridge_command_result(
             token,
             chat_id,
             reply_to_message_id,
@@ -2062,7 +2139,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             "Use ok",
             "Use failed",
         )
-        if exit_code == 0:
+        if exit_code == 0 and should_attach_follow_after_command(output, active_summary):
             maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 
@@ -2082,7 +2159,7 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
             "Open ok",
             "Open failed",
         )
-        if exit_code == 0:
+        if exit_code == 0 and should_attach_follow_after_command("", active_summary):
             maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
         return
 

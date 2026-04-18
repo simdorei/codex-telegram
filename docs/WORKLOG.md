@@ -114,5 +114,44 @@
   - test in this order:
     - `1` approve row-select
     - `2` approve+remember row-select
-    - plain-text decline reason
+  - plain-text decline reason
   - decide whether the new path actually clears `waiting-approval` before making any broader cleanup.
+
+## 2026-04-18 21:55:00 +09:00
+- Goal: stabilize Telegram approval/follow behavior enough to push the current morning-version patch set, with concrete log evidence included.
+- Findings:
+  - The earlier "duplicate approval" report mixed two different cases:
+    - true duplicate delivery in older logs (`21:34:14`) where the same approval notice fanned out to two `reply_to` targets
+    - later cases where the user pasted a prior approval card back into chat, which then started a normal ask (`21:50:53`)
+  - Fresh approval delivery now reproduces correctly through the ask relay:
+    - `21:52:13` `relay_interactive_notice ... state=waiting-approval`
+    - the approval card was sent immediately to Telegram
+    - `21:52:24` plain `1` was routed into `approval_reply`
+    - `21:52:27` approval completed successfully
+  - The remaining confusion point is not first-approval delivery anymore; it is that re-sending an old approval card or progress text can still be interpreted as a new ask.
+- Changes:
+  - Updated `codex_telegram_bot.py` to:
+    - flush interactive relay blocks immediately on blank-line completion
+    - suppress follow-watcher reattachment after approval/input replies when the same chat/thread already has an active ask
+    - suppress generic "Following busy thread" text when the selected thread is already in an interactive state
+    - gate `/use` and `/open` follow attachment based on current active work and interactive output
+    - add targeted debug logging:
+      - `relay_interactive_notice`
+      - `follow_interactive_notice`
+      - `approval_like_message_without_interactive_target`
+  - Added a tracked log excerpt file for this debugging session:
+    - `docs/telegram_approval_follow_debug_2026-04-18.txt`
+- Validation:
+  - `python -m py_compile codex_telegram_bot.py codex_desktop_bridge.py`
+  - Telegram bot restarted and rechecked during the same session
+  - fresh approval smoke test via `Get-Date` escalation:
+    - first approval card delivered through relay
+    - reply `1` accepted
+    - approval completed without the earlier `/list` -> `/use` recovery path
+- Current status:
+  - first approval delivery is working in the latest fresh reproduction
+  - the old duplicate fan-out path has not reappeared in the latest fresh reproduction
+  - one residual UX bug remains:
+    - if a prior approval card or progress block is pasted back into chat, the bot may still treat it as a new ask
+- Next focused step:
+  - add an input guard so pasted approval/progress cards are rejected or normalized instead of being queued as a fresh ask

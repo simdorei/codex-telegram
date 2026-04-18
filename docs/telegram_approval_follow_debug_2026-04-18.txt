@@ -1,0 +1,12 @@
+Extracted from `codex_telegram_bot.log` on 2026-04-18.
+These are the key lines used to confirm the latest approval/follow behavior.
+
+[2026-04-18 21:50:53] handle_message chat_id=6311923737 allowed=[6311923737] text=Waiting approval thread: codex:1  kind: commandExecution approval/follow 진단 로그가 반영된 새 코드로 텔레그램 봇을 다시 재시작할까요? 1. yes 2. yes + do not ask again in this session 3.
+[2026-04-18 21:50:53] ask_job_start chat_id=6311923737 target_ref=codex:1 prompt=Waiting approval thread: codex:1  kind: commandExecution approval/follow 진단 로그가 반영된 새 코드로 텔레그램 봇을 다시 재시작할까요? 1. yes 2. yes + do not ask again in this session 3.
+
+[2026-04-18 21:52:13] relay_interactive_notice chat_id=6311923737 thread=codex:1 state=waiting-approval reply_to=8321
+[2026-04-18 21:52:13] send_text chat_id=6311923737 reply_to=8321 chunks=1 preview=Waiting approval thread: codex:1  kind: commandExecution 새 봇에서 첫 approval이 follow로 한 번만 오는지 검증하려고 Get-Date 테스트 승인을 띄울까요?
+[2026-04-18 21:52:24] handle_message chat_id=6311923737 allowed=[6311923737] text=1
+[2026-04-18 21:52:25] approval_reply_start chat_id=6311923737 thread=019d9f81-adb2-76e1-8ebf-5cf10e2365ba ref=codex:1 prompt=1
+[2026-04-18 21:52:27] approval_reply_finish chat_id=6311923737 thread=019d9f81-adb2-76e1-8ebf-5cf10e2365ba exit_code=0 preview=thread_id: 019d9f81-adb2-76e1-8ebf-5cf10e2365ba
+[2026-04-18 21:52:27] send_text chat_id=6311923737 reply_to=8332 chunks=1 preview=Approval submitted. thread: codex:1 decision: accept kind: commandExecution
