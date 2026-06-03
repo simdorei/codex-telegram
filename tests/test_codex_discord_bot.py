@@ -131,6 +131,16 @@ class EnvPatch:
 
 
 class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._old_mirror_db_path = bot.MIRROR_DB_PATH
+        self._mirror_db_temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        bot.MIRROR_DB_PATH = Path(self._mirror_db_temp_dir.name) / "mirror.sqlite"
+        bot.init_mirror_db()
+
+    def tearDown(self) -> None:
+        bot.MIRROR_DB_PATH = self._old_mirror_db_path
+        self._mirror_db_temp_dir.cleanup()
+
     def test_log_path_override_writes_to_temp_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "discord-smoke.log"

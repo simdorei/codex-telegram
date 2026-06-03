@@ -1646,6 +1646,33 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:50 +09:00 - Discord test mirror DB isolation
+- Goal: stop unit tests from writing fake busy-choice rows into the production `discord_mirror.sqlite` database.
+- Key assumptions:
+  - The observed active busy-choice group with `channel_id=222` and `target_thread_id=thread-1` was test fixture data, not real Discord state.
+  - Test-created busy-choice rows can confuse `/doctor` counts and stale-button debugging.
+- Changes:
+  - Added per-test temporary `MIRROR_DB_PATH` setup/teardown for `DiscordBotHelperTests`.
+  - Verified the test run no longer increases the production busy-choice row count.
+  - Removed 48 fake production busy-choice rows matching `channel_id < 1000000000000` or `target_thread_id='thread-1'`.
+- Abuse cases checked:
+  - Deleting real user controls: cleanup used fake-ID predicates only; real Discord snowflake channel IDs are much larger and real target thread IDs are UUID-like.
+  - Future test pollution: tests now run against isolated temporary mirror DBs by default.
+  - Prompt leakage: cleanup verification logged only counts and fake identifiers, not prompt text.
+  - Mirror mapping loss: only `busy_choices` rows were deleted; mirror project/thread mappings were untouched.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (63 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+  - Production busy-choice DB counts after cleanup: `total=0`, `fake=0`, `expired=0`.
+  - Local doctor smoke showed `busy_choices_active: 0` and `busy_choices_stale: 0`.
+  - `build_mirror_check()` still reports `missing: 0`, `stale: 0`, `wrong_project: 0`.
+- Side effects:
+  - Unit tests no longer share the production mirror DB unless a test explicitly overrides the path within its own temp scope.
+  - No command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:
