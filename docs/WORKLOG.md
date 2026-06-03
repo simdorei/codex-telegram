@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 12:07:06 +09:00
+- Goal: lock Discord `new` failure behavior so failed thread creation cannot mutate mirror state.
+- Key assumptions:
+  - A failed `new` bridge call should report failure only.
+  - Mirror creation should run only after a successful bridge result with a thread id.
+- Changes:
+  - Added a regression test for `run_discord_new_thread()` when the bridge returns a nonzero exit.
+  - Asserted no mirror call occurs, no mirrored-thread mention is returned, and no `new_thread_mirrored` log is emitted.
+  - Asserted default cwd logging remains visible for failure diagnosis.
+- Abuse cases checked:
+  - Test-only change exposes no new Discord command path.
+  - Covered behavior prevents stale or fabricated mirror threads after failed local thread creation.
+  - Test logging is isolated through `CODEX_DISCORD_LOG_PATH`.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 18 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - None for failed-new mirror side effects.
+
 ## 2026-06-03 12:04:42 +09:00
 - Goal: lock slash `/ask` busy-choice ownership for Discord interactions.
 - Key assumptions:

@@ -398,6 +398,48 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.run_bridge_command = original_run_bridge_command
             bot.mirror_single_codex_thread = original_mirror_single
 
+    async def test_new_thread_failure_does_not_mirror(self) -> None:
+        original_resolve_cwd = bot.resolve_discord_new_thread_cwd
+        original_run_bridge_command = bot.run_bridge_command
+        original_mirror_single = bot.mirror_single_codex_thread
+        argv_seen: list[str] = []
+        mirror_calls: list[str] = []
+        try:
+            bot.resolve_discord_new_thread_cwd = lambda channel_id: None
+
+            def fake_run_bridge_command(argv):
+                argv_seen.extend(argv)
+                return 1, "ERROR: cannot create thread"
+
+            async def fake_mirror_single_codex_thread(fake_bot, thread_id):
+                mirror_calls.append(thread_id)
+                return SimpleNamespace(id=999)
+
+            bot.run_bridge_command = fake_run_bridge_command
+            bot.mirror_single_codex_thread = fake_mirror_single_codex_thread
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    exit_code, output = await bot.run_discord_new_thread(
+                        SimpleNamespace(),
+                        222,
+                        "start here",
+                    )
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(argv_seen, ["new", "start here"])
+            self.assertEqual(mirror_calls, [])
+            self.assertIn("New failed (exit 1)", output)
+            self.assertNotIn("Mirrored Discord thread:", output)
+            self.assertIn("new_thread_cwd channel=222 cwd=default", log_text)
+            self.assertNotIn("new_thread_mirrored", log_text)
+        finally:
+            bot.resolve_discord_new_thread_cwd = original_resolve_cwd
+            bot.run_bridge_command = original_run_bridge_command
+            bot.mirror_single_codex_thread = original_mirror_single
+
     async def test_slash_ask_routes_to_existing_ask_flow(self) -> None:
         original_get_mirrored = bot.get_mirrored_codex_thread_id
         original_handle_plain_ask = bot.handle_plain_ask
