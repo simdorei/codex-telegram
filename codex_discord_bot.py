@@ -2628,13 +2628,17 @@ class BusyChoiceView(discord.ui.View):
                 f"queue_next_immediate_sent user={interaction.user.id} "
                 f"target={self.target_thread_id or '-'}"
             )
-            asyncio.create_task(
-                run_prompt_flow(
-                    self.message.channel,
-                    self.prompt,
-                    source_message=self.message,
-                    target_thread_id=self.target_thread_id,
-                )
+            position = await enqueue_thread_ask(
+                self.message.channel,
+                self.prompt,
+                self.target_thread_id,
+                queued=False,
+                ack_sent=True,
+                source_message=self.message,
+            )
+            log_line(
+                f"queue_next_immediate_enqueued user={interaction.user.id} "
+                f"position={position} target={self.target_thread_id or '-'}"
             )
             return
 

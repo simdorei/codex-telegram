@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 12:38:15 +09:00
+- Goal: route Discord `Queue next` immediate-start behavior through the same runner queue as normal asks.
+- Key assumptions:
+  - `Queue next` can race with a thread becoming idle between button render and click.
+  - The immediate-start branch should still use the same runner queue/error-handling path instead of spawning a separate fire-and-forget task.
+- Changes:
+  - Replaced direct `asyncio.create_task(run_prompt_flow(...))` in the `Queue next` idle branch with `enqueue_thread_ask(..., ack_sent=True)`.
+  - Added `queue_next_immediate_enqueued` logging.
+  - Added a regression test that confirms the immediate branch enqueues and does not call `run_prompt_flow()` directly.
+- Abuse cases checked:
+  - Button ownership and one-shot claim behavior remain unchanged.
+  - The prompt stays tied to the original message/channel/source user through the existing queued job payload.
+  - This does not expose a new command path; it only normalizes execution through the existing per-thread runner.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 30 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need a live Discord `Queue next` click after deployment to prove `queue_next_immediate_enqueued` or normal queued behavior in Discord.
+
 ## 2026-06-03 12:35:06 +09:00
 - Goal: keep Discord view-bearing prompt messages within Discord's single-message length limit.
 - Key assumptions:

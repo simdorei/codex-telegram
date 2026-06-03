@@ -480,6 +480,60 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.submit_approval_reply = original_submit_approval_reply
 
+    async def test_queue_next_immediate_uses_runner_queue(self) -> None:
+        original_get_busy_state = bot.get_busy_state_for_thread
+        original_is_thread_runner_busy = bot.is_thread_runner_busy
+        original_enqueue_thread_ask = bot.enqueue_thread_ask
+        original_run_prompt_flow = bot.run_prompt_flow
+        calls: list[tuple[object, str, str | None, bool, bool, object]] = []
+        try:
+            bot.get_busy_state_for_thread = lambda target_thread_id: ("idle", target_thread_id, "taxlab:1")
+
+            async def runner_idle(target_thread_id):
+                return False
+
+            async def fake_enqueue_thread_ask(
+                channel,
+                prompt,
+                target_thread_id,
+                *,
+                queued=False,
+                ack_sent=False,
+                source_message=None,
+            ):
+                calls.append((channel, prompt, target_thread_id, queued, ack_sent, source_message))
+                return 1
+
+            async def fail_run_prompt_flow(*args, **kwargs):
+                raise AssertionError("queue_next immediate should use enqueue_thread_ask")
+
+            bot.is_thread_runner_busy = runner_idle
+            bot.enqueue_thread_ask = fake_enqueue_thread_ask
+            bot.run_prompt_flow = fail_run_prompt_flow
+
+            message = FakeMessage()
+            view = bot.BusyChoiceView(message, "please queue", target_thread_id="thread-1")
+            button = next(item for item in view.children if getattr(item, "label", "") == "Queue next")
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await button.callback(interaction)
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(
+                calls,
+                [(message.channel, "please queue", "thread-1", False, True, message)],
+            )
+            self.assertEqual(interaction.followup.messages, ["No active job now. Starting this message."])
+            self.assertIn("queue_next_immediate_enqueued user=242286902982606848", log_text)
+        finally:
+            bot.get_busy_state_for_thread = original_get_busy_state
+            bot.is_thread_runner_busy = original_is_thread_runner_busy
+            bot.enqueue_thread_ask = original_enqueue_thread_ask
+            bot.run_prompt_flow = original_run_prompt_flow
+
     async def test_interactive_approval_prompt_with_view_is_truncated(self) -> None:
         channel = FakeTarget()
         await bot.send_interactive_prompt(
