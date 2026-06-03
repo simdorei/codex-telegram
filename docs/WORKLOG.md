@@ -1183,3 +1183,25 @@
   - No command schema, mirror DB schema, or session behavior changed.
 - Unresolved:
   - Still needs fresh live Discord message/button interaction after deployment to prove end-to-end Discord behavior.
+
+## 2026-06-03 13:12 +09:00 - Discord slash allowlist observability
+- Goal: distinguish slash-command hook failures from allowlist/channel filtering.
+- Key assumptions:
+  - A denied slash command can look like a frontend hook failure unless the runtime log records the filter reason.
+  - Logging IDs and command names is enough for diagnosis; request text is not needed.
+- Changes:
+  - Added sanitized `slash_ignored` logs for user allowlist and channel allowlist denials.
+  - Added regression tests for both denial reasons.
+- Abuse cases checked:
+  - Raw prompt leakage into logs: blocked; only command name, reason, user ID, and channel ID are logged.
+  - Enumeration through user-visible responses: unchanged; the user-facing denial message is the same.
+  - Cross-channel command abuse: unchanged structurally; denied commands still return before executing command logic.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (42 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Runtime logs now include sanitized denied slash-command attempts.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord slash/message/button activity after deployment to prove end-to-end behavior.

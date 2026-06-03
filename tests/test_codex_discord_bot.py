@@ -86,10 +86,17 @@ class FakeMessage:
 
 
 class FakeBot:
+    def __init__(self, *, allowed_user: bool = True, allowed_channel: bool = False) -> None:
+        self.allowed_user = allowed_user
+        self.allowed_channel = allowed_channel
+
     def is_allowed_user(self, user_id: int | None) -> bool:
-        return True
+        return self.allowed_user
 
     def is_allowed_channel(self, channel_id: int | None) -> bool:
+        return self.allowed_channel
+
+    def is_allowed_message_channel(self, channel) -> bool:
         return False
 
 
@@ -141,6 +148,37 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(bot.check_interaction_allowed(FakeBot(), interaction))
             finally:
                 bot.MIRROR_DB_PATH = old_db_path
+
+    def test_interaction_user_denial_is_logged(self) -> None:
+        interaction = FakeInteraction(command_name="ask", channel_id=222)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                allowed = bot.check_interaction_allowed(
+                    FakeBot(allowed_user=False),
+                    interaction,
+                )
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertFalse(allowed)
+        self.assertIn("slash_ignored command=ask reason=user_not_allowed", log_text)
+        self.assertIn("channel=222", log_text)
+
+    def test_interaction_channel_denial_is_logged(self) -> None:
+        interaction = FakeInteraction(command_name="ask", channel_id=333)
+        interaction.channel = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                allowed = bot.check_interaction_allowed(
+                    FakeBot(allowed_user=True, allowed_channel=False),
+                    interaction,
+                )
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertFalse(allowed)
+        self.assertIn("slash_ignored command=ask reason=channel_not_allowed", log_text)
+        self.assertIn("channel=333", log_text)
 
     def test_discord_thread_target_args_prefer_mapped_thread(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH

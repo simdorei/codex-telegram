@@ -3168,7 +3168,12 @@ def register_commands(bot: CodexDiscordBot) -> None:
 
 
 def check_interaction_allowed(bot: CodexDiscordBot, interaction: discord.Interaction) -> bool:
+    command_name = get_interaction_command_name(interaction)
     if not bot.is_allowed_user(interaction.user.id):
+        log_line(
+            f"slash_ignored command={command_name} reason=user_not_allowed "
+            f"user={interaction.user.id} channel={interaction.channel_id}"
+        )
         return False
     if bot.is_allowed_channel(interaction.channel_id):
         return True
@@ -3177,6 +3182,10 @@ def check_interaction_allowed(bot: CodexDiscordBot, interaction: discord.Interac
     channel = interaction.channel
     if channel is not None and bot.is_allowed_message_channel(channel):
         return True
+    log_line(
+        f"slash_ignored command={command_name} reason=channel_not_allowed "
+        f"user={interaction.user.id} channel={interaction.channel_id}"
+    )
     return False
 
 
