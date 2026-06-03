@@ -2612,16 +2612,24 @@ def start_codex_desktop_process(executable_path: Path) -> subprocess.Popen[str]:
 class CodexAppServerSidecar:
     def __init__(self) -> None:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self.process = subprocess.Popen(
-            [resolve_codex_app_server_executable(), "app-server"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            creationflags=creationflags,
-        )
+        executable = resolve_codex_app_server_executable()
+        try:
+            self.process = subprocess.Popen(
+                [executable, "app-server"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                "Failed to start the Codex app-server sidecar. "
+                f"executable={executable!r}. "
+                f"Run `doctor` or set {CODEX_APP_SERVER_EXE_ENV} to the app-server codex.exe path."
+            ) from exc
         if self.process.stdin is None or self.process.stdout is None:
             self.close()
             raise RuntimeError("Failed to start the Codex app-server sidecar.")

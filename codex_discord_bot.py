@@ -101,13 +101,18 @@ def parse_bounded_int_arg(raw: str, *, default: int, minimum: int, maximum: int)
         return default
 
 
-def resolve_status_args(ref: str | None) -> list[str]:
-    argv = ["status"]
+def resolve_discord_thread_target_args(
+    discord_channel_id: int | None,
+    ref: str | None,
+) -> list[str]:
     normalized = str(ref or "").strip()
     if normalized:
         thread = bridge.resolve_thread_ref(normalized)
-        argv.extend(["--thread-id", thread.id])
-    return argv
+        return ["--thread-id", thread.id]
+    target_thread_id = get_mirrored_codex_thread_id(discord_channel_id)
+    if target_thread_id:
+        return ["--thread-id", target_thread_id]
+    return []
 
 
 def log_line(message: str) -> None:
@@ -2247,7 +2252,9 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         await run_bridge_and_send(message.channel, argv, "Open")
         return
     if command == "status":
-        await run_bridge_and_send(message.channel, resolve_status_args(arg or None), "Status")
+        argv = ["status"]
+        argv.extend(resolve_discord_thread_target_args(message.channel.id, arg or None))
+        await run_bridge_and_send(message.channel, argv, "Status")
         return
     if command == "doctor":
         await run_bridge_and_send(message.channel, ["doctor"], "Doctor")
@@ -2328,8 +2335,7 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         return
     if command == "archive":
         argv = ["archive"]
-        if arg:
-            argv.append(arg)
+        argv.extend(resolve_discord_thread_target_args(message.channel.id, arg or None))
         await run_bridge_and_send(message.channel, argv, "Archive")
         return
     if command == "delete_archive":
@@ -2505,9 +2511,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
             return
         await interaction.response.defer(thinking=True)
         argv = ["status"]
-        if ref:
-            thread = bridge.resolve_thread_ref(ref)
-            argv.extend(["--thread-id", thread.id])
+        argv.extend(resolve_discord_thread_target_args(interaction.channel_id, ref or None))
         exit_code, output = await asyncio.to_thread(run_bridge_command, argv)
         prefix = "Status" if exit_code == 0 else f"Status failed (exit {exit_code})"
         for chunk in split_message(f"{prefix}\n\n{output or '(no output)'}"):

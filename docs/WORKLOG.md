@@ -1,5 +1,27 @@
 # WORKLOG
 
+## 2026-06-03 10:38:58 +09:00
+- Goal: stabilize Discord mirrored-thread frontend commands.
+- Key assumptions:
+  - In a mirrored Discord thread, no-arg `!status`, `/status`, and `!archive` should act on that mapped Codex thread, not on the global selected thread.
+  - Archive failures should include enough sidecar executable detail for recovery instead of surfacing only a raw `WinError 2`.
+- Changes:
+  - Added shared Discord target-argument resolution that prefers an explicit ref, then the current mirrored Discord thread.
+  - Updated prefix `!status`, prefix `!archive`, and slash `/status` to pass `--thread-id` for the mapped Codex thread when available.
+  - Wrapped Codex app-server sidecar startup `OSError` with a recoverable diagnostic message including the attempted executable and `CODEX_EXE` hint.
+- Abuse cases checked:
+  - Unauthorized users remain blocked by the existing Discord user/channel checks before command execution.
+  - A no-arg archive in a mirrored thread can only target that thread's mapped Codex id, reducing accidental selected-thread archive risk.
+  - The new error message exposes only a local executable path already available through diagnostics, not prompt or session content.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - `git diff --check`
+  - Function smoke confirmed the goal Discord thread maps `status/archive` to `--thread-id 019e8afb-41a2-7ae0-8b36-d66c8e82a364`.
+  - Sidecar failure smoke with a fake `CODEX_EXE` now returns the actionable startup diagnostic.
+  - `build_mirror_check()` reports `missing: 0`, `stale: 0`, `wrong_project: 0`.
+- Unresolved items:
+  - Need a live Discord command/message after deployment to prove the frontend path is stable in Discord itself.
+
 ## 2026-06-03 10:33:00 +09:00
 - Goal: make critical-context guidance actionable from Discord.
 - Key assumptions:
