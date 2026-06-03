@@ -2734,10 +2734,12 @@ def summarize_discord_hook_log_line(line: str) -> str | None:
             f"command={get_log_field(body, 'command')}"
         )
     if body.startswith("slash_"):
+        slash_event = body.split(" ", 1)[0]
         return (
-            f"{timestamp} slash_event "
+            f"{timestamp} {slash_event} "
             f"channel={get_log_field(body, 'channel')} command={get_log_field(body, 'command')} "
-            f"exit={get_log_field(body, 'exit')}"
+            f"exit={get_log_field(body, 'exit')} response={get_log_field(body, 'response')} "
+            f"reason={get_log_field(body, 'reason')}"
         )
     if body.startswith("component_interaction_"):
         return (

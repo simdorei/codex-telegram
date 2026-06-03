@@ -1551,6 +1551,29 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:37 +09:00 - Discord doctor slash event labels
+- Goal: make doctor hook timelines show which slash lifecycle event occurred instead of collapsing all slash logs into one generic label.
+- Key assumptions:
+  - Slash command debugging needs to distinguish dispatch, response start/sent, ignored, and error events.
+  - This is a diagnostics-only formatting change.
+- Changes:
+  - Recent hook event summaries now preserve the specific `slash_*` log event name.
+  - Slash summaries include sanitized `exit`, `response`, and `reason` fields when present.
+  - Extended the doctor regression test with slash dispatch and response log lines.
+- Abuse cases checked:
+  - Prompt leakage: slash summaries still use whitelisted fields and omit prompt text.
+  - Overexposure of user data: no user IDs are added to doctor summaries.
+  - Output growth: the existing recent-event limit remains unchanged.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (61 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `/doctor` and `!doctor` recent hook events now show labels like `slash_ask_dispatch` and `slash_response_sent`.
+  - No command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

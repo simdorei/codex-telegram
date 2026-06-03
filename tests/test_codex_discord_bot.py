@@ -461,6 +461,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                             "[2026-06-03 14:00:00] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=2 bot=False content_len=12",
                             "[2026-06-03 14:00:01] message chat=222 user=2 prefix=False runner_busy=False codex_busy=idle target_source=mirror target=thread-1 text=sensitive prompt",
                             "[2026-06-03 14:00:02] busy_choice_sent reason=late_busy_failure target=thread-1 prompt_len=16",
+                            "[2026-06-03 14:00:03] slash_ask_dispatch command=ask channel=222 user=2 target_source=mirror target=thread-1 prompt_len=9",
+                            "[2026-06-03 14:00:04] slash_response_sent command=doctor title='Doctor' exit=0 chunks=1",
                         ]
                     ),
                     encoding="utf-8",
@@ -482,6 +484,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("raw_message channel=222", output)
         self.assertIn("message_routed channel=222", output)
         self.assertIn("busy_choice_event reason=late_busy_failure", output)
+        self.assertIn("slash_ask_dispatch channel=222 command=ask", output)
+        self.assertIn("slash_response_sent channel=- command=doctor exit=0", output)
         self.assertNotIn("sensitive prompt", output)
 
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
