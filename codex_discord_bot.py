@@ -43,6 +43,8 @@ INTERACTIVE_STATE_NONE = ""
 INTERACTIVE_STATE_INPUT = "waiting-input"
 INTERACTIVE_STATE_APPROVAL = "waiting-approval"
 CODEX_PROJECTLESS_CHAT_KEY = "codex:chats"
+BUSY_CHOICE_CUSTOM_ID_PREFIX = "codex_busy"
+BUSY_CHOICE_TTL_SECONDS = 1800
 
 
 def load_local_env(path: Path) -> None:
@@ -294,6 +296,127 @@ def init_mirror_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS busy_choices (
+                choice_id TEXT PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                target_thread_id TEXT,
+                prompt TEXT NOT NULL,
+                allow_steer INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                claimed_at REAL
+            )
+            """
+        )
+
+
+def cleanup_expired_busy_choices(now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    init_mirror_db()
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM busy_choices WHERE expires_at <= ? OR claimed_at IS NOT NULL",
+            (current,),
+        )
+
+
+def create_busy_choice_record(
+    message: discord.Message,
+    prompt: str,
+    target_thread_id: str | None,
+    *,
+    allow_steer: bool,
+) -> str:
+    cleanup_expired_busy_choices()
+    now = time.time()
+    choice_id = hashlib.sha256(
+        f"{now}:{os.urandom(16).hex()}:{getattr(message.author, 'id', '-')}".encode("utf-8")
+    ).hexdigest()[:24]
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO busy_choices (
+                choice_id, owner_user_id, channel_id, target_thread_id, prompt,
+                allow_steer, created_at, expires_at, claimed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                choice_id,
+                int(getattr(message.author, "id")),
+                int(getattr(message.channel, "id")),
+                target_thread_id,
+                str(prompt or ""),
+                1 if allow_steer else 0,
+                now,
+                now + BUSY_CHOICE_TTL_SECONDS,
+            ),
+        )
+    return choice_id
+
+
+def get_busy_choice_record(choice_id: str) -> dict[str, object] | None:
+    init_mirror_db()
+    now = time.time()
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT owner_user_id, channel_id, target_thread_id, prompt, allow_steer, expires_at, claimed_at
+            FROM busy_choices
+            WHERE choice_id = ?
+            """,
+            (choice_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if float(row[5]) <= now or row[6] is not None:
+            conn.execute("DELETE FROM busy_choices WHERE choice_id = ?", (choice_id,))
+            return None
+    return {
+        "choice_id": choice_id,
+        "owner_user_id": int(row[0]),
+        "channel_id": int(row[1]),
+        "target_thread_id": str(row[2] or "") or None,
+        "prompt": str(row[3] or ""),
+        "allow_steer": bool(row[4]),
+        "expires_at": float(row[5]),
+    }
+
+
+def claim_busy_choice_record(choice_id: str) -> bool:
+    init_mirror_db()
+    now = time.time()
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        result = conn.execute(
+            """
+            UPDATE busy_choices
+            SET claimed_at = ?
+            WHERE choice_id = ?
+              AND claimed_at IS NULL
+              AND expires_at > ?
+            """,
+            (now, choice_id, now),
+        )
+        return result.rowcount == 1
+
+
+def parse_busy_choice_custom_id(custom_id: str) -> tuple[str, str] | None:
+    parts = str(custom_id or "").split(":")
+    if len(parts) != 3 or parts[0] != BUSY_CHOICE_CUSTOM_ID_PREFIX:
+        return None
+    choice_id, action = parts[1], parts[2]
+    if not re.fullmatch(r"[0-9a-f]{24}", choice_id):
+        return None
+    if action not in {"steer", "queue", "ignore"}:
+        return None
+    return choice_id, action
+
+
+def format_busy_choice_custom_id(choice_id: str, action: str) -> str:
+    return f"{BUSY_CHOICE_CUSTOM_ID_PREFIX}:{choice_id}:{action}"
 
 
 def normalize_discord_name(value: str, *, prefix: str = "", max_len: int = 90) -> str:
@@ -1034,12 +1157,19 @@ async def send_chunks(target: discord.abc.Messageable, text: str) -> None:
 async def report_unhandled_component_interaction(
     interaction: discord.Interaction,
     *,
-    delay_sec: float = 2.0,
+    delay_sec: float = 0.75,
 ) -> None:
     await asyncio.sleep(delay_sec)
     if interaction.response.is_done():
         return
     custom_id = get_interaction_custom_id(interaction)
+    try:
+        if await handle_persistent_busy_choice_interaction(interaction, custom_id):
+            return
+    except Exception:
+        log_line("component_interaction_persistent_handler_failed\n" + traceback.format_exc())
+        if interaction.response.is_done():
+            return
     try:
         await interaction.response.send_message(
             "This Discord button is no longer active. Send the message again to get fresh controls.",
@@ -1051,6 +1181,184 @@ async def report_unhandled_component_interaction(
         )
     except Exception:
         log_line("component_interaction_unhandled_report_failed\n" + traceback.format_exc())
+
+
+async def resolve_interaction_channel(interaction: discord.Interaction, channel_id: int) -> object | None:
+    channel = getattr(interaction, "channel", None)
+    if channel is not None and hasattr(channel, "send"):
+        return channel
+    client = getattr(interaction, "client", None)
+    if client is not None:
+        try:
+            fetched = await client.fetch_channel(channel_id)
+            if hasattr(fetched, "send"):
+                return fetched
+        except Exception as exc:
+            log_line(
+                f"busy_choice_persistent_channel_fetch_failed channel={channel_id} "
+                f"error_type={type(exc).__name__}"
+            )
+    return None
+
+
+def make_persistent_busy_source_message(record: dict[str, object], channel: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        author=SimpleNamespace(id=int(record["owner_user_id"])),
+        channel=channel,
+    )
+
+
+async def handle_persistent_busy_choice_interaction(
+    interaction: discord.Interaction,
+    custom_id: str,
+) -> bool:
+    parsed = parse_busy_choice_custom_id(custom_id)
+    if not parsed:
+        return False
+    choice_id, action = parsed
+    record = get_busy_choice_record(choice_id)
+    user_id = int(getattr(interaction.user, "id", 0) or 0)
+    if record is None:
+        await interaction.response.send_message(
+            "This Discord button is no longer active. Send the message again to get fresh controls.",
+            ephemeral=True,
+        )
+        log_line(
+            f"busy_choice_persistent_missing action={action} choice={choice_id} "
+            f"channel={interaction.channel_id} user={user_id}"
+        )
+        return True
+    if user_id != int(record["owner_user_id"]):
+        await interaction.response.send_message("Only the original sender can choose this.", ephemeral=True)
+        log_line(
+            f"busy_choice_persistent_denied action={action} choice={choice_id} "
+            f"user={user_id} owner={record['owner_user_id']} target={record['target_thread_id'] or '-'}"
+        )
+        return True
+    if not claim_busy_choice_record(choice_id):
+        await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
+        log_line(
+            f"busy_choice_persistent_already_handled action={action} choice={choice_id} "
+            f"user={user_id} target={record['target_thread_id'] or '-'}"
+        )
+        return True
+
+    prompt = str(record["prompt"] or "")
+    target_thread_id = str(record["target_thread_id"] or "") or None
+    allow_steer = bool(record["allow_steer"])
+    channel = await resolve_interaction_channel(interaction, int(record["channel_id"]))
+    if action == "ignore":
+        log_line(
+            f"busy_choice_persistent_ignore user={user_id} choice={choice_id} "
+            f"target={target_thread_id or '-'}"
+        )
+        await interaction.response.send_message("Ignored.")
+        return True
+    if channel is None:
+        await interaction.response.send_message(
+            "Discord channel is unavailable. Send the message again to get fresh controls.",
+            ephemeral=True,
+        )
+        log_line(
+            f"busy_choice_persistent_channel_unavailable action={action} choice={choice_id} "
+            f"target={target_thread_id or '-'}"
+        )
+        return True
+
+    source_message = make_persistent_busy_source_message(record, channel)
+    await interaction.response.defer(thinking=True)
+    if action == "steer":
+        if not allow_steer:
+            await send_direct_followup(
+                interaction,
+                "This message targets a different Codex thread. Queue it instead.",
+                log_prefix="button_followup",
+                context="persistent_steer_not_allowed",
+            )
+            log_line(
+                f"busy_choice_persistent_steer_rejected user={user_id} choice={choice_id} "
+                f"target={target_thread_id or '-'} reason=not_allowed"
+            )
+            return True
+        log_line(
+            f"busy_choice_persistent_steer user={user_id} choice={choice_id} "
+            f"target={target_thread_id or '-'} prompt_len={format_log_text_len(prompt)}"
+        )
+        exit_code, output = await asyncio.to_thread(run_steering_prompt, prompt, target_thread_id)
+        log_line(
+            f"busy_choice_persistent_steer_done exit={exit_code} choice={choice_id} "
+            f"target={target_thread_id or '-'} output_len={format_log_text_len(output)}"
+        )
+        if is_selected_thread_busy_error(exit_code, output):
+            await send_direct_followup(
+                interaction,
+                build_busy_choice_message(prompt, target_thread_id),
+                view=make_busy_choice_view(
+                    source_message,  # type: ignore[arg-type]
+                    prompt,
+                    target_thread_id=target_thread_id,
+                    allow_steer=True,
+                ),
+                log_prefix="button_followup",
+                context="persistent_steer_busy_failure",
+            )
+            log_busy_choice_sent("persistent_steer_busy_failure", target_thread_id, prompt)
+            return True
+        title = "Steering sent" if exit_code == 0 else f"Steering failed (exit {exit_code})"
+        await send_followup_chunks(
+            interaction,
+            f"{title}\n\n{output or '(no output)'}",
+            title="Steering",
+            exit_code=exit_code,
+            log_prefix="button_response",
+        )
+        return True
+
+    busy_state, _busy_thread_id, _busy_ref = await asyncio.to_thread(
+        get_busy_state_for_thread,
+        target_thread_id,
+    )
+    if busy_state == "idle" and not await is_thread_runner_busy(target_thread_id):
+        await send_direct_followup(
+            interaction,
+            "No active job now. Starting this message.",
+            log_prefix="button_followup",
+            context="persistent_queue_next_immediate",
+        )
+        position = await enqueue_thread_ask(
+            channel,  # type: ignore[arg-type]
+            prompt,
+            target_thread_id,
+            queued=False,
+            ack_sent=True,
+            source_message=source_message,  # type: ignore[arg-type]
+        )
+        log_line(
+            f"busy_choice_persistent_queue_immediate user={user_id} choice={choice_id} "
+            f"position={position} target={target_thread_id or '-'} "
+            f"prompt_len={format_log_text_len(prompt)}"
+        )
+        return True
+
+    position = await enqueue_thread_ask(
+        channel,  # type: ignore[arg-type]
+        prompt,
+        target_thread_id,
+        queued=True,
+        source_message=source_message,  # type: ignore[arg-type]
+    )
+    await send_direct_followup(
+        interaction,
+        f"Queued at position {position}.",
+        log_prefix="button_followup",
+        context="persistent_queue_next",
+    )
+    log_line(
+        f"busy_choice_persistent_queue user={user_id} choice={choice_id} "
+        f"position={position} target={target_thread_id or '-'} "
+        f"prompt_len={format_log_text_len(prompt)}"
+    )
+    return True
 
 
 async def send_interactive_prompt(
@@ -2317,7 +2625,7 @@ async def run_prompt_and_send(
         if has_busy_choice_source(source_message):
             await channel.send(
                 build_busy_choice_message(prompt, target_thread_id),
-                view=BusyChoiceView(
+                view=make_busy_choice_view(
                     source_message,
                     prompt,
                     target_thread_id=target_thread_id,
@@ -2444,6 +2752,28 @@ def log_busy_choice_sent(reason: str, target_thread_id: str | None, prompt: str)
     )
 
 
+def make_busy_choice_view(
+    message: discord.Message,
+    prompt: str,
+    *,
+    target_thread_id: str | None,
+    allow_steer: bool = True,
+) -> BusyChoiceView:
+    choice_id = create_busy_choice_record(
+        message,
+        prompt,
+        target_thread_id,
+        allow_steer=allow_steer,
+    )
+    return BusyChoiceView(
+        message,
+        prompt,
+        target_thread_id=target_thread_id,
+        allow_steer=allow_steer,
+        choice_id=choice_id,
+    )
+
+
 async def handle_plain_ask(
     message: discord.Message,
     prompt: str,
@@ -2483,7 +2813,7 @@ async def handle_plain_ask(
                 [],
             )
             return
-        view = BusyChoiceView(
+        view = make_busy_choice_view(
             message,
             prompt,
             target_thread_id=target_thread_id,
@@ -2498,7 +2828,7 @@ async def handle_plain_ask(
 
     if await is_thread_runner_busy(target_thread_id):
         allow_steer = True
-        view = BusyChoiceView(
+        view = make_busy_choice_view(
             message,
             prompt,
             target_thread_id=target_thread_id,
@@ -2679,17 +3009,35 @@ class BusyChoiceView(discord.ui.View):
         *,
         target_thread_id: str | None = None,
         allow_steer: bool = True,
+        choice_id: str | None = None,
     ) -> None:
         super().__init__(timeout=900)
         self.message = message
         self.prompt = prompt
         self.target_thread_id = target_thread_id
         self.allow_steer = allow_steer
+        self.choice_id = choice_id
         self.claimed = False
+        self.assign_persistent_custom_ids()
         if not allow_steer:
             for item in self.children:
                 if isinstance(item, discord.ui.Button) and item.label == "Steer now":
                     item.disabled = True
+
+    def assign_persistent_custom_ids(self) -> None:
+        if not self.choice_id:
+            return
+        labels_to_actions = {
+            "Steer now": "steer",
+            "Queue next": "queue",
+            "Ignore": "ignore",
+        }
+        for item in self.children:
+            if not isinstance(item, discord.ui.Button):
+                continue
+            action = labels_to_actions.get(str(item.label))
+            if action:
+                item.custom_id = format_busy_choice_custom_id(self.choice_id, action)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.message.author.id:
@@ -2703,6 +3051,8 @@ class BusyChoiceView(discord.ui.View):
 
     def claim(self) -> bool:
         if self.claimed:
+            return False
+        if self.choice_id and not claim_busy_choice_record(self.choice_id):
             return False
         self.claimed = True
         self.disable_all_items()
@@ -2751,7 +3101,7 @@ class BusyChoiceView(discord.ui.View):
             await send_direct_followup(
                 interaction,
                 build_busy_choice_message(self.prompt, self.target_thread_id),
-                view=BusyChoiceView(
+                view=make_busy_choice_view(
                     self.message,
                     self.prompt,
                     target_thread_id=self.target_thread_id,

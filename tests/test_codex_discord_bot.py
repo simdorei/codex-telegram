@@ -295,6 +295,100 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(interaction.response.messages, [])
         self.assertFalse(log_exists)
 
+    async def test_busy_choice_view_persists_custom_ids(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                message = FakeMessage()
+                view = bot.make_busy_choice_view(
+                    message,
+                    "please steer",
+                    target_thread_id="thread-1",
+                    allow_steer=True,
+                )
+                custom_ids = {
+                    getattr(item, "label", ""): getattr(item, "custom_id", "")
+                    for item in view.children
+                }
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertRegex(custom_ids["Steer now"], r"^codex_busy:[0-9a-f]{24}:steer$")
+        self.assertRegex(custom_ids["Queue next"], r"^codex_busy:[0-9a-f]{24}:queue$")
+        self.assertRegex(custom_ids["Ignore"], r"^codex_busy:[0-9a-f]{24}:ignore$")
+
+    async def test_persistent_busy_choice_ignore_handles_restart_stale_view(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                message = FakeMessage()
+                view = bot.make_busy_choice_view(
+                    message,
+                    "please ignore",
+                    target_thread_id="thread-1",
+                    allow_steer=True,
+                )
+                ignore_id = next(
+                    getattr(item, "custom_id", "")
+                    for item in view.children
+                    if getattr(item, "label", "") == "Ignore"
+                )
+                choice_id, _action = bot.parse_busy_choice_custom_id(ignore_id)
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                interaction = FakeInteraction(command_name="-", channel_id=222)
+                interaction.type = bot.discord.InteractionType.component
+                interaction.data = {"custom_id": ignore_id}
+
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.report_unhandled_component_interaction(interaction, delay_sec=0)
+                log_text = log_path.read_text(encoding="utf-8")
+                remaining = bot.get_busy_choice_record(choice_id)
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertEqual(interaction.response.messages, ["Ignored."])
+        self.assertIsNone(remaining)
+        self.assertIn("busy_choice_persistent_ignore", log_text)
+        self.assertNotIn("please ignore", log_text)
+
+    async def test_persistent_busy_choice_denied_does_not_claim_record(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                message = FakeMessage()
+                view = bot.make_busy_choice_view(
+                    message,
+                    "please queue",
+                    target_thread_id="thread-1",
+                    allow_steer=True,
+                )
+                queue_id = next(
+                    getattr(item, "custom_id", "")
+                    for item in view.children
+                    if getattr(item, "label", "") == "Queue next"
+                )
+                choice_id, _action = bot.parse_busy_choice_custom_id(queue_id)
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                interaction = FakeInteraction(command_name="-", channel_id=222)
+                interaction.type = bot.discord.InteractionType.component
+                interaction.data = {"custom_id": queue_id}
+                interaction.user = SimpleNamespace(id=999)
+
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.report_unhandled_component_interaction(interaction, delay_sec=0)
+                log_text = log_path.read_text(encoding="utf-8")
+                remaining = bot.get_busy_choice_record(choice_id)
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertEqual(interaction.response.messages, ["Only the original sender can choose this."])
+        self.assertIsNotNone(remaining)
+        self.assertIn("busy_choice_persistent_denied", log_text)
+        self.assertNotIn("please queue", log_text)
+
     def test_help_readme_and_registered_slash_commands_match(self) -> None:
         expected_commands = {
             "help",

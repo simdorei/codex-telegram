@@ -1278,6 +1278,33 @@
   - BusyChoice buttons are still not fully persistent across restarts; this step makes stale clicks visible and actionable.
   - Still needs fresh live Discord message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 13:41 +09:00 - Discord BusyChoice restart recovery
+- Goal: make Discord BusyChoice controls recoverable after bot restarts instead of requiring users to re-send every prompt.
+- Key assumptions:
+  - Runtime `discord.ui.View` callbacks can disappear across deploy/restart, but component custom IDs still reach `on_interaction`.
+  - Persisting a short-lived prompt record is acceptable only with owner checks, single-use claims, and automatic cleanup.
+- Changes:
+  - Added a `busy_choices` table in `discord_mirror.sqlite` for short-lived BusyChoice prompt records.
+  - Added nonce-based BusyChoice button custom IDs and a fallback interaction handler that can route `steer`, `queue`, and `ignore` after restart.
+  - Added single-use DB claiming, owner-user enforcement, TTL cleanup, and prompt-length-only diagnostics.
+  - Added tests for custom ID assignment, restart-style persistent ignore handling, and unauthorized persistent button clicks.
+- Abuse cases checked:
+  - Unauthorized user clicks a persisted button: blocked by stored owner ID before claim, leaving the record usable by the owner.
+  - Replay/double-click of a persisted button: blocked by atomic single-use `claimed_at` update.
+  - Sensitive prompt leakage through custom IDs/logs: blocked by nonce-only custom IDs and length-only logging.
+  - Stale prompt records accumulating or remaining usable too long: mitigated by a 30-minute TTL and cleanup on creation/read.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (50 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `discord_mirror.sqlite` gains a `busy_choices` table.
+  - BusyChoice prompt text is stored locally for up to 30 minutes to support restart recovery.
+  - Component fallback delay is reduced to 0.75s to stay within Discord's interaction response window.
+  - No slash command schema, route names, Codex session keys, or mirror thread mappings changed.
+- Unresolved:
+  - Live Discord button/ask behavior still needs a fresh post-deploy click/message to prove end-to-end behavior in the server.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:
