@@ -1761,3 +1761,27 @@
   - Developers can keep a local Discord bot running without dirtying the worktree.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:09 +09:00 - Discord doctor hook timestamps
+- Goal: make Discord hook debugging show whether the bot is recently ready, seeing gateway events, and seeing user/control events.
+- Key assumptions:
+  - Recent event lists are useful, but explicit last-marker timestamps make stale hook evidence easier to spot.
+  - Timestamp-only diagnostics are enough to distinguish current startup health from old user input without exposing message text.
+- Changes:
+  - Added `get_discord_log_markers()` to summarize `last_ready_at`, `last_gateway_event_at`, and `last_user_or_control_hook_at` from the runtime log.
+  - Added those marker lines to `/doctor` and `!doctor` Discord adapter diagnostics.
+  - Extended the doctor regression test with ready/gateway/user-control marker assertions.
+- Abuse cases checked:
+  - Prompt leakage through diagnostics: marker extraction exposes timestamps only, and existing recent-event summaries still omit raw prompt text.
+  - Misleading stale diagnostics: explicit marker timestamps make old user/control evidence visible instead of implied.
+  - Log parsing failure: missing/unreadable logs return `-` markers instead of breaking doctor output.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (63 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+  - Local doctor smoke showed `last_ready_at: 2026-06-03 15:04:58`, `last_gateway_event_at: 2026-06-03 15:04:59`, and stale `last_user_or_control_hook_at: 2026-06-03 12:54:32`.
+- Side effects:
+  - `/doctor` and `!doctor` output gains three timestamp lines.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

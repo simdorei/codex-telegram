@@ -2802,11 +2802,38 @@ def get_recent_discord_hook_events(
     return events[-limit:]
 
 
+def get_discord_log_markers(*, max_lines: int = 2000) -> dict[str, str]:
+    log_path = get_log_path()
+    markers = {
+        "last_ready_at": "-",
+        "last_gateway_event_at": "-",
+        "last_user_or_control_hook_at": "-",
+    }
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return markers
+    for line in lines[-max_lines:]:
+        parsed = parse_log_line(line)
+        if not parsed:
+            continue
+        timestamp, body = parsed
+        if body.startswith("ready "):
+            markers["last_ready_at"] = timestamp
+        if body.startswith(("socket_message_create ", "socket_message_create_untracked ", "socket_interaction_create ")):
+            markers["last_gateway_event_at"] = timestamp
+        summary = summarize_discord_hook_log_line(line)
+        if summary and is_user_or_control_hook_summary(summary):
+            markers["last_user_or_control_hook_at"] = timestamp
+    return markers
+
+
 def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -> str:
     target_thread_id = get_mirrored_codex_thread_id(channel_id)
     project = get_mirror_project_for_channel(channel_id)
     active_busy_choices, stale_busy_choices = get_busy_choice_counts()
     mirror_lines = build_mirror_check().splitlines()
+    log_markers = get_discord_log_markers()
     recent_events = get_recent_discord_hook_events()
     recent_user_events = get_recent_discord_hook_events(user_or_control_only=True)
     lines = [
@@ -2823,6 +2850,9 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
         f"empty_content_notice_channels: {len(EMPTY_CONTENT_NOTICE_LAST_SENT)}",
         f"busy_choices_active: {active_busy_choices}",
         f"busy_choices_stale: {stale_busy_choices}",
+        f"last_ready_at: {log_markers['last_ready_at']}",
+        f"last_gateway_event_at: {log_markers['last_gateway_event_at']}",
+        f"last_user_or_control_hook_at: {log_markers['last_user_or_control_hook_at']}",
         "",
         *mirror_lines,
         "",

@@ -524,6 +524,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 log_path.write_text(
                     "\n".join(
                         [
+                            "[2026-06-03 13:59:57] ready user=codex#1234 guilds=1",
                             "[2026-06-03 13:59:58] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=3 bot=True content_len=49",
                             "[2026-06-03 13:59:59] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=3 bot=True content_len=49",
                             "[2026-06-03 14:00:00] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=2 bot=False content_len=12",
@@ -546,6 +547,9 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("intent_message_content: True", output)
         self.assertIn("raw_debug_events: True", output)
         self.assertIn("allowed_channels: 222", output)
+        self.assertIn("last_ready_at: 2026-06-03 13:59:57", output)
+        self.assertIn("last_gateway_event_at: 2026-06-03 14:00:00", output)
+        self.assertIn("last_user_or_control_hook_at: 2026-06-03 14:00:04", output)
         self.assertIn("Mirror check", output)
         self.assertIn("Expected live log sequence:", output)
         self.assertIn("Recent user/control hook events:", output)
