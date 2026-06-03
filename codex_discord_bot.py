@@ -3214,13 +3214,86 @@ async def build_discord_channel_history_lines(channel: object | None, *, limit: 
     return [*lines, *(messages or ["-"])]
 
 
+async def resolve_discord_history_channel(bot: object, channel_id: int) -> tuple[object | None, str]:
+    getter = getattr(bot, "get_cached_channel_or_thread", None)
+    if callable(getter):
+        channel, source = getter(channel_id)
+    else:
+        channel = None
+        source = "-"
+        get_channel = getattr(bot, "get_channel", None)
+        if callable(get_channel):
+            channel = get_channel(channel_id)
+            source = "client_channel_cache" if channel is not None else "-"
+    if channel is None:
+        fetch_channel = getattr(bot, "fetch_channel", None)
+        if callable(fetch_channel):
+            try:
+                channel = await fetch_channel(channel_id)
+                source = "fetch"
+            except Exception as exc:
+                return None, f"fetch_error:{type(exc).__name__}"
+    return channel, source
+
+
+async def build_discord_tracked_target_user_history_lines(
+    bot: object,
+    *,
+    per_target_limit: int = 5,
+    target_limit: int = 50,
+) -> list[str]:
+    lines = ["Recent tracked target user history:"]
+    targets = get_startup_probe_targets(
+        getattr(bot, "allowed_channel_ids", set()),
+        getattr(bot, "startup_channel_id", None),
+        limit=target_limit,
+    )
+    if not targets:
+        return [*lines, "-"]
+    for label, channel_id in targets:
+        channel, source = await resolve_discord_history_channel(bot, channel_id)
+        prefix = f"{label} channel={channel_id} source={source}"
+        if channel is None or not hasattr(channel, "history"):
+            lines.append(f"{prefix} latest_user=-")
+            continue
+        latest_user_message = None
+        try:
+            async for message in channel.history(limit=per_target_limit):  # type: ignore[attr-defined]
+                if getattr(getattr(message, "author", None), "bot", False):
+                    continue
+                latest_user_message = message
+                break
+        except Exception as exc:
+            lines.append(f"{prefix} latest_user=history_error:{type(exc).__name__}")
+            continue
+        if latest_user_message is None:
+            lines.append(f"{prefix} latest_user=-")
+            continue
+        author = getattr(latest_user_message, "author", None)
+        lines.append(
+            f"{prefix} latest_user_at={format_discord_message_created_at(latest_user_message)} "
+            f"user={getattr(author, 'id', '-')} "
+            f"content_len={format_log_text_len(getattr(latest_user_message, 'content', '') or '')} "
+            f"type={format_discord_message_type(latest_user_message)}"
+        )
+    return lines
+
+
 async def build_discord_doctor_message_with_history(
     bot: CodexDiscordBot,
     channel_id: int | None,
     channel: object | None,
 ) -> str:
     history_lines = await build_discord_channel_history_lines(channel)
-    return build_discord_doctor_message(bot, channel_id) + "\n\n" + "\n".join(history_lines)
+    tracked_history_lines = await build_discord_tracked_target_user_history_lines(bot)
+    return (
+        build_discord_doctor_message(bot, channel_id)
+        + "\n\n"
+        + "\n".join(history_lines)
+        + "\n\n"
+        + "\n".join(tracked_history_lines)
+    )
+
 
 
 async def build_runners_message() -> str:

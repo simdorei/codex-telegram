@@ -1979,3 +1979,26 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, approval persistence, or busy-choice behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:56 +09:00 - Discord tracked history diagnostics
+- Goal: make Discord hook failures easier to distinguish from messages posted outside tracked targets.
+- Key assumptions:
+  - Doctor output can safely show bounded metadata for tracked targets without exposing prompt text.
+  - The useful split is whether a recent user message exists in startup/allowed/mirrored targets, not scanning unrelated guild channels.
+- Changes:
+  - Added a `/doctor`/`!doctor` section for recent tracked target user history.
+  - Reused the same startup/allowed/mirror target list that history polling probes.
+  - Kept diagnostic output to timestamp, channel/source, user id, message type, and content length.
+- Abuse cases checked:
+  - Prompt leakage through diagnostics: blocked by omitting message content.
+  - Cross-channel metadata exposure: bounded to already tracked startup/allowed/mirrored targets only.
+  - Expensive guild-wide scanning: avoided by reusing bounded tracked targets and a small per-target history limit.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (69 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Doctor output is longer by one bounded diagnostic section.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, approval/input, or busy-choice behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

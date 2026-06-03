@@ -682,6 +682,59 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2026-06-03T15:12:00+00:00 bot=False content_len=16 type=default", output)
         self.assertNotIn("sensitive prompt", output)
 
+    async def test_discord_tracked_target_history_sanitizes_message_content(self) -> None:
+        class FakeHistoryChannel:
+            def __init__(self, messages) -> None:
+                self.messages = messages
+
+            def history(self, *, limit: int):
+                async def iterator():
+                    for message in self.messages[:limit]:
+                        yield message
+
+                return iterator()
+
+        user_message = SimpleNamespace(
+            created_at=datetime.datetime(2026, 6, 3, 15, 12, tzinfo=datetime.timezone.utc),
+            author=SimpleNamespace(id=242, bot=False),
+            content="sensitive prompt",
+            type=SimpleNamespace(name="default"),
+        )
+        bot_message = SimpleNamespace(
+            created_at=datetime.datetime(2026, 6, 3, 15, 13, tzinfo=datetime.timezone.utc),
+            author=SimpleNamespace(id=151, bot=True),
+            content="bot startup",
+            type=SimpleNamespace(name="default"),
+        )
+
+        class FakeBot:
+            allowed_channel_ids = {222}
+            startup_channel_id = 111
+
+            def get_cached_channel_or_thread(self, channel_id: int):
+                channels = {
+                    111: FakeHistoryChannel([bot_message]),
+                    222: FakeHistoryChannel([bot_message, user_message]),
+                }
+                return channels.get(channel_id), "fake_cache"
+
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                output = "\n".join(await bot.build_discord_tracked_target_user_history_lines(FakeBot()))
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertIn("Recent tracked target user history:", output)
+        self.assertIn("startup channel=111 source=fake_cache latest_user=-", output)
+        self.assertIn(
+            "allowed channel=222 source=fake_cache "
+            "latest_user_at=2026-06-03T15:12:00+00:00 user=242 content_len=16 type=default",
+            output,
+        )
+        self.assertNotIn("sensitive prompt", output)
+
     async def test_history_poll_primes_then_processes_new_user_message_once(self) -> None:
         class FakeHistoryChannel(FakeTarget):
             def __init__(self) -> None:
