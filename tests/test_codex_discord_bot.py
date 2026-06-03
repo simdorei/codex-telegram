@@ -90,7 +90,8 @@ class FakeInteraction:
 
 
 class FakeMessage:
-    def __init__(self, content: str = "", channel_id: int = 222) -> None:
+    def __init__(self, content: str = "", channel_id: int = 222, message_id: int | None = None) -> None:
+        self.id = message_id
         self.channel = FakeTarget(channel_id=channel_id)
         self.author = SimpleNamespace(id=242286902982606848, bot=False)
         self.content = content
@@ -520,6 +521,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                     allowed_channel_ids={222},
                     allowed_user_ids=set(),
                     startup_channel_id=222,
+                    history_poll_seconds=15.0,
                 )
                 log_path = Path(temp_dir) / "discord-smoke.log"
                 log_path.write_text(
@@ -547,6 +549,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("message_content_enabled: True", output)
         self.assertIn("intent_message_content: True", output)
         self.assertIn("raw_debug_events: True", output)
+        self.assertIn("history_poll_seconds: 15.0", output)
         self.assertIn("allowed_channels: 222", output)
         self.assertIn("last_ready_at: 2026-06-03 13:59:57", output)
         self.assertIn("last_gateway_event_at: 2026-06-03 14:00:00", output)
@@ -582,6 +585,79 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Recent channel history:", output)
         self.assertIn("2026-06-03T15:12:00+00:00 bot=False content_len=16 type=default", output)
         self.assertNotIn("sensitive prompt", output)
+
+    async def test_history_poll_primes_then_processes_new_user_message_once(self) -> None:
+        class FakeHistoryChannel(FakeTarget):
+            def __init__(self) -> None:
+                super().__init__(channel_id=333)
+                self.history_messages: list[FakeMessage] = []
+
+            def history(self, *, limit: int):
+                async def iterator():
+                    for message in self.history_messages[:limit]:
+                        yield message
+
+                return iterator()
+
+        original_get_mirrored = bot.get_mirrored_codex_thread_id
+        original_handle_plain_ask = bot.handle_plain_ask
+        original_is_thread_runner_busy = bot.is_thread_runner_busy
+        original_get_busy_state = bot.get_busy_state_for_thread
+        handled: list[tuple[str, str | None]] = []
+        channel = FakeHistoryChannel()
+        old_message = FakeMessage(content="old", channel_id=333, message_id=100)
+        new_message = FakeMessage(content="please hook", channel_id=333, message_id=101)
+        old_message.channel = channel
+        new_message.channel = channel
+        try:
+            bot.get_mirrored_codex_thread_id = lambda channel_id: "thread-1"
+            bot.get_busy_state_for_thread = lambda target_thread_id: ("idle", None, "")
+
+            async def runner_idle(target_thread_id):
+                return False
+
+            async def fake_handle_plain_ask(message, prompt, *, target_thread_id=None):
+                handled.append((prompt, target_thread_id))
+
+            bot.is_thread_runner_busy = runner_idle
+            bot.handle_plain_ask = fake_handle_plain_ask
+
+            async def process_message(message, *, source):
+                await bot.CodexDiscordBot.process_discord_message(client, message, source=source)
+
+            client = SimpleNamespace(
+                _processed_message_ids={},
+                _history_poll_primed_channels=set(),
+                enable_prefix_commands=True,
+                get_cached_channel_or_thread=lambda channel_id: (channel, "test_cache"),
+                fetch_channel=lambda channel_id: (_ for _ in ()).throw(AssertionError("fetch not expected")),
+                is_allowed_message_channel=lambda message_channel: True,
+                is_allowed_user=lambda user_id: True,
+                process_discord_message=process_message,
+            )
+            channel.history_messages = [old_message]
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.CodexDiscordBot.poll_history_channel(client, "allowed", 333)
+                    await bot.CodexDiscordBot.poll_history_channel(client, "allowed", 333)
+                    channel.history_messages = [new_message, old_message]
+                    await bot.CodexDiscordBot.poll_history_channel(client, "allowed", 333)
+                    await bot.CodexDiscordBot.on_message(client, new_message)
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(handled, [("please hook", "thread-1")])
+            self.assertIn("history_poll_primed label=allowed channel=333", log_text)
+            self.assertIn("history_poll_message channel=333", log_text)
+            self.assertIn("message_received chat=333", log_text)
+            self.assertIn("source=history_poll", log_text)
+            self.assertIn("duplicate_message_skipped source=gateway chat=333 message=101", log_text)
+        finally:
+            bot.get_mirrored_codex_thread_id = original_get_mirrored
+            bot.handle_plain_ask = original_handle_plain_ask
+            bot.is_thread_runner_busy = original_is_thread_runner_busy
+            bot.get_busy_state_for_thread = original_get_busy_state
 
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
         fake_client = SimpleNamespace(

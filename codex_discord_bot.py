@@ -48,6 +48,9 @@ BUSY_CHOICE_CUSTOM_ID_PREFIX = "codex_busy"
 BUSY_CHOICE_TTL_SECONDS = 1800
 EMPTY_CONTENT_NOTICE_COOLDOWN_SECONDS = 300
 EMPTY_CONTENT_NOTICE_LAST_SENT: dict[int, float] = {}
+HISTORY_POLL_DEFAULT_SECONDS = 15.0
+HISTORY_POLL_HISTORY_LIMIT = 10
+PROCESSED_MESSAGE_ID_LIMIT = 2000
 
 
 def load_local_env(path: Path) -> None:
@@ -112,6 +115,17 @@ def parse_bounded_int_arg(raw: str, *, default: int, minimum: int, maximum: int)
         return max(minimum, min(maximum, int(raw)))
     except ValueError:
         return default
+
+
+def parse_bounded_float_env(name: str, *, default: float, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def resolve_discord_thread_target_args(
@@ -717,6 +731,38 @@ def is_mirrored_channel_id(discord_channel_id: int | None) -> bool:
     return bool(row)
 
 
+def get_discord_message_id(message: object) -> int | None:
+    raw_id = getattr(message, "id", None)
+    if raw_id is None:
+        return None
+    try:
+        return int(raw_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def claim_discord_message(owner: object, message: object) -> bool:
+    message_id = get_discord_message_id(message)
+    if message_id is None:
+        return True
+    processed = getattr(owner, "_processed_message_ids", None)
+    if not isinstance(processed, dict):
+        processed = {}
+        try:
+            setattr(owner, "_processed_message_ids", processed)
+        except Exception:
+            return True
+    if message_id in processed:
+        return False
+    processed[message_id] = time.monotonic()
+    if len(processed) > PROCESSED_MESSAGE_ID_LIMIT:
+        for stale_id, _seen_at in sorted(processed.items(), key=lambda item: item[1])[
+            : len(processed) - PROCESSED_MESSAGE_ID_LIMIT
+        ]:
+            processed.pop(stale_id, None)
+    return True
+
+
 class LineStream(io.TextIOBase):
     def __init__(self, on_line):
         self.on_line = on_line
@@ -1104,6 +1150,15 @@ class CodexDiscordBot(discord.Client):
         self.startup_channel_id = startup_channel_id
         self.guild_id = guild_id
         self.enable_prefix_commands = enable_prefix_commands
+        self.history_poll_seconds = parse_bounded_float_env(
+            "DISCORD_HISTORY_POLL_SECONDS",
+            default=HISTORY_POLL_DEFAULT_SECONDS,
+            minimum=0.0,
+            maximum=300.0,
+        )
+        self._history_poll_task: asyncio.Task[None] | None = None
+        self._history_poll_primed_channels: set[int] = set()
+        self._processed_message_ids: dict[int, float] = {}
 
     def is_allowed_channel(self, channel_id: int | None) -> bool:
         if not self.allowed_channel_ids:
@@ -1191,6 +1246,76 @@ class CodexDiscordBot(discord.Client):
         except Exception:
             log_line("startup_diagnostics_failed\n" + traceback.format_exc())
 
+    async def start_history_polling(self) -> None:
+        if self.history_poll_seconds <= 0:
+            log_line("history_poll_disabled")
+            return
+        if self._history_poll_task and not self._history_poll_task.done():
+            log_line("history_poll_already_running")
+            return
+        self._history_poll_task = asyncio.create_task(self.history_poll_loop())
+        log_line(f"history_poll_started seconds={self.history_poll_seconds:g}")
+
+    async def history_poll_loop(self) -> None:
+        try:
+            while not self.is_closed():
+                targets = get_startup_probe_targets(
+                    self.allowed_channel_ids,
+                    self.startup_channel_id,
+                    limit=50,
+                )
+                for label, channel_id in targets:
+                    await self.poll_history_channel(label, channel_id)
+                await asyncio.sleep(self.history_poll_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_line("history_poll_loop_failed\n" + traceback.format_exc())
+
+    async def poll_history_channel(self, label: str, channel_id: int) -> None:
+        channel, source = self.get_cached_channel_or_thread(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+                source = "fetch"
+            except Exception as exc:
+                log_line(
+                    f"history_poll_channel_failed label={label} channel={channel_id} "
+                    f"error_type={type(exc).__name__}"
+                )
+                return
+        if not hasattr(channel, "history"):
+            log_line(f"history_poll_channel_skipped label={label} channel={channel_id} reason=no_history")
+            return
+        is_primed = int(channel_id) in self._history_poll_primed_channels
+        claimed_messages = []
+        try:
+            async for message in channel.history(limit=HISTORY_POLL_HISTORY_LIMIT):  # type: ignore[attr-defined]
+                if claim_discord_message(self, message):
+                    claimed_messages.append(message)
+        except Exception as exc:
+            log_line(
+                f"history_poll_channel_failed label={label} channel={channel_id} "
+                f"source={source} error_type={type(exc).__name__}"
+            )
+            return
+        if not is_primed:
+            self._history_poll_primed_channels.add(int(channel_id))
+            log_line(
+                f"history_poll_primed label={label} channel={channel_id} "
+                f"source={source} messages={len(claimed_messages)}"
+            )
+            return
+        for message in reversed(claimed_messages):
+            if getattr(getattr(message, "author", None), "bot", False):
+                continue
+            log_line(
+                f"history_poll_message channel={getattr(getattr(message, 'channel', None), 'id', channel_id)} "
+                f"user={getattr(getattr(message, 'author', None), 'id', '-')} "
+                f"content_len={format_log_text_len(getattr(message, 'content', '') or '')}"
+            )
+            await self.process_discord_message(message, source="history_poll")
+
     async def on_ready(self) -> None:
         log_line(f"ready user={self.user} guilds={len(self.guilds)}")
         try:
@@ -1200,6 +1325,8 @@ class CodexDiscordBot(discord.Client):
         except Exception:
             log_line("busy_choice_cleanup_failed\n" + traceback.format_exc())
         await self.log_startup_diagnostics()
+        if hasattr(self, "start_history_polling"):
+            await self.start_history_polling()
         if env_flag("DISCORD_STARTUP_NOTIFY", default=False) and self.startup_channel_id:
             channel = self.get_channel(self.startup_channel_id)
             if channel is None:
@@ -1310,14 +1437,25 @@ class CodexDiscordBot(discord.Client):
         return "-"
 
     async def on_message(self, message: discord.Message) -> None:
+        if getattr(getattr(message, "author", None), "bot", False):
+            return
+        if not claim_discord_message(self, message):
+            log_line(
+                f"duplicate_message_skipped source=gateway "
+                f"chat={getattr(getattr(message, 'channel', None), 'id', '-')} "
+                f"message={get_discord_message_id(message) or '-'}"
+            )
+            return
+        await CodexDiscordBot.process_discord_message(self, message, source="gateway")
+
+    async def process_discord_message(self, message: discord.Message, *, source: str) -> None:
         try:
-            if message.author.bot:
-                return
             log_line(
                 f"message_received chat={getattr(message.channel, 'id', '-')} "
                 f"parent={getattr(message.channel, 'parent_id', '-')} "
                 f"user={message.author.id} "
-                f"content_len={format_log_text_len(message.content or '')}"
+                f"content_len={format_log_text_len(message.content or '')} "
+                f"source={source}"
             )
             if not self.enable_prefix_commands:
                 log_line("ignored_message reason=message_content_disabled")
@@ -2722,6 +2860,16 @@ def summarize_discord_hook_log_line(line: str) -> str | None:
             f"{timestamp} ignored_message "
             f"reason={get_log_field(body, 'reason')} channel={get_log_field(body, 'chat')}"
         )
+    if body.startswith("history_poll_message "):
+        return (
+            f"{timestamp} history_poll_message "
+            f"channel={get_log_field(body, 'channel')} content_len={get_log_field(body, 'content_len')}"
+        )
+    if body.startswith("history_poll_primed "):
+        return (
+            f"{timestamp} history_poll_primed "
+            f"channel={get_log_field(body, 'channel')} messages={get_log_field(body, 'messages')}"
+        )
     if body.startswith("message "):
         return (
             f"{timestamp} message_routed "
@@ -2771,6 +2919,7 @@ def is_user_or_control_hook_summary(summary: str) -> bool:
         for marker in [
             " message_received ",
             " ignored_message ",
+            " history_poll_message ",
             " message_routed ",
             " raw_interaction ",
             " interaction_received ",
@@ -2844,6 +2993,7 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
         f"message_content_enabled: {bool(getattr(bot, 'enable_prefix_commands', False))}",
         f"intent_message_content: {bool(getattr(getattr(bot, 'intents', None), 'message_content', False))}",
         f"raw_debug_events: {bool(getattr(bot, '_enable_debug_events', False))}",
+        f"history_poll_seconds: {getattr(bot, 'history_poll_seconds', '-')}",
         f"allowed_channels: {format_discord_id_list(getattr(bot, 'allowed_channel_ids', set()))}",
         f"allowed_users: {format_discord_id_list(getattr(bot, 'allowed_user_ids', set()))}",
         f"startup_channel_id: {getattr(bot, 'startup_channel_id', None) or '-'}",

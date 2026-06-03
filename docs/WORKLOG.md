@@ -1809,3 +1809,32 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:22 +09:00 - Discord history poll fallback
+- Goal: keep Discord plain-message handling working even if gateway `on_message` delivery is delayed or missed.
+- Key assumptions:
+  - Gateway events should remain the primary path, but recent channel history can safely cover missed user messages in allowed/mirrored channels.
+  - Startup history should be primed but not replayed, so old messages do not trigger fresh Codex asks after a restart.
+- Changes:
+  - Added `DISCORD_HISTORY_POLL_SECONDS` with a default 15-second fallback poll interval and `0` disable support.
+  - Added a background history poller over startup, allowed, and mirrored channels/threads.
+  - Added message-id dedupe so gateway and history polling do not process the same Discord message twice.
+  - Routed poll-caught messages through the same prefix/plain-message handling path as gateway messages.
+  - Added doctor visibility for `history_poll_seconds` and recent `history_poll_message` events.
+  - Documented the new environment variable in `.env.example` and README.
+- Abuse cases checked:
+  - Replaying old messages after restart: blocked by per-channel priming on first history scan.
+  - Duplicate Codex asks from gateway plus polling: blocked by per-message-id claiming before processing.
+  - Processing unauthorized channels/users: poll targets are startup/allowed/mirrored channels and every message still passes the existing channel/user gates.
+  - Prompt leakage in logs/doctor: poll logs content length only, and summaries omit raw message text.
+  - API pressure: polling is bounded to recent channels and 10 recent messages per channel, with a configurable interval and disable switch.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (65 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Discord bot startup now starts a history polling task unless `DISCORD_HISTORY_POLL_SECONDS=0`.
+  - `/doctor` and `!doctor` include `history_poll_seconds` and can show poll-caught user messages in recent hook events.
+  - No Discord command schema, mirror DB schema, session key behavior, slash commands, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
