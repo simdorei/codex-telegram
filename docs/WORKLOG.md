@@ -1476,6 +1476,30 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:22 +09:00 - Discord new mirror location normalization
+- Goal: keep `/new` and `!new` mirrored output in the invoking Discord project's original location when Windows path spelling differs.
+- Key assumptions:
+  - A new Codex thread launched from a mirrored Discord thread should mirror back under that thread's parent project channel when the resolved project path is the same.
+  - Windows path variants such as `C:\taxlab`, `c:\taxlab`, and `\\?\C:\taxlab` should not create or select a different Discord project channel.
+- Changes:
+  - Added normalized project-key comparison for Discord new-thread project channel selection.
+  - Updated `resolve_discord_new_thread_project_channel_id` to compare the invoking thread/project channel rows after normalization instead of relying only on exact DB string equality.
+  - Added a regression test for `\\?\C:\taxlab` matching an existing `c:\taxlab` mirrored thread parent.
+- Abuse cases checked:
+  - Cross-project misrouting: projectless keys and named projectless fallbacks still require exact matching and are not normalized into arbitrary paths.
+  - Unauthorized channel access: no authorization checks changed; the helper only selects among existing mirror DB rows for the invoking channel.
+  - Sensitive path leakage: no new user-facing path output was added; existing logs still only show the selected cwd for new-thread diagnostics.
+  - Broad mirror mutation: only single-thread `/new` mirror placement is affected; mirror sync, ask routing, and button handling are unchanged.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (60 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `/new` and `!new` can now reuse the invoking Discord project channel when project paths match after Windows normalization.
+  - No command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

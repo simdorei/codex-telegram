@@ -647,6 +647,23 @@ def resolve_discord_new_thread_cwd(discord_channel_id: int | None) -> str | None
     return None
 
 
+def project_keys_match(left: str | None, right: str | None) -> bool:
+    left_value = str(left or "").strip()
+    right_value = str(right or "").strip()
+    if not left_value or not right_value:
+        return False
+    if left_value == right_value:
+        return True
+    if left_value.startswith("projectless:") or right_value.startswith("projectless:"):
+        return False
+    if left_value == CODEX_PROJECTLESS_CHAT_KEY or right_value == CODEX_PROJECTLESS_CHAT_KEY:
+        return False
+    try:
+        return bridge.normalize_workspace_path(left_value) == bridge.normalize_workspace_path(right_value)
+    except Exception:
+        return left_value.lower() == right_value.lower()
+
+
 def resolve_discord_new_thread_project_channel_id(
     discord_channel_id: int | None,
     project_key: str | None,
@@ -655,27 +672,31 @@ def resolve_discord_new_thread_project_channel_id(
         return None
     init_mirror_db()
     with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        row = conn.execute(
+        thread_rows = conn.execute(
             """
-            SELECT discord_channel_id
+            SELECT discord_channel_id, project_key
             FROM mirror_threads
-            WHERE discord_thread_id = ? AND project_key = ?
-            LIMIT 1
+            WHERE discord_thread_id = ?
+            ORDER BY updated_at DESC
             """,
-            (int(discord_channel_id), project_key),
-        ).fetchone()
-        if row:
-            return int(row[0])
-        row = conn.execute(
+            (int(discord_channel_id),),
+        ).fetchall()
+        for row in thread_rows:
+            if project_keys_match(str(row[1] or ""), project_key):
+                return int(row[0])
+        project_rows = conn.execute(
             """
-            SELECT discord_channel_id
+            SELECT discord_channel_id, project_key
             FROM mirror_projects
-            WHERE discord_channel_id = ? AND project_key = ?
-            LIMIT 1
+            WHERE discord_channel_id = ?
+            ORDER BY updated_at DESC
             """,
-            (int(discord_channel_id), project_key),
-        ).fetchone()
-    return int(row[0]) if row else None
+            (int(discord_channel_id),),
+        ).fetchall()
+    for row in project_rows:
+        if project_keys_match(str(row[1] or ""), project_key):
+            return int(row[0])
+    return None
 
 
 def is_mirrored_channel_id(discord_channel_id: int | None) -> bool:

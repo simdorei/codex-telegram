@@ -1653,6 +1653,30 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 bot.MIRROR_DB_PATH = old_db_path
 
+    def test_new_thread_project_channel_matches_normalized_invoking_thread_parent(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                bot.init_mirror_db()
+                with sqlite3.connect(bot.MIRROR_DB_PATH) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO mirror_threads (
+                            codex_thread_id, project_key, thread_title,
+                            discord_channel_id, discord_thread_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("thread-1", r"c:\taxlab", "title", 111, 222, 1.0),
+                    )
+
+                self.assertEqual(
+                    bot.resolve_discord_new_thread_project_channel_id(222, r"\\?\C:\taxlab"),
+                    111,
+                )
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
     def test_new_thread_project_channel_accepts_project_parent_channel(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
