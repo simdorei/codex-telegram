@@ -2609,6 +2609,68 @@ def build_where_message(channel_id: int | None) -> str:
         return f"Mapped Codex thread: {target_thread_id}\nERROR: {exc}"
 
 
+def get_busy_choice_counts(now: float | None = None) -> tuple[int, int]:
+    current = time.time() if now is None else now
+    init_mirror_db()
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        active = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM busy_choices
+            WHERE expires_at > ? AND claimed_at IS NULL
+            """,
+            (current,),
+        ).fetchone()[0]
+        stale = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM busy_choices
+            WHERE expires_at <= ? OR claimed_at IS NOT NULL
+            """,
+            (current,),
+        ).fetchone()[0]
+    return int(active), int(stale)
+
+
+def format_discord_id_list(values: set[int], *, limit: int = 8) -> str:
+    if not values:
+        return "ALL"
+    sorted_values = sorted(values)
+    rendered = ",".join(str(value) for value in sorted_values[:limit])
+    if len(sorted_values) > limit:
+        rendered += f",+{len(sorted_values) - limit} more"
+    return rendered
+
+
+def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -> str:
+    target_thread_id = get_mirrored_codex_thread_id(channel_id)
+    project = get_mirror_project_for_channel(channel_id)
+    active_busy_choices, stale_busy_choices = get_busy_choice_counts()
+    mirror_lines = build_mirror_check().splitlines()
+    lines = [
+        "Discord adapter diagnostics",
+        f"channel_id: {channel_id or '-'}",
+        f"mapped_thread_id: {target_thread_id or '-'}",
+        f"project_channel: {project[1] if project else '-'}",
+        f"message_content_enabled: {bool(getattr(bot, 'enable_prefix_commands', False))}",
+        f"intent_message_content: {bool(getattr(getattr(bot, 'intents', None), 'message_content', False))}",
+        f"raw_debug_events: {bool(getattr(bot, '_enable_debug_events', False))}",
+        f"allowed_channels: {format_discord_id_list(getattr(bot, 'allowed_channel_ids', set()))}",
+        f"allowed_users: {format_discord_id_list(getattr(bot, 'allowed_user_ids', set()))}",
+        f"startup_channel_id: {getattr(bot, 'startup_channel_id', None) or '-'}",
+        f"empty_content_notice_channels: {len(EMPTY_CONTENT_NOTICE_LAST_SENT)}",
+        f"busy_choices_active: {active_busy_choices}",
+        f"busy_choices_stale: {stale_busy_choices}",
+        "",
+        *mirror_lines,
+        "",
+        "Expected live log sequence:",
+        "message: socket_message_create -> message_received",
+        "slash/button: socket_interaction_create -> interaction_received",
+    ]
+    return "\n".join(lines)
+
+
 async def build_runners_message() -> str:
     async with THREAD_RUNNERS_LOCK:
         items = list(THREAD_RUNNERS.items())
@@ -3490,6 +3552,7 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         await run_bridge_and_send(message.channel, argv, "Status")
         return
     if command == "doctor":
+        await send_chunks(message.channel, build_discord_doctor_message(bot, message.channel.id))
         await run_bridge_and_send(message.channel, ["doctor"], "Doctor")
         return
     if command == "discover_codex":
@@ -3742,6 +3805,11 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
+        await send_interaction_chunks(
+            interaction,
+            build_discord_doctor_message(bot, interaction.channel_id),
+            title="Discord doctor",
+        )
         await run_interaction_bridge_and_send(interaction, ["doctor"], "Doctor")
 
     @bot.tree.command(name="where", description="Show the Codex thread mapped to this Discord channel.")

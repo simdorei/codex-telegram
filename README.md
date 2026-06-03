@@ -173,7 +173,7 @@ Useful Discord commands:
 - `!new <prompt>`: create a new Codex thread and send the first prompt
 - `!archive [ref]`, `!delete_archive <ref>`, `!confirm_delete_archive <ref>`: archive and local archived-thread deletion flow
 - `!use <ref>`, `!open <ref>`, `!open_abort <ref>`: select or open Codex threads
-- `!status [ref]`, `!doctor`, `!discover_codex`, `!restart_codex`: bridge diagnostics and Codex Desktop maintenance
+- `!status [ref]`, `!doctor`, `!discover_codex`, `!restart_codex`: Discord/bridge diagnostics and Codex Desktop maintenance
 - `!context [all]`, `!usage [days]`, `!runners`, `!chatid`: Discord/Codex utility status
 - `!mirror sync [limit]`: create/update Discord project channels and thread mirrors from local Codex threads
 - `!mirror list [limit]`: show the current local mirror map
@@ -231,7 +231,7 @@ After `/restart_codex`, run `/open <ref>` again before asking if you want live I
 | `/confirm_delete_archive <ref>` | Actually delete the archived thread locally. | 보관 스레드를 로컬에서 실제 삭제합니다. |
 | `/use <ref>` | Persist the default target thread without opening UI. | UI를 열지 않고 기본 대상 스레드를 선택합니다. |
 | `/status [ref]` | Show status for the current or specified thread. | 현재 또는 지정한 스레드 상태를 보여줍니다. |
-| `/doctor` | Print bridge diagnostics. | 브리지 진단 정보를 출력합니다. |
+| `/doctor` | Print Discord adapter and bridge diagnostics. | 브리지 진단 정보를 출력합니다. |
 | `/ask <prompt>` | Send a prompt through the default IPC path. | 기본 IPC 경로로 질문을 보냅니다. |
 | `/ask_ipc <prompt>` | Alias of `/ask`. | `/ask`의 별칭입니다. |
 | `/discover_codex` | Discover the Codex Desktop executable and persist it into `.env`. | Codex Desktop 실행 파일을 찾아 `.env`에 저장합니다. |

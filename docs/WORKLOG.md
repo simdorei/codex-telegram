@@ -1427,6 +1427,31 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:09 +09:00 - Discord doctor diagnostics
+- Goal: let users diagnose Discord frontend/hooking state from inside Discord without reading local logs first.
+- Key assumptions:
+  - Existing `/doctor` was bridge-centric and did not expose Discord adapter state needed for hook debugging.
+  - Adding Discord adapter diagnostics before existing bridge diagnostics preserves the command contract while improving observability.
+- Changes:
+  - Added `build_discord_doctor_message` with channel mapping, message content intent, raw debug event, allowlist, busy choice, empty-content notice, and mirror-check status.
+  - Updated `!doctor` and `/doctor` to send Discord adapter diagnostics before the existing bridge doctor output.
+  - Updated README `/doctor` descriptions.
+  - Added a regression test for Discord doctor output.
+- Abuse cases checked:
+  - Sensitive prompt leakage: diagnostics include IDs, booleans, counts, and mirror status only; no prompt text is included.
+  - Unauthorized diagnostics access: unchanged because `/doctor` and `!doctor` still pass existing channel/user allow checks first.
+  - Excessively long allowlist output: bounded by `format_discord_id_list`.
+  - Command contract regression: existing bridge doctor still runs after the new Discord diagnostics.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (59 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `/doctor` and `!doctor` now send Discord adapter diagnostics plus bridge diagnostics.
+  - No command names, mirror DB schema, session behavior, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

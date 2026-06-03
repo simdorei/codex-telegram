@@ -433,6 +433,33 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_discord_doctor_message_includes_adapter_diagnostics(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                bot.init_mirror_db()
+                fake_bot = SimpleNamespace(
+                    enable_prefix_commands=True,
+                    intents=SimpleNamespace(message_content=True),
+                    _enable_debug_events=True,
+                    allowed_channel_ids={222},
+                    allowed_user_ids=set(),
+                    startup_channel_id=222,
+                )
+                output = bot.build_discord_doctor_message(fake_bot, 222)
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertIn("Discord adapter diagnostics", output)
+        self.assertIn("channel_id: 222", output)
+        self.assertIn("message_content_enabled: True", output)
+        self.assertIn("intent_message_content: True", output)
+        self.assertIn("raw_debug_events: True", output)
+        self.assertIn("allowed_channels: 222", output)
+        self.assertIn("Mirror check", output)
+        self.assertIn("Expected live log sequence:", output)
+
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
         fake_client = SimpleNamespace(
             is_allowed_channel=lambda channel_id: channel_id == 222,
