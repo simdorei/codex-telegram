@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 11:12:54 +09:00
+- Goal: lock the busy-thread Discord frontend behavior that originally regressed.
+- Key assumptions:
+  - A plain Discord message to a busy mirrored Codex thread should render a `BusyChoiceView`, not fall through to an `Ask failed` bridge error.
+  - Helper-level tests can protect the decision path until live Discord input is available.
+- Changes:
+  - Added a regression test for `handle_plain_ask()` when the target Codex thread is busy.
+  - Extended fake Discord target support so tests can assert sent views as well as text.
+- Abuse cases checked:
+  - Test uses fake message/channel objects only and does not call Discord APIs.
+  - Test patches busy-state helpers locally and restores them, avoiding Codex thread mutation.
+  - No new externally reachable feature is exposed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 6 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord busy-message input after deployment to prove the live UI behavior.
+
 ## 2026-06-03 11:09:49 +09:00
 - Goal: lock in Discord frontend helper behavior with regression tests.
 - Key assumptions:

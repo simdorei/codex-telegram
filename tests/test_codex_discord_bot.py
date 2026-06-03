@@ -18,10 +18,10 @@ class FakeFollowup:
 
 class FakeTarget:
     def __init__(self) -> None:
-        self.messages: list[str] = []
+        self.messages: list[tuple[str, object | None]] = []
 
-    async def send(self, content: str) -> None:
-        self.messages.append(content)
+    async def send(self, content: str, view=None) -> None:
+        self.messages.append((content, view))
 
 
 class FakeInteraction:
@@ -31,6 +31,12 @@ class FakeInteraction:
         self.followup = FakeFollowup()
         self.user = SimpleNamespace(id=242286902982606848)
         self.channel = None
+
+
+class FakeMessage:
+    def __init__(self) -> None:
+        self.channel = FakeTarget()
+        self.author = SimpleNamespace(id=242286902982606848)
 
 
 class FakeBot:
@@ -126,12 +132,41 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(exit_code, 0)
                 self.assertEqual(output, "ok")
-                self.assertEqual(target.messages, ["Status\n\nok"])
+                self.assertEqual(target.messages, [("Status\n\nok", None)])
                 log_text = log_path.read_text(encoding="utf-8")
                 self.assertIn("bridge_command_done title='Status' exit=0", log_text)
                 self.assertIn("bridge_command_sent title='Status' exit=0", log_text)
         finally:
             bot.run_bridge_command = original_run_bridge_command
+
+    async def test_busy_plain_ask_shows_busy_choice_view(self) -> None:
+        original_get_interactive_state = bot.get_interactive_state_for_thread
+        original_get_busy_state = bot.get_busy_state_for_thread
+        original_build_context_warning = bot.build_context_warning
+        original_is_thread_runner_busy = bot.is_thread_runner_busy
+        try:
+            bot.get_interactive_state_for_thread = lambda target_thread_id: ("", None, "")
+            bot.get_busy_state_for_thread = lambda target_thread_id: ("busy", "thread-1", "taxlab:1")
+            bot.build_context_warning = lambda target_thread_id: ""
+
+            async def runner_idle(target_thread_id):
+                return False
+
+            bot.is_thread_runner_busy = runner_idle
+            message = FakeMessage()
+            await bot.handle_plain_ask(message, "please steer", target_thread_id="thread-1")
+
+            self.assertEqual(len(message.channel.messages), 1)
+            content, view = message.channel.messages[0]
+            self.assertIn("This Codex thread is already working.", content)
+            self.assertIn("please steer", content)
+            self.assertIsInstance(view, bot.BusyChoiceView)
+            self.assertEqual(view.target_thread_id, "thread-1")
+        finally:
+            bot.get_interactive_state_for_thread = original_get_interactive_state
+            bot.get_busy_state_for_thread = original_get_busy_state
+            bot.build_context_warning = original_build_context_warning
+            bot.is_thread_runner_busy = original_is_thread_runner_busy
 
 
 if __name__ == "__main__":
