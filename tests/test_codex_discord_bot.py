@@ -491,6 +491,10 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("socket_message_create channel=222 tracked=True", log_text)
         self.assertNotIn("raw message", log_text)
 
+    def test_discord_client_enables_debug_events_for_raw_socket_diagnostics(self) -> None:
+        source = Path(bot.__file__).read_text(encoding="utf-8")
+        self.assertIn("enable_debug_events=True", source)
+
     async def test_socket_message_create_untracked_omits_author_and_content_len(self) -> None:
         fake_client = SimpleNamespace(
             is_allowed_channel=lambda channel_id: False,

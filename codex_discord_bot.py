@@ -1073,7 +1073,7 @@ class CodexDiscordBot(discord.Client):
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = enable_prefix_commands
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, enable_debug_events=True)
         self.tree = LoggingCommandTree(self)
         self.allowed_channel_ids = allowed_channel_ids
         self.allowed_user_ids = allowed_user_ids

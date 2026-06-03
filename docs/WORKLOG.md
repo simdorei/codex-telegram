@@ -1380,6 +1380,28 @@
 - Unresolved:
   - Still needs fresh live Discord message/slash/button activity after deployment to prove whether gateway events arrive in the server.
 
+## 2026-06-03 13:58 +09:00 - Discord raw debug events enablement
+- Goal: make raw gateway diagnostics actually fire in discord.py runtime.
+- Key assumptions:
+  - discord.py requires `enable_debug_events=True` for `on_socket_raw_receive`.
+  - The raw receive handler remains bounded to selected event types, so enabling debug events does not mean logging raw gateway bodies.
+- Changes:
+  - Enabled `enable_debug_events=True` when constructing the Discord client.
+  - Added a regression test that the client source keeps debug events enabled for raw socket diagnostics.
+- Abuse cases checked:
+  - Raw gateway payload leakage after enabling debug events: blocked by handler-level parsing and selected structured logs only.
+  - Extra runtime overhead from debug events: accepted for diagnostics; log output remains filtered to `MESSAGE_CREATE` and `INTERACTION_CREATE`.
+  - Future regression disabling raw diagnostics silently: covered by the source regression test.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (56 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - discord.py debug gateway events are enabled for the bot process.
+  - No command schema, mirror DB schema, session behavior, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord message/slash/button activity after deployment to prove raw gateway diagnostics in the server.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:
