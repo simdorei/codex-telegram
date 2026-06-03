@@ -1423,7 +1423,7 @@ def build_context_warning(target_thread_id: str | None) -> str:
     return (
         f"Context warning: {context_usage.usage_ratio * 100:.1f}% ({status}), "
         f"archive_recommended={'yes' if archive_recommended else 'no'}. "
-        "Use `!context` to inspect, or start a fresh thread if replies slow down."
+        "Use `!context` to inspect, or `!new <prompt>` to continue in a fresh mirrored thread."
     )
 
 

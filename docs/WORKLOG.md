@@ -1,5 +1,22 @@
 # WORKLOG
 
+## 2026-06-03 10:33:00 +09:00
+- Goal: make critical-context guidance actionable from Discord.
+- Key assumptions:
+  - The mapped goal thread is above 90% context usage, so the frontend should nudge users toward a fresh thread.
+  - `!new` now creates and mirrors a fresh Discord thread automatically, so it is the right next action to show.
+- Changes:
+  - Updated context warning text to include `!new <prompt>` as the explicit continuation command.
+- Abuse cases checked:
+  - Warning remains informational and does not block legitimate use.
+  - The command hint does not bypass existing Discord channel/user authorization.
+  - The hint points to the newly stabilized mirrored-thread flow rather than manual `!mirror sync`.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - Function smoke confirmed the warning now renders `!new <prompt>`.
+- Unresolved items:
+  - Live Discord warning render still needs a real incoming message after deployment.
+
 ## 2026-06-03 10:30:00 +09:00
 - Goal: surface critical Codex context state directly in Discord ask/busy flows.
 - Key assumptions:
