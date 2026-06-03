@@ -1718,3 +1718,29 @@
   - No command schema, mirror DB schema, or session behavior changed.
 - Unresolved:
   - Still needs fresh live Discord approval/message/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:03 +09:00 - Discord launcher PID lock ownership
+- Goal: make Discord scheduled-task recovery distinguish a real running launcher from a stale lock left by a stopped/crashed bot.
+- Key assumptions:
+  - The current Windows environment hides Python process command lines, so script-path process matching is not reliable.
+  - A lock directory with an owning launcher PID is safer than relying on scheduled-task `Running` state, because a just-started task also reports `Running`.
+- Changes:
+  - Added `.codex_discord_bot.lock\launcher.pid` ownership when the Discord launcher acquires the lock.
+  - Changed duplicate detection to trust a live owner PID first.
+  - Kept a legacy no-pid fallback for the currently running old launcher shape.
+  - Changed lock cleanup to `rmdir /s /q` because the lock directory now contains the PID file.
+- Abuse cases checked:
+  - Duplicate Discord bot processes: blocked by live owner-PID detection and the existing lock directory.
+  - Stale lock denial of service: dead PID locks are removed and retried instead of blocking future starts.
+  - Self-running scheduled-task false positive: avoided by checking the owner PID rather than only task `Running` state.
+  - Prompt/session leakage: PID lock files and launcher messages contain only process IDs and generic state.
+- Verification:
+  - `cmd /c "codex-discord-bot.cmd --help"` while the bot was Running printed `Codex Discord bot is already running.`, exited `0`, and preserved `.codex_discord_bot.lock`.
+  - Temp launcher smoke with dead `launcher.pid` removed the stale lock, ran a fake bot, exited `0`, and left no lock behind.
+  - `py -3 -m unittest tests.test_codex_discord_bot` (63 tests)
+  - `git diff --check`
+- Side effects:
+  - Future launcher-owned locks include a `launcher.pid` file.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

@@ -4,6 +4,10 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT=%SCRIPT_DIR%codex_discord_bot.py"
 set "LOCK_DIR=%SCRIPT_DIR%.codex_discord_bot.lock"
+set "PID_FILE=%LOCK_DIR%\launcher.pid"
+set "LAUNCHER_PID="
+
+for /f %%P in ('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID); [Console]::Write($p.ParentProcessId)"') do set "LAUNCHER_PID=%%P"
 
 if not exist "%SCRIPT%" (
   echo ERROR: Script not found: "%SCRIPT%"
@@ -12,18 +16,22 @@ if not exist "%SCRIPT%" (
 
 mkdir "%LOCK_DIR%" >nul 2>nul
 if errorlevel 1 (
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$task = Get-ScheduledTask -TaskName 'Codex Discord Bot' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 } exit 1" >nul 2>nul
+  call :existing_launcher_alive
   if not errorlevel 1 (
     echo Codex Discord bot is already running.
     exit /b 0
   )
   echo Removing stale Codex Discord bot lock.
-  rmdir "%LOCK_DIR%" >nul 2>nul
+  rmdir /s /q "%LOCK_DIR%" >nul 2>nul
   mkdir "%LOCK_DIR%" >nul 2>nul
   if errorlevel 1 (
     echo ERROR: Could not create lock directory: "%LOCK_DIR%"
     exit /b 1
   )
+)
+
+if defined LAUNCHER_PID (
+  >"%PID_FILE%" echo %LAUNCHER_PID%
 )
 
 if defined PYTHON_EXE if exist "%PYTHON_EXE%" goto run
@@ -35,7 +43,7 @@ where py >nul 2>nul
 if %errorlevel%==0 (
   py -3 "%SCRIPT%" %*
   set "EXIT_CODE=%errorlevel%"
-  rmdir "%LOCK_DIR%" >nul 2>nul
+  rmdir /s /q "%LOCK_DIR%" >nul 2>nul
   exit /b %EXIT_CODE%
 )
 
@@ -43,16 +51,31 @@ where python >nul 2>nul
 if %errorlevel%==0 (
   python "%SCRIPT%" %*
   set "EXIT_CODE=%errorlevel%"
-  rmdir "%LOCK_DIR%" >nul 2>nul
+  rmdir /s /q "%LOCK_DIR%" >nul 2>nul
   exit /b %EXIT_CODE%
 )
 
 echo ERROR: Python executable not found.
-rmdir "%LOCK_DIR%" >nul 2>nul
+rmdir /s /q "%LOCK_DIR%" >nul 2>nul
 exit /b 1
 
 :run
 "%PYTHON_EXE%" "%SCRIPT%" %*
 set "EXIT_CODE=%errorlevel%"
-rmdir "%LOCK_DIR%" >nul 2>nul
+rmdir /s /q "%LOCK_DIR%" >nul 2>nul
 exit /b %EXIT_CODE%
+
+:existing_launcher_alive
+set "EXISTING_PID="
+if exist "%PID_FILE%" (
+  for /f "usebackq delims=" %%P in ("%PID_FILE%") do set "EXISTING_PID=%%P"
+  if defined EXISTING_PID (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$pidText=$env:EXISTING_PID; if ($pidText -match '^\d+$' -and (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $pidText) -ErrorAction SilentlyContinue)) { exit 0 } exit 1" >nul 2>nul
+    if not errorlevel 1 exit /b 0
+  )
+  exit /b 1
+)
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$procs=Get-CimInstance Win32_Process; $cmdParents=@{}; foreach ($p in $procs) { if ($p.Name -eq 'cmd.exe') { $cmdParents[[int]$p.ProcessId]=$true } }; foreach ($p in $procs) { if (($p.Name -eq 'py.exe' -or $p.Name -eq 'python.exe') -and $cmdParents.ContainsKey([int]$p.ParentProcessId)) { exit 0 } }; exit 1" >nul 2>nul
+if not errorlevel 1 exit /b 0
+exit /b 1
