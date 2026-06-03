@@ -2754,7 +2754,32 @@ def summarize_discord_hook_log_line(line: str) -> str | None:
     return None
 
 
-def get_recent_discord_hook_events(*, limit: int = 8, max_lines: int = 1000) -> list[str]:
+def is_user_or_control_hook_summary(summary: str) -> bool:
+    if " raw_message " in summary:
+        return " bot=False " in summary or " bot=- " in summary
+    if " raw_message_untracked " in summary:
+        return True
+    return any(
+        marker in summary
+        for marker in [
+            " message_received ",
+            " ignored_message ",
+            " message_routed ",
+            " raw_interaction ",
+            " interaction_received ",
+            " slash_",
+            " component_event ",
+            " busy_choice_event ",
+        ]
+    )
+
+
+def get_recent_discord_hook_events(
+    *,
+    limit: int = 8,
+    max_lines: int = 1000,
+    user_or_control_only: bool = False,
+) -> list[str]:
     log_path = get_log_path()
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -2764,6 +2789,8 @@ def get_recent_discord_hook_events(*, limit: int = 8, max_lines: int = 1000) -> 
     for line in lines[-max_lines:]:
         summary = summarize_discord_hook_log_line(line)
         if summary:
+            if user_or_control_only and not is_user_or_control_hook_summary(summary):
+                continue
             events.append(summary)
     return events[-limit:]
 
@@ -2774,6 +2801,7 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
     active_busy_choices, stale_busy_choices = get_busy_choice_counts()
     mirror_lines = build_mirror_check().splitlines()
     recent_events = get_recent_discord_hook_events()
+    recent_user_events = get_recent_discord_hook_events(user_or_control_only=True)
     lines = [
         "Discord adapter diagnostics",
         f"channel_id: {channel_id or '-'}",
@@ -2794,6 +2822,9 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
         "Expected live log sequence:",
         "message: socket_message_create -> message_received",
         "slash/button: socket_interaction_create -> interaction_received",
+        "",
+        "Recent user/control hook events:",
+        *(recent_user_events or ["-"]),
         "",
         "Recent hook events:",
         *(recent_events or ["-"]),

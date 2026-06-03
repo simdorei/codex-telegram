@@ -1597,6 +1597,31 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:43 +09:00 - Discord doctor user hook section
+- Goal: keep user/control hook evidence visible even when recent raw gateway traffic is dominated by bot startup messages.
+- Key assumptions:
+  - Startup notifications produce valid raw message events, but they can hide the last real user/slash/button activity in the short recent-event list.
+  - Separating user/control events makes it easier to diagnose whether the Discord frontend is receiving user input at all.
+- Changes:
+  - Added a `Recent user/control hook events` doctor section.
+  - Filtered out `bot=True` raw messages from that section while retaining user messages, routed messages, interactions, slash events, component events, and busy-choice events.
+  - Extended the doctor regression test to ensure bot startup raw messages do not appear in the user/control section.
+- Abuse cases checked:
+  - Prompt leakage: summaries still use whitelisted fields and omit raw prompt text.
+  - User identity leakage: no author/user IDs were added to the new section.
+  - Misleading diagnostics: full recent hook events remain available below the user/control section for comparison.
+  - Output growth: both sections keep the existing bounded event limits.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (61 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+  - Local doctor smoke showed last user/control activity separately from bot startup raw messages.
+- Side effects:
+  - `/doctor` and `!doctor` now include both user/control hook events and full recent hook events.
+  - No command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

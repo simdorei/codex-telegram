@@ -458,6 +458,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 log_path.write_text(
                     "\n".join(
                         [
+                            "[2026-06-03 13:59:58] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=3 bot=True content_len=49",
+                            "[2026-06-03 13:59:59] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=3 bot=True content_len=49",
                             "[2026-06-03 14:00:00] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=2 bot=False content_len=12",
                             "[2026-06-03 14:00:01] message chat=222 user=2 prefix=False runner_busy=False codex_busy=idle target_source=mirror target=thread-1 text=sensitive prompt",
                             "[2026-06-03 14:00:02] busy_choice_sent reason=late_busy_failure target=thread-1 prompt_len=16",
@@ -480,12 +482,15 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("allowed_channels: 222", output)
         self.assertIn("Mirror check", output)
         self.assertIn("Expected live log sequence:", output)
+        self.assertIn("Recent user/control hook events:", output)
         self.assertIn("Recent hook events:", output)
         self.assertIn("raw_message channel=222 source=client_channel_cache bot=False", output)
         self.assertIn("message_routed channel=222", output)
         self.assertIn("busy_choice_event reason=late_busy_failure", output)
         self.assertIn("slash_ask_dispatch channel=222 command=ask", output)
         self.assertIn("slash_response_sent channel=- command=doctor exit=0", output)
+        user_section = output.split("Recent user/control hook events:", 1)[1].split("Recent hook events:", 1)[0]
+        self.assertNotIn("bot=True", user_section)
         self.assertNotIn("sensitive prompt", output)
 
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
