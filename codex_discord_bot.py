@@ -864,11 +864,17 @@ class CodexDiscordBot(discord.Client):
             if not content:
                 return
             target_thread_id = get_mirrored_codex_thread_id(message.channel.id)
-            target_busy = await is_thread_runner_busy(target_thread_id)
+            target_source = "mirror" if target_thread_id else "selected"
+            runner_busy = await is_thread_runner_busy(target_thread_id)
+            codex_busy_state, _busy_thread_id, _busy_ref = await asyncio.to_thread(
+                get_busy_state_for_thread,
+                target_thread_id,
+            )
             log_line(
                 f"message chat={message.channel.id} user={message.author.id} "
-                f"prefix={content.startswith('!')} active={target_busy} "
-                f"target={target_thread_id or '-'} "
+                f"prefix={content.startswith('!')} runner_busy={runner_busy} "
+                f"codex_busy={codex_busy_state} "
+                f"target_source={target_source} target={target_thread_id or '-'} "
                 f"text={content[:160].replace(chr(10), ' ')}"
             )
             if content.startswith("!"):

@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 10:25:00 +09:00
+- Goal: make Discord message logs reflect the same busy-state evidence used by the frontend decision path.
+- Key assumptions:
+  - Previous `active=` log values only represented the in-process Discord runner queue, not the actual Codex thread busy state.
+  - Troubleshooting steering UI regressions needs both runner busy state and Codex busy state in the local log.
+- Changes:
+  - Replaced the ambiguous `active=` message log field with `runner_busy=`.
+  - Added `codex_busy=` and `target_source=` to incoming Discord message logs.
+- Abuse cases checked:
+  - Logging should not change authorization or dispatch behavior: patch only changes diagnostic fields.
+  - Prompt leakage risk remains bounded to the existing 160-character message preview.
+  - Unmapped channels are explicitly marked `target_source=selected` so selected-thread fallback is visible in logs.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - `git diff --check`
+  - Function smoke confirmed the current target thread resolves to `busy`.
+- Unresolved items:
+  - Live Discord message smoke is still needed to confirm the new log fields on a real incoming message.
+
 ## 2026-06-03 10:22:00 +09:00
 - Goal: reduce Discord `!new` follow-up friction by mirroring the newly created Codex thread immediately.
 - Key assumptions:
