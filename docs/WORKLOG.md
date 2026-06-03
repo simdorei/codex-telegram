@@ -1252,6 +1252,32 @@
 - Unresolved:
   - Still needs fresh live Discord approval/message/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 13:31 +09:00 - Discord stale button interaction fallback
+- Goal: make Discord interaction hooking observable and prevent old BusyChoice buttons from failing silently after bot restarts.
+- Key assumptions:
+  - Recent "hooking not working" reports can be caused by runtime Discord views expiring across deploy/restart cycles.
+  - Stale buttons cannot recover their original prompt safely without persisted prompt metadata, so the safe micro-step is to return a clear retry notice.
+- Changes:
+  - Added sanitized `interaction_received` logging for Discord interactions without logging prompt/message content.
+  - Added delayed fallback handling for unhandled component interactions; if no callback/defer responds, the user gets an ephemeral stale-button notice.
+  - Added tests for stale component fallback and already-handled component interactions.
+- Abuse cases checked:
+  - Malicious custom IDs used for log injection or log bloat: blocked by newline flattening and length-bounded custom ID logging.
+  - Stale buttons causing invisible failures after restart: mitigated by an explicit ephemeral retry notice.
+  - Fallback racing valid callbacks and double-responding: mitigated by a short delay and `interaction.response.is_done()` before sending.
+  - Unauthorized users probing stale buttons: no prompt, target output, or sensitive state is exposed; the fallback only says the button is inactive.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (47 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Component interactions now create a short-lived fallback task.
+  - Runtime logs now include sanitized interaction type, command, custom ID, channel, and user for Discord interactions.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - BusyChoice buttons are still not fully persistent across restarts; this step makes stale clicks visible and actionable.
+  - Still needs fresh live Discord message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

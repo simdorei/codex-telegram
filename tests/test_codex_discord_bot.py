@@ -76,6 +76,8 @@ class FakeInteraction:
         self.user = SimpleNamespace(id=242286902982606848)
         self.channel = None
         self.message = FakeInteractionMessage()
+        self.type = bot.discord.InteractionType.application_command
+        self.data: dict[str, object] = {}
 
 
 class FakeMessage:
@@ -259,6 +261,39 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(label), 80)
         self.assertNotIn("\n", label)
         self.assertTrue(label.endswith("..."))
+
+    async def test_unhandled_component_interaction_gets_stale_button_notice(self) -> None:
+        interaction = FakeInteraction(command_name="-", channel_id=222)
+        interaction.type = bot.discord.InteractionType.component
+        interaction.data = {"custom_id": "codex-busy-choice-old-button"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.report_unhandled_component_interaction(interaction, delay_sec=0)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            interaction.response.messages,
+            ["This Discord button is no longer active. Send the message again to get fresh controls."],
+        )
+        self.assertIn("component_interaction_unhandled_reported", log_text)
+        self.assertIn("custom_id=codex-busy-choice-old-button", log_text)
+
+    async def test_unhandled_component_interaction_skips_already_handled_response(self) -> None:
+        interaction = FakeInteraction(command_name="-", channel_id=222)
+        interaction.type = bot.discord.InteractionType.component
+        interaction.data = {"custom_id": "codex-busy-choice-active-button"}
+        await interaction.response.defer(thinking=True)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.report_unhandled_component_interaction(interaction, delay_sec=0)
+            log_exists = log_path.exists()
+
+        self.assertEqual(interaction.response.messages, [])
+        self.assertFalse(log_exists)
 
     def test_help_readme_and_registered_slash_commands_match(self) -> None:
         expected_commands = {

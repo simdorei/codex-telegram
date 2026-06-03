@@ -179,6 +179,21 @@ def format_discord_command_label(command: str, *, limit: int = 80) -> str:
     return label[: max(0, limit - 3)].rstrip() + "..."
 
 
+def format_interaction_type(interaction: discord.Interaction) -> str:
+    interaction_type = getattr(interaction, "type", None)
+    return str(getattr(interaction_type, "name", None) or interaction_type or "-")
+
+
+def get_interaction_custom_id(interaction: discord.Interaction) -> str:
+    data = getattr(interaction, "data", None)
+    if not isinstance(data, dict):
+        return "-"
+    custom_id = data.get("custom_id")
+    if custom_id is None:
+        return "-"
+    return format_discord_command_label(str(custom_id), limit=100)
+
+
 def run_bridge_command(argv: list[str]) -> tuple[int, str]:
     parser = bridge.build_parser()
     stdout_buffer = io.StringIO()
@@ -936,6 +951,18 @@ class CodexDiscordBot(discord.Client):
             if isinstance(channel, discord.abc.Messageable):
                 await send_chunks(channel, "Codex Discord bot online. Try `!list` or `/list`.")
 
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        interaction_type = format_interaction_type(interaction)
+        command_name = get_interaction_command_name(interaction)
+        custom_id = get_interaction_custom_id(interaction)
+        log_line(
+            f"interaction_received type={interaction_type} command={command_name} "
+            f"custom_id={custom_id} channel={interaction.channel_id} "
+            f"user={getattr(interaction.user, 'id', '-')}"
+        )
+        if getattr(interaction, "type", None) == discord.InteractionType.component:
+            asyncio.create_task(report_unhandled_component_interaction(interaction))
+
     async def on_message(self, message: discord.Message) -> None:
         try:
             if message.author.bot:
@@ -1002,6 +1029,28 @@ class CodexDiscordBot(discord.Client):
 async def send_chunks(target: discord.abc.Messageable, text: str) -> None:
     for chunk in split_message(text):
         await target.send(chunk)
+
+
+async def report_unhandled_component_interaction(
+    interaction: discord.Interaction,
+    *,
+    delay_sec: float = 2.0,
+) -> None:
+    await asyncio.sleep(delay_sec)
+    if interaction.response.is_done():
+        return
+    custom_id = get_interaction_custom_id(interaction)
+    try:
+        await interaction.response.send_message(
+            "This Discord button is no longer active. Send the message again to get fresh controls.",
+            ephemeral=True,
+        )
+        log_line(
+            f"component_interaction_unhandled_reported custom_id={custom_id} "
+            f"channel={interaction.channel_id} user={getattr(interaction.user, 'id', '-')}"
+        )
+    except Exception:
+        log_line("component_interaction_unhandled_report_failed\n" + traceback.format_exc())
 
 
 async def send_interactive_prompt(
