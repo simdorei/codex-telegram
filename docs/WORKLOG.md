@@ -1929,3 +1929,30 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:44 +09:00 - Discord approval/input persistent buttons
+- Goal: let future approval/input choice buttons recover after bot restart the same way busy-choice buttons can.
+- Key assumptions:
+  - Approval answers are fixed values, so target thread id plus answer is enough to recover stale approval button clicks.
+  - Input choice values are safe to persist in a custom id only when the encoded custom id fits Discord's 100-character limit.
+- Changes:
+  - Added persistent custom IDs for approval buttons.
+  - Added bounded persistent custom IDs for short input-choice buttons.
+  - Added stale-view fallback handlers for approval and input choice component interactions.
+  - Added recent-event summaries and component markers for approval/input persistent fallback events.
+  - Added regression tests for custom id assignment and restart-stale approval/input handling.
+- Abuse cases checked:
+  - Unauthorized users submitting stale buttons: persistent approval/input handlers still call the existing Discord user allowlist check.
+  - Prompt/input leakage in logs: fallback logs only answer/value lengths and target thread id, not raw values.
+  - Custom id overflow: input choice custom ids are omitted when the encoded value would exceed Discord's limit.
+  - Duplicate behavior regression: live in-memory button callbacks are unchanged; persistent fallback only handles otherwise-unhandled component interactions.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (68 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Future approval buttons carry `codex_approval:*` custom IDs.
+  - Future short input-choice buttons carry `codex_input:*` custom IDs.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or busy-choice behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

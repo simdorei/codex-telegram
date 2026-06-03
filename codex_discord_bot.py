@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -45,6 +46,8 @@ INTERACTIVE_STATE_INPUT = "waiting-input"
 INTERACTIVE_STATE_APPROVAL = "waiting-approval"
 CODEX_PROJECTLESS_CHAT_KEY = "codex:chats"
 BUSY_CHOICE_CUSTOM_ID_PREFIX = "codex_busy"
+APPROVAL_CUSTOM_ID_PREFIX = "codex_approval"
+INPUT_CHOICE_CUSTOM_ID_PREFIX = "codex_input"
 BUSY_CHOICE_TTL_SECONDS = 1800
 EMPTY_CONTENT_NOTICE_COOLDOWN_SECONDS = 300
 EMPTY_CONTENT_NOTICE_LAST_SENT: dict[int, float] = {}
@@ -448,6 +451,53 @@ def parse_busy_choice_custom_id(custom_id: str) -> tuple[str, str] | None:
 
 def format_busy_choice_custom_id(choice_id: str, action: str) -> str:
     return f"{BUSY_CHOICE_CUSTOM_ID_PREFIX}:{choice_id}:{action}"
+
+
+def format_approval_custom_id(target_thread_id: str, answer: str) -> str:
+    return f"{APPROVAL_CUSTOM_ID_PREFIX}:{target_thread_id}:{answer}"
+
+
+def parse_approval_custom_id(custom_id: str) -> tuple[str, str] | None:
+    parts = str(custom_id or "").split(":", 2)
+    if len(parts) != 3 or parts[0] != APPROVAL_CUSTOM_ID_PREFIX:
+        return None
+    target_thread_id = parts[1].strip()
+    answer = parts[2].strip()
+    if not target_thread_id or answer not in {"1", "2", "3", "cancel"}:
+        return None
+    return target_thread_id, answer
+
+
+def encode_input_choice_value(value: str) -> str:
+    raw = str(value or "").encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_input_choice_value(encoded: str) -> str | None:
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        return base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+
+
+def format_input_choice_custom_id(target_thread_id: str, value: str) -> str | None:
+    encoded = encode_input_choice_value(value)
+    custom_id = f"{INPUT_CHOICE_CUSTOM_ID_PREFIX}:{target_thread_id}:{encoded}"
+    if len(custom_id) > 100:
+        return None
+    return custom_id
+
+
+def parse_input_choice_custom_id(custom_id: str) -> tuple[str, str] | None:
+    parts = str(custom_id or "").split(":", 2)
+    if len(parts) != 3 or parts[0] != INPUT_CHOICE_CUSTOM_ID_PREFIX:
+        return None
+    target_thread_id = parts[1].strip()
+    value = decode_input_choice_value(parts[2].strip())
+    if not target_thread_id or value is None:
+        return None
+    return target_thread_id, value
 
 
 def get_startup_probe_targets(
@@ -1578,6 +1628,10 @@ async def report_unhandled_component_interaction(
         return
     custom_id = get_interaction_custom_id(interaction)
     try:
+        if await handle_persistent_approval_interaction(interaction, custom_id):
+            return
+        if await handle_persistent_input_choice_interaction(interaction, custom_id):
+            return
         if await handle_persistent_busy_choice_interaction(interaction, custom_id):
             return
     except Exception:
@@ -1613,6 +1667,74 @@ async def resolve_interaction_channel(interaction: discord.Interaction, channel_
                 f"error_type={type(exc).__name__}"
             )
     return None
+
+
+async def handle_persistent_approval_interaction(
+    interaction: discord.Interaction,
+    custom_id: str,
+) -> bool:
+    parsed = parse_approval_custom_id(custom_id)
+    if not parsed:
+        return False
+    target_thread_id, answer = parsed
+    user_id = int(getattr(interaction.user, "id", 0) or 0)
+    if not is_discord_user_allowed(user_id):
+        await interaction.response.send_message("This user is not allowed.", ephemeral=True)
+        log_line(f"approval_persistent_denied user={user_id} target={target_thread_id}")
+        return True
+    await interaction.response.defer(thinking=True)
+    log_line(
+        f"approval_persistent user={user_id} target={target_thread_id} "
+        f"answer_len={format_log_text_len(answer)}"
+    )
+    exit_code, output = await asyncio.to_thread(submit_approval_reply, target_thread_id, answer)
+    log_line(
+        f"approval_persistent_done exit={exit_code} target={target_thread_id} "
+        f"answer_len={format_log_text_len(answer)}"
+    )
+    title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
+    await send_followup_chunks(
+        interaction,
+        f"{title}\n\n{output or '(no output)'}",
+        title="Approval",
+        exit_code=exit_code,
+        log_prefix="button_response",
+    )
+    return True
+
+
+async def handle_persistent_input_choice_interaction(
+    interaction: discord.Interaction,
+    custom_id: str,
+) -> bool:
+    parsed = parse_input_choice_custom_id(custom_id)
+    if not parsed:
+        return False
+    target_thread_id, value = parsed
+    user_id = int(getattr(interaction.user, "id", 0) or 0)
+    if not is_discord_user_allowed(user_id):
+        await interaction.response.send_message("This user is not allowed.", ephemeral=True)
+        log_line(f"input_choice_persistent_denied user={user_id} target={target_thread_id}")
+        return True
+    await interaction.response.defer(thinking=True)
+    log_line(
+        f"input_choice_persistent user={user_id} target={target_thread_id} "
+        f"value_len={format_log_text_len(value)}"
+    )
+    exit_code, output = await asyncio.to_thread(submit_input_reply, target_thread_id, value)
+    log_line(
+        f"input_choice_persistent_done exit={exit_code} target={target_thread_id} "
+        f"value_len={format_log_text_len(value)}"
+    )
+    title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
+    await send_followup_chunks(
+        interaction,
+        f"{title}\n\n{output or '(no output)'}",
+        title="Input",
+        exit_code=exit_code,
+        log_prefix="button_response",
+    )
+    return True
 
 
 def make_persistent_busy_source_message(record: dict[str, object], channel: object) -> SimpleNamespace:
@@ -2917,6 +3039,16 @@ def summarize_discord_hook_log_line(line: str) -> str | None:
             f"{timestamp} busy_choice_event "
             f"reason={get_log_field(body, 'reason')} target={get_log_field(body, 'target')}"
         )
+    if body.startswith("approval_persistent"):
+        return (
+            f"{timestamp} approval_persistent "
+            f"target={get_log_field(body, 'target')} exit={get_log_field(body, 'exit')}"
+        )
+    if body.startswith("input_choice_persistent"):
+        return (
+            f"{timestamp} input_choice_persistent "
+            f"target={get_log_field(body, 'target')} exit={get_log_field(body, 'exit')}"
+        )
     return None
 
 
@@ -2937,6 +3069,8 @@ def is_user_or_control_hook_summary(summary: str) -> bool:
             " slash_",
             " component_event ",
             " busy_choice_event ",
+            " approval_persistent ",
+            " input_choice_persistent ",
         ]
     )
 
@@ -2991,7 +3125,12 @@ def get_discord_log_markers(*, max_lines: int = 2000) -> dict[str, str]:
             markers["last_interaction_at"] = timestamp
             if " type=component " in f" {body} ":
                 markers["last_component_at"] = timestamp
-        if body.startswith(("component_interaction_", "busy_choice_persistent_")):
+        if body.startswith((
+            "component_interaction_",
+            "busy_choice_persistent_",
+            "approval_persistent",
+            "input_choice_persistent",
+        )):
             markers["last_component_at"] = timestamp
         summary = summarize_discord_hook_log_line(line)
         if summary and is_user_or_control_hook_summary(summary):
@@ -3649,6 +3788,21 @@ class ApprovalView(discord.ui.View):
         super().__init__(timeout=1800)
         self.target_thread_id = target_thread_id
         self.claimed = False
+        self.assign_persistent_custom_ids()
+
+    def assign_persistent_custom_ids(self) -> None:
+        labels_to_answers = {
+            "Approve": "1",
+            "Approve session": "2",
+            "Reject": "3",
+            "Cancel": "cancel",
+        }
+        for item in self.children:
+            if not isinstance(item, discord.ui.Button):
+                continue
+            answer = labels_to_answers.get(str(item.label))
+            if answer:
+                item.custom_id = format_approval_custom_id(self.target_thread_id, answer)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if is_discord_user_allowed(interaction.user.id):
@@ -3711,7 +3865,11 @@ class ApprovalView(discord.ui.View):
 
 class InputChoiceButton(discord.ui.Button):
     def __init__(self, target_thread_id: str, value: str, label: str) -> None:
-        super().__init__(label=label[:80], style=discord.ButtonStyle.primary)
+        super().__init__(
+            label=label[:80],
+            style=discord.ButtonStyle.primary,
+            custom_id=format_input_choice_custom_id(target_thread_id, value),
+        )
         self.target_thread_id = target_thread_id
         self.value = value
 

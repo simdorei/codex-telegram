@@ -230,7 +230,23 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 bot.MIRROR_DB_PATH = old_db_path
 
     def test_choice_views_claim_once_and_disable_buttons(self) -> None:
+        approval_view = bot.ApprovalView("thread-1")
+        approval_custom_ids = {
+            getattr(item, "label", ""): getattr(item, "custom_id", "")
+            for item in approval_view.children
+        }
+        self.assertEqual(approval_custom_ids["Approve"], "codex_approval:thread-1:1")
+        self.assertEqual(approval_custom_ids["Approve session"], "codex_approval:thread-1:2")
+        self.assertEqual(approval_custom_ids["Reject"], "codex_approval:thread-1:3")
+        self.assertEqual(approval_custom_ids["Cancel"], "codex_approval:thread-1:cancel")
+
         input_view = bot.InputChoiceView("thread-1", [("1", "First"), ("2", "Second")])
+        input_custom_ids = {
+            getattr(item, "label", ""): getattr(item, "custom_id", "")
+            for item in input_view.children
+        }
+        self.assertEqual(bot.parse_input_choice_custom_id(input_custom_ids["First"]), ("thread-1", "1"))
+        self.assertEqual(bot.parse_input_choice_custom_id(input_custom_ids["Second"]), ("thread-1", "2"))
         self.assertTrue(input_view.claim())
         self.assertFalse(input_view.claim())
         self.assertTrue(all(getattr(item, "disabled", False) for item in input_view.children))
@@ -302,6 +318,64 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("component_interaction_unhandled_reported", log_text)
         self.assertIn("custom_id=codex-busy-choice-old-button", log_text)
+
+    async def test_persistent_approval_handles_restart_stale_view(self) -> None:
+        original_submit = bot.submit_approval_reply
+        submitted: list[tuple[str, str]] = []
+        try:
+            def fake_submit(target_thread_id, answer):
+                submitted.append((target_thread_id, answer))
+                return 0, "approved"
+
+            bot.submit_approval_reply = fake_submit
+            interaction = FakeInteraction(command_name="-", channel_id=222)
+            interaction.type = bot.discord.InteractionType.component
+            interaction.data = {"custom_id": "codex_approval:thread-1:2"}
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.report_unhandled_component_interaction(interaction, delay_sec=0)
+                log_text = log_path.read_text(encoding="utf-8")
+        finally:
+            bot.submit_approval_reply = original_submit
+
+        self.assertEqual(submitted, [("thread-1", "2")])
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(interaction.followup.messages, ["Approval submitted\n\napproved"])
+        self.assertIn("approval_persistent user=242286902982606848 target=thread-1 answer_len=1", log_text)
+        self.assertIn("approval_persistent_done exit=0 target=thread-1 answer_len=1", log_text)
+        self.assertNotIn("approved session", log_text)
+
+    async def test_persistent_input_choice_handles_restart_stale_view(self) -> None:
+        original_submit = bot.submit_input_reply
+        submitted: list[tuple[str, str]] = []
+        custom_id = bot.format_input_choice_custom_id("thread-1", "first choice")
+        self.assertIsNotNone(custom_id)
+        try:
+            def fake_submit(target_thread_id, value):
+                submitted.append((target_thread_id, value))
+                return 0, "answered"
+
+            bot.submit_input_reply = fake_submit
+            interaction = FakeInteraction(command_name="-", channel_id=222)
+            interaction.type = bot.discord.InteractionType.component
+            interaction.data = {"custom_id": custom_id}
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.report_unhandled_component_interaction(interaction, delay_sec=0)
+                log_text = log_path.read_text(encoding="utf-8")
+        finally:
+            bot.submit_input_reply = original_submit
+
+        self.assertEqual(submitted, [("thread-1", "first choice")])
+        self.assertTrue(interaction.response.deferred)
+        self.assertEqual(interaction.followup.messages, ["Input submitted\n\nanswered"])
+        self.assertIn("input_choice_persistent user=242286902982606848 target=thread-1 value_len=12", log_text)
+        self.assertIn("input_choice_persistent_done exit=0 target=thread-1 value_len=12", log_text)
+        self.assertNotIn("first choice", log_text)
 
     async def test_unhandled_component_interaction_skips_already_handled_response(self) -> None:
         interaction = FakeInteraction(command_name="-", channel_id=222)
