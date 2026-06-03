@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 10:44:02 +09:00
+- Goal: reduce duplicate Discord button submissions in busy/interactive frontend flows.
+- Key assumptions:
+  - Earlier logs showed repeated `steer_now` clicks for the same busy prompt, so Discord views should lock immediately on first accepted click.
+  - Users can re-open pending approval/input controls with existing commands if a backend submission later fails.
+- Changes:
+  - Added one-shot claim state to approval, input-choice, and busy-choice Discord views.
+  - Disabled view buttons immediately after the first accepted click, before running bridge submission work.
+  - Changed busy queue follow-up replies to use the deferred interaction follow-up path after the immediate lock.
+- Abuse cases checked:
+  - Double-clicking or racing the same button now returns an ephemeral already-handled message instead of submitting twice.
+  - Unauthorized approval/input users remain blocked by the existing user allowlist checks before claiming a button.
+  - Busy prompt choices remain limited to the original message author before any claim is accepted.
+- Verification:
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, and `codex_desktop_bridge.py` because the running bot held the default `__pycache__` file.
+  - `git diff --check`
+  - View smoke confirmed first claim succeeds, second claim fails, and buttons become disabled.
+  - `build_mirror_check()` reports `missing: 0`, `stale: 0`, `wrong_project: 0`.
+- Unresolved items:
+  - Need live Discord button interaction after deployment to prove rendered button behavior.
+
 ## 2026-06-03 10:38:58 +09:00
 - Goal: stabilize Discord mirrored-thread frontend commands.
 - Key assumptions:

@@ -2028,6 +2028,7 @@ class ApprovalView(discord.ui.View):
     def __init__(self, target_thread_id: str) -> None:
         super().__init__(timeout=1800)
         self.target_thread_id = target_thread_id
+        self.claimed = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if is_discord_user_allowed(interaction.user.id):
@@ -2037,16 +2038,20 @@ class ApprovalView(discord.ui.View):
         return False
 
     async def _submit(self, interaction: discord.Interaction, answer: str) -> None:
-        await interaction.response.defer(thinking=True)
-        log_line(f"approval_button user={interaction.user.id} answer={answer}")
-        exit_code, output = await asyncio.to_thread(submit_approval_reply, self.target_thread_id, answer)
-        title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
-        await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
+        if self.claimed:
+            await interaction.response.send_message("This approval choice was already handled.", ephemeral=True)
+            return
+        self.claimed = True
         self.disable_all_items()
+        await interaction.response.defer(thinking=True)
         try:
             await interaction.message.edit(view=self)
         except Exception:
             pass
+        log_line(f"approval_button user={interaction.user.id} answer={answer}")
+        exit_code, output = await asyncio.to_thread(submit_approval_reply, self.target_thread_id, answer)
+        title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
+        await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2081,27 +2086,37 @@ class InputChoiceButton(discord.ui.Button):
             log_line(f"input_choice_button_denied user={interaction.user.id} target={self.target_thread_id}")
             await interaction.response.send_message("This user is not allowed.", ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
-        log_line(f"input_choice_button user={interaction.user.id} value={self.value}")
-        exit_code, output = await asyncio.to_thread(submit_input_reply, self.target_thread_id, self.value)
-        title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
-        await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
         view = self.view
-        if view:
-            for item in view.children:
-                if isinstance(item, discord.ui.Button):
-                    item.disabled = True
+        if isinstance(view, InputChoiceView) and not view.claim():
+            await interaction.response.send_message("This input choice was already handled.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        if isinstance(view, InputChoiceView):
             try:
                 await interaction.message.edit(view=view)
             except Exception:
                 pass
+        log_line(f"input_choice_button user={interaction.user.id} value={self.value}")
+        exit_code, output = await asyncio.to_thread(submit_input_reply, self.target_thread_id, self.value)
+        title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
+        await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
 
 
 class InputChoiceView(discord.ui.View):
     def __init__(self, target_thread_id: str, options: list[tuple[str, str]]) -> None:
         super().__init__(timeout=1800)
+        self.claimed = False
         for value, label in options[:5]:
             self.add_item(InputChoiceButton(target_thread_id, value, label))
+
+    def claim(self) -> bool:
+        if self.claimed:
+            return False
+        self.claimed = True
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        return True
 
 
 class BusyChoiceView(discord.ui.View):
@@ -2118,6 +2133,7 @@ class BusyChoiceView(discord.ui.View):
         self.prompt = prompt
         self.target_thread_id = target_thread_id
         self.allow_steer = allow_steer
+        self.claimed = False
         if not allow_steer:
             for item in self.children:
                 if isinstance(item, discord.ui.Button) and item.label == "Steer now":
@@ -2129,9 +2145,23 @@ class BusyChoiceView(discord.ui.View):
         await interaction.response.send_message("Only the original sender can choose this.", ephemeral=True)
         return False
 
+    def claim(self) -> bool:
+        if self.claimed:
+            return False
+        self.claimed = True
+        self.disable_all_items()
+        return True
+
     @discord.ui.button(label="Steer now", style=discord.ButtonStyle.primary)
     async def steer_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.claim():
+            await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
+            return
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
         if not self.allow_steer:
             await interaction.followup.send("This message targets a different Codex thread. Queue it instead.")
             return
@@ -2150,14 +2180,17 @@ class BusyChoiceView(discord.ui.View):
         )
         title = "Steering sent" if exit_code == 0 else f"Steering failed (exit {exit_code})"
         await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
-        self.disable_all_items()
+
+    @discord.ui.button(label="Queue next", style=discord.ButtonStyle.secondary)
+    async def queue_next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.claim():
+            await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
         try:
             await interaction.message.edit(view=self)
         except Exception:
             pass
-
-    @discord.ui.button(label="Queue next", style=discord.ButtonStyle.secondary)
-    async def queue_next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         busy_state, _busy_thread_id, _busy_ref = await asyncio.to_thread(
             get_busy_state_for_thread,
             self.target_thread_id,
@@ -2168,7 +2201,7 @@ class BusyChoiceView(discord.ui.View):
                 f"target={self.target_thread_id or '-'} "
                 f"prompt={self.prompt[:160].replace(chr(10), ' ')}"
             )
-            await interaction.response.send_message("No active job now. Starting this message.")
+            await interaction.followup.send("No active job now. Starting this message.")
             asyncio.create_task(
                 run_prompt_flow(
                     self.message.channel,
@@ -2176,11 +2209,6 @@ class BusyChoiceView(discord.ui.View):
                     target_thread_id=self.target_thread_id,
                 )
             )
-            self.disable_all_items()
-            try:
-                await interaction.message.edit(view=self)
-            except Exception:
-                pass
             return
 
         position = await enqueue_thread_ask(
@@ -2193,18 +2221,15 @@ class BusyChoiceView(discord.ui.View):
             f"queue_next user={interaction.user.id} position={position} target={self.target_thread_id or '-'} "
             f"prompt={self.prompt[:160].replace(chr(10), ' ')}"
         )
-        await interaction.response.send_message(f"Queued at position {position}.")
-        self.disable_all_items()
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
+        await interaction.followup.send(f"Queued at position {position}.")
 
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.danger)
     async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.claim():
+            await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
+            return
         log_line(f"ignore_busy_prompt user={interaction.user.id}")
         await interaction.response.send_message("Ignored.")
-        self.disable_all_items()
         try:
             await interaction.message.edit(view=self)
         except Exception:
