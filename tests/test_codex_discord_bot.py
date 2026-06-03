@@ -212,8 +212,12 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
             bot.is_thread_runner_busy = runner_idle
-            message = FakeMessage()
-            await bot.handle_plain_ask(message, "please steer", target_thread_id="thread-1")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                message = FakeMessage()
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.handle_plain_ask(message, "please steer", target_thread_id="thread-1")
+                log_text = log_path.read_text(encoding="utf-8")
 
             self.assertEqual(len(message.channel.messages), 1)
             content, view = message.channel.messages[0]
@@ -221,6 +225,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("please steer", content)
             self.assertIsInstance(view, bot.BusyChoiceView)
             self.assertEqual(view.target_thread_id, "thread-1")
+            self.assertIn("busy_choice_sent reason=codex_busy_preflight target=thread-1", log_text)
         finally:
             bot.get_interactive_state_for_thread = original_get_interactive_state
             bot.get_busy_state_for_thread = original_get_busy_state
@@ -260,6 +265,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                         source_message=message,
                         target_thread_id="thread-1",
                     )
+                log_text = log_path.read_text(encoding="utf-8")
 
             self.assertEqual(len(message.channel.messages), 1)
             content, view = message.channel.messages[0]
@@ -267,6 +273,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("please steer", content)
             self.assertIsInstance(view, bot.BusyChoiceView)
             self.assertEqual(view.target_thread_id, "thread-1")
+            self.assertIn("busy_choice_sent reason=late_busy_failure target=thread-1", log_text)
         finally:
             bot.resolve_target_ref = original_resolve_target_ref
             bot.run_ask_stream = original_run_ask_stream
@@ -294,6 +301,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
 
                 with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
                     await button.callback(interaction)
+                log_text = log_path.read_text(encoding="utf-8")
 
             self.assertTrue(interaction.response.deferred)
             self.assertEqual(len(interaction.followup.messages), 1)
@@ -303,6 +311,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(followup_view, bot.BusyChoiceView)
             self.assertEqual(followup_view.target_thread_id, "thread-1")
             self.assertNotIn("selected thread is still busy", content.lower())
+            self.assertIn("busy_choice_sent reason=steer_busy_failure target=thread-1", log_text)
         finally:
             bot.run_steering_prompt = original_run_steering_prompt
             bot.build_context_warning = original_build_context_warning

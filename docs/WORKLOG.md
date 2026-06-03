@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 11:42:26 +09:00
+- Goal: make live Discord busy-choice rendering auditable from logs.
+- Key assumptions:
+  - Final stabilization still needs real Discord evidence that the busy steering UI rendered.
+  - Existing logs showed busy detection and failure classification, but not every successful busy-choice UI send.
+- Changes:
+  - Added `busy_choice_sent` logs with reason, target, and prompt length.
+  - Logged busy-choice sends for Codex preflight busy, runner preflight busy, late ask busy fallback, and steer-button busy fallback.
+  - Extended regression tests to assert the busy-choice send logs are emitted through isolated temp logs.
+- Abuse cases checked:
+  - Logs include prompt length only, not prompt content.
+  - The change does not relax Discord channel/user authorization or original-sender button ownership.
+  - Test log assertions use temporary log paths and do not pollute the live bot log.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 13 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord busy-thread message and button click after deployment to close the goal with live evidence.
+
 ## 2026-06-03 11:38:43 +09:00
 - Goal: keep Discord busy steering buttons from surfacing raw transport busy errors.
 - Key assumptions:

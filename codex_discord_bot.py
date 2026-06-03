@@ -1957,6 +1957,7 @@ async def run_prompt_and_send(
                     allow_steer=True,
                 ),
             )
+            log_busy_choice_sent("late_busy_failure", target_thread_id, prompt)
             return
         await send_chunks(
             channel,
@@ -2064,6 +2065,14 @@ def build_busy_choice_message(prompt: str, target_thread_id: str | None) -> str:
     return "\n".join(lines)
 
 
+def log_busy_choice_sent(reason: str, target_thread_id: str | None, prompt: str) -> None:
+    safe_reason = reason.replace("\n", " ")[:80]
+    log_line(
+        f"busy_choice_sent reason={safe_reason} target={target_thread_id or '-'} "
+        f"prompt_len={format_log_text_len(prompt)}"
+    )
+
+
 async def handle_plain_ask(
     message: discord.Message,
     prompt: str,
@@ -2113,6 +2122,7 @@ async def handle_plain_ask(
             build_busy_choice_message(prompt, target_thread_id),
             view=view,
         )
+        log_busy_choice_sent("codex_busy_preflight", target_thread_id, prompt)
         return
 
     if await is_thread_runner_busy(target_thread_id):
@@ -2127,6 +2137,7 @@ async def handle_plain_ask(
             build_busy_choice_message(prompt, target_thread_id),
             view=view,
         )
+        log_busy_choice_sent("runner_busy_preflight", target_thread_id, prompt)
         return
 
     await run_prompt_flow(
@@ -2344,6 +2355,7 @@ class BusyChoiceView(discord.ui.View):
                     allow_steer=True,
                 ),
             )
+            log_busy_choice_sent("steer_busy_failure", self.target_thread_id, self.prompt)
             log_line(
                 f"steer_now_busy_choice_resent exit={exit_code} "
                 f"target={self.target_thread_id or '-'}"
