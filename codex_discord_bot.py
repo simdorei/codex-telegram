@@ -2869,6 +2869,46 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
     return "\n".join(lines)
 
 
+def format_discord_message_type(message: object) -> str:
+    message_type = getattr(message, "type", "-")
+    return str(getattr(message_type, "name", message_type) or "-")
+
+
+def format_discord_message_created_at(message: object) -> str:
+    created_at = getattr(message, "created_at", None)
+    if hasattr(created_at, "isoformat"):
+        return str(created_at.isoformat())
+    return "-"
+
+
+async def build_discord_channel_history_lines(channel: object | None, *, limit: int = 5) -> list[str]:
+    lines = ["Recent channel history:"]
+    if channel is None or not hasattr(channel, "history"):
+        return [*lines, "history_unavailable: no_channel"]
+    try:
+        messages = []
+        async for message in channel.history(limit=limit):  # type: ignore[attr-defined]
+            author = getattr(message, "author", None)
+            messages.append(
+                f"{format_discord_message_created_at(message)} "
+                f"bot={bool(getattr(author, 'bot', False))} "
+                f"content_len={format_log_text_len(getattr(message, 'content', '') or '')} "
+                f"type={format_discord_message_type(message)}"
+            )
+    except Exception as exc:
+        return [*lines, f"history_error: {type(exc).__name__}"]
+    return [*lines, *(messages or ["-"])]
+
+
+async def build_discord_doctor_message_with_history(
+    bot: CodexDiscordBot,
+    channel_id: int | None,
+    channel: object | None,
+) -> str:
+    history_lines = await build_discord_channel_history_lines(channel)
+    return build_discord_doctor_message(bot, channel_id) + "\n\n" + "\n".join(history_lines)
+
+
 async def build_runners_message() -> str:
     async with THREAD_RUNNERS_LOCK:
         items = list(THREAD_RUNNERS.items())
@@ -3810,7 +3850,10 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         await run_bridge_and_send(message.channel, argv, "Status")
         return
     if command == "doctor":
-        await send_chunks(message.channel, build_discord_doctor_message(bot, message.channel.id))
+        await send_chunks(
+            message.channel,
+            await build_discord_doctor_message_with_history(bot, message.channel.id, message.channel),
+        )
         await run_bridge_and_send(message.channel, ["doctor"], "Doctor")
         return
     if command == "discover_codex":
@@ -4065,7 +4108,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
         await interaction.response.defer(thinking=True)
         await send_interaction_chunks(
             interaction,
-            build_discord_doctor_message(bot, interaction.channel_id),
+            await build_discord_doctor_message_with_history(bot, interaction.channel_id, interaction.channel),
             title="Discord doctor",
         )
         await run_interaction_bridge_and_send(interaction, ["doctor"], "Doctor")

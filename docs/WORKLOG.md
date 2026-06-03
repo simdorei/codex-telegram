@@ -1785,3 +1785,27 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:14 +09:00 - Discord doctor channel history
+- Goal: let Discord doctor compare recent channel history against gateway/user hook timestamps without exposing message text.
+- Key assumptions:
+  - A message can appear in Discord history even when gateway/message hooks are not logged, so history gives a second diagnostic source.
+  - Content length, message type, timestamp, and bot flag are enough to debug hook freshness without copying prompts.
+- Changes:
+  - Added sanitized current-channel history lines to `/doctor` and `!doctor` Discord adapter diagnostics.
+  - Added async doctor wrapper so existing sync diagnostics remain reusable in tests and local smoke checks.
+  - Added a regression test proving recent history omits raw message content.
+- Abuse cases checked:
+  - Prompt leakage through channel history: blocked by reporting only timestamp, `bot`, content length, and message type.
+  - Doctor failure from missing history permission/API errors: handled with `history_unavailable` or `history_error` lines instead of raising.
+  - Unauthorized diagnostics access: unchanged because `/doctor` and `!doctor` still pass existing user/channel gates first.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (64 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+  - Local history helper smoke showed `bot=False content_len=16` and no raw prompt text.
+- Side effects:
+  - `/doctor` and `!doctor` now perform a small current-channel history fetch.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -561,6 +562,25 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("slash_response_sent channel=- command=doctor exit=0", output)
         user_section = output.split("Recent user/control hook events:", 1)[1].split("Recent hook events:", 1)[0]
         self.assertNotIn("bot=True", user_section)
+        self.assertNotIn("sensitive prompt", output)
+
+    async def test_discord_channel_history_sanitizes_message_content(self) -> None:
+        class FakeHistoryChannel:
+            def history(self, *, limit: int):
+                async def iterator():
+                    yield SimpleNamespace(
+                        created_at=datetime.datetime(2026, 6, 3, 15, 12, tzinfo=datetime.timezone.utc),
+                        author=SimpleNamespace(bot=False),
+                        content="sensitive prompt",
+                        type=SimpleNamespace(name="default"),
+                    )
+
+                return iterator()
+
+        output = "\n".join(await bot.build_discord_channel_history_lines(FakeHistoryChannel()))
+
+        self.assertIn("Recent channel history:", output)
+        self.assertIn("2026-06-03T15:12:00+00:00 bot=False content_len=16 type=default", output)
         self.assertNotIn("sensitive prompt", output)
 
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
