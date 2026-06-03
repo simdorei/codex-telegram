@@ -329,14 +329,15 @@ def init_mirror_db() -> None:
         )
 
 
-def cleanup_expired_busy_choices(now: float | None = None) -> None:
+def cleanup_expired_busy_choices(now: float | None = None) -> int:
     current = time.time() if now is None else now
     init_mirror_db()
     with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        conn.execute(
+        result = conn.execute(
             "DELETE FROM busy_choices WHERE expires_at <= ? OR claimed_at IS NOT NULL",
             (current,),
         )
+        return result.rowcount
 
 
 def create_busy_choice_record(
@@ -1192,6 +1193,12 @@ class CodexDiscordBot(discord.Client):
 
     async def on_ready(self) -> None:
         log_line(f"ready user={self.user} guilds={len(self.guilds)}")
+        try:
+            deleted_busy_choices = await asyncio.to_thread(cleanup_expired_busy_choices)
+            if deleted_busy_choices:
+                log_line(f"busy_choice_cleanup_deleted count={deleted_busy_choices}")
+        except Exception:
+            log_line("busy_choice_cleanup_failed\n" + traceback.format_exc())
         await self.log_startup_diagnostics()
         if env_flag("DISCORD_STARTUP_NOTIFY", default=False) and self.startup_channel_id:
             channel = self.get_channel(self.startup_channel_id)

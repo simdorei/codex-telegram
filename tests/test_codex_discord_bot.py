@@ -400,6 +400,62 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("busy_choice_persistent_denied", log_text)
         self.assertNotIn("please queue", log_text)
 
+    def test_cleanup_expired_busy_choices_returns_deleted_count(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                bot.init_mirror_db()
+                with sqlite3.connect(bot.MIRROR_DB_PATH) as conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO busy_choices (
+                            choice_id, owner_user_id, channel_id, target_thread_id, prompt,
+                            allow_steer, created_at, expires_at, claimed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            ("a" * 24, 1, 222, "thread-1", "expired", 1, 1.0, 2.0, None),
+                            ("b" * 24, 1, 222, "thread-1", "claimed", 1, 1.0, 20.0, 3.0),
+                            ("c" * 24, 1, 222, "thread-1", "active", 1, 1.0, 20.0, None),
+                        ],
+                    )
+
+                deleted = bot.cleanup_expired_busy_choices(now=10.0)
+                with sqlite3.connect(bot.MIRROR_DB_PATH) as conn:
+                    remaining = conn.execute("SELECT choice_id FROM busy_choices").fetchall()
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(remaining, [("c" * 24,)])
+
+    async def test_on_ready_cleans_up_expired_busy_choices(self) -> None:
+        original_cleanup = bot.cleanup_expired_busy_choices
+        calls: list[str] = []
+        try:
+            bot.cleanup_expired_busy_choices = lambda: 3
+
+            async def fake_startup_diagnostics() -> None:
+                calls.append("startup")
+
+            fake_client = SimpleNamespace(
+                user="bot#0001",
+                guilds=[],
+                startup_channel_id=None,
+                log_startup_diagnostics=fake_startup_diagnostics,
+            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.CodexDiscordBot.on_ready(fake_client)
+                log_text = log_path.read_text(encoding="utf-8")
+        finally:
+            bot.cleanup_expired_busy_choices = original_cleanup
+
+        self.assertEqual(calls, ["startup"])
+        self.assertIn("busy_choice_cleanup_deleted count=3", log_text)
+
     def test_startup_probe_targets_include_allowed_and_mirror_channels(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:

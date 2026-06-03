@@ -1622,6 +1622,30 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:47 +09:00 - Discord busy choice ready cleanup
+- Goal: reduce stale Discord steering button records after bot restarts.
+- Key assumptions:
+  - Expired or already-claimed busy-choice records are no longer actionable and can confuse doctor counts or stale button recovery.
+  - Cleanup on `ready` is safe because active unexpired choices remain untouched.
+- Changes:
+  - `cleanup_expired_busy_choices` now returns the number of deleted records.
+  - `on_ready` runs busy-choice cleanup and logs `busy_choice_cleanup_deleted` when records are removed.
+  - Added regression tests for cleanup deletion count and ready-time cleanup logging.
+- Abuse cases checked:
+  - Deleting active steering controls: cleanup only removes `expires_at <= now` or `claimed_at IS NOT NULL`.
+  - Prompt leakage: cleanup logs only deletion count, never prompt text.
+  - Startup failure from DB errors: cleanup exceptions are caught and logged before startup diagnostics continue.
+  - Cross-user state loss: unexpired, unclaimed records remain available for their original owner only.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (63 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Bot startup now deletes expired or claimed busy-choice rows from `discord_mirror.sqlite`.
+  - No command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:
