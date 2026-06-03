@@ -1,5 +1,27 @@
 # WORKLOG
 
+## 2026-06-03 11:47:30 +09:00
+- Goal: align Discord slash frontend with the documented new-thread flow.
+- Key assumptions:
+  - README already documented `/new <prompt>`, but the Discord adapter did not register it.
+  - Slash `/new` should behave like prefix `!new`, including mapped cwd resolution and immediate mirror creation.
+- Changes:
+  - Extracted the Discord new-thread creation/mirroring flow into `run_discord_new_thread()`.
+  - Reused that flow for prefix `!new`.
+  - Added slash `/new <prompt>` with the same authorization gate and cwd/mirror behavior.
+  - Updated Discord help and README slash command lists.
+  - Added regression coverage for slash registration and cwd-aware new-thread mirroring.
+- Abuse cases checked:
+  - `/new` uses `check_interaction_allowed` before creating a thread.
+  - Cwd resolution remains constrained to existing mapped thread/project paths or the existing projectless new-chat fallback.
+  - Mirror creation runs only after the bridge `new` command succeeds and returns a thread id.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 14 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/new` input after deployment to prove slash sync and live cwd behavior.
+
 ## 2026-06-03 11:42:26 +09:00
 - Goal: make live Discord busy-choice rendering auditable from logs.
 - Key assumptions:

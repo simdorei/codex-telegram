@@ -160,12 +160,14 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/archived_list", help_text)
         self.assertIn("/usage", help_text)
         self.assertIn("/runners", help_text)
+        self.assertIn("/new", help_text)
 
         source = Path(bot.__file__).read_text(encoding="utf-8")
         command_names = set(re.findall(r'@bot\.tree\.command\(name="([^"]+)"', source))
         self.assertIn("archived_list", command_names)
         self.assertIn("usage", command_names)
         self.assertIn("runners", command_names)
+        self.assertIn("new", command_names)
 
     async def test_send_interaction_chunks_logs_and_sends(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -334,6 +336,39 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.channel.messages, [("ok", None)])
         finally:
             bot.run_bridge_and_send = original_run_bridge_and_send
+
+    async def test_new_thread_flow_uses_resolved_cwd_and_mirrors(self) -> None:
+        original_resolve_cwd = bot.resolve_discord_new_thread_cwd
+        original_run_bridge_command = bot.run_bridge_command
+        original_mirror_single = bot.mirror_single_codex_thread
+        argv_seen: list[str] = []
+        try:
+            bot.resolve_discord_new_thread_cwd = lambda channel_id: r"C:\taxlab"
+
+            def fake_run_bridge_command(argv):
+                argv_seen.extend(argv)
+                return 0, "target_thread: thread-new\ncwd: C:\\taxlab"
+
+            async def fake_mirror_single_codex_thread(fake_bot, thread_id):
+                return SimpleNamespace(id=999)
+
+            bot.run_bridge_command = fake_run_bridge_command
+            bot.mirror_single_codex_thread = fake_mirror_single_codex_thread
+
+            exit_code, output = await bot.run_discord_new_thread(
+                SimpleNamespace(),
+                222,
+                "start here",
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(argv_seen, ["new", "--cwd", r"C:\taxlab", "start here"])
+            self.assertIn("target_thread: thread-new", output)
+            self.assertIn("Mirrored Discord thread: <#999>", output)
+        finally:
+            bot.resolve_discord_new_thread_cwd = original_resolve_cwd
+            bot.run_bridge_command = original_run_bridge_command
+            bot.mirror_single_codex_thread = original_mirror_single
 
     def test_new_thread_cwd_prefers_mirrored_thread_cwd(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH

@@ -1019,6 +1019,45 @@ async def run_interaction_bridge_and_send(
     return exit_code, output
 
 
+async def run_discord_new_thread(
+    bot: "CodexDiscordBot",
+    discord_channel_id: int | None,
+    prompt: str,
+) -> tuple[int, str]:
+    argv = ["new"]
+    target_cwd = resolve_discord_new_thread_cwd(discord_channel_id)
+    if target_cwd:
+        argv.extend(["--cwd", target_cwd])
+        log_line(f"new_thread_cwd channel={discord_channel_id} cwd={target_cwd}")
+    else:
+        log_line(f"new_thread_cwd channel={discord_channel_id} cwd=default")
+    argv.append(prompt)
+
+    exit_code, output = await asyncio.to_thread(run_bridge_command, argv)
+    prefix = "New" if exit_code == 0 else f"New failed (exit {exit_code})"
+    parts = [f"{prefix}\n\n{output or '(no output)'}"]
+    if exit_code == 0:
+        new_thread_id = (
+            parse_bridge_output_value(output, "target_thread")
+            or parse_bridge_output_value(output, "selected_thread")
+        )
+        if new_thread_id:
+            try:
+                discord_thread = await mirror_single_codex_thread(bot, new_thread_id)
+                log_line(
+                    f"new_thread_mirrored codex_thread={new_thread_id} "
+                    f"discord_thread={discord_thread.id}"
+                )
+                parts.append(f"Mirrored Discord thread: <#{discord_thread.id}>")
+            except Exception as exc:
+                log_line("new_thread_mirror_failed\n" + traceback.format_exc())
+                parts.append(f"Mirror update failed: {exc}\nRun `!mirror sync` to repair.")
+        else:
+            log_line("new_thread_mirror_skipped reason=no_thread_id")
+            parts.append("Mirror update skipped: new thread id was not found in bridge output.")
+    return exit_code, "\n\n".join(parts)
+
+
 async def get_mirror_guild(bot: CodexDiscordBot) -> discord.Guild:
     guild = bot.get_guild(bot.guild_id) if bot.guild_id else (bot.guilds[0] if bot.guilds else None)
     if guild is None:
@@ -2618,37 +2657,8 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         if not arg:
             await message.channel.send("Usage: !new <prompt>")
             return
-        argv = ["new"]
-        target_cwd = resolve_discord_new_thread_cwd(message.channel.id)
-        if target_cwd:
-            argv.extend(["--cwd", target_cwd])
-            log_line(f"new_thread_cwd channel={message.channel.id} cwd={target_cwd}")
-        else:
-            log_line(f"new_thread_cwd channel={message.channel.id} cwd=default")
-        argv.append(arg)
-        exit_code, output = await asyncio.to_thread(run_bridge_command, argv)
-        prefix = "New" if exit_code == 0 else f"New failed (exit {exit_code})"
-        parts = [f"{prefix}\n\n{output or '(no output)'}"]
-        if exit_code == 0:
-            new_thread_id = (
-                parse_bridge_output_value(output, "target_thread")
-                or parse_bridge_output_value(output, "selected_thread")
-            )
-            if new_thread_id:
-                try:
-                    discord_thread = await mirror_single_codex_thread(bot, new_thread_id)
-                    log_line(
-                        f"new_thread_mirrored codex_thread={new_thread_id} "
-                        f"discord_thread={discord_thread.id}"
-                    )
-                    parts.append(f"Mirrored Discord thread: <#{discord_thread.id}>")
-                except Exception as exc:
-                    log_line("new_thread_mirror_failed\n" + traceback.format_exc())
-                    parts.append(f"Mirror update failed: {exc}\nRun `!mirror sync` to repair.")
-            else:
-                log_line("new_thread_mirror_skipped reason=no_thread_id")
-                parts.append("Mirror update skipped: new thread id was not found in bridge output.")
-        await send_chunks(message.channel, "\n\n".join(parts))
+        _exit_code, output = await run_discord_new_thread(bot, message.channel.id, arg)
+        await send_chunks(message.channel, output)
         return
     if command in {"ask", "ask_ipc"}:
         if not arg:
@@ -2696,7 +2706,7 @@ def build_help() -> str:
             "!ask <prompt>",
             "",
             "Plain messages in mirrored Discord threads are sent to that Codex thread.",
-            "Slash commands: /help, /list, /archived_list, /use, /status, /doctor, /where, /context, /usage, /runners, /mirror_check.",
+            "Slash commands: /help, /list, /archived_list, /use, /status, /doctor, /where, /context, /usage, /runners, /mirror_check, /new.",
         ]
     )
 
@@ -2797,6 +2807,15 @@ def register_commands(bot: CodexDiscordBot) -> None:
             return
         await interaction.response.defer(thinking=True)
         await send_interaction_chunks(interaction, await build_runners_message(), title="Runners")
+
+    @bot.tree.command(name="new", description="Create a new Codex thread with the first prompt.")
+    async def slash_new(interaction: discord.Interaction, prompt: str) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        exit_code, output = await run_discord_new_thread(bot, interaction.channel_id, prompt)
+        await send_interaction_chunks(interaction, output, title="New", exit_code=exit_code)
 
     @bot.tree.command(name="mirror_check", description="Check Discord mirror mappings.")
     async def slash_mirror_check(interaction: discord.Interaction) -> None:
