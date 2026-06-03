@@ -1500,6 +1500,32 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:28 +09:00 - Discord busy choice delivery fallback
+- Goal: make busy-thread steering controls observable and degrade gracefully if Discord rejects a button view.
+- Key assumptions:
+  - Users reporting raw `Ask failed` instead of steering controls need clearer evidence of whether the busy-choice message was attempted, delivered with buttons, or fell back.
+  - If a Discord view cannot be attached, a text-only fallback is better than silently losing the steering prompt.
+- Changes:
+  - Added a shared busy-choice send helper used by preflight busy checks and late busy failures.
+  - Added logs for busy-choice view send failure, text fallback success, and fallback failure.
+  - Preserved existing `busy_choice_sent` logging only for successful button-view delivery.
+  - Added a regression test where Discord rejects the view send and the bot posts a text fallback.
+- Abuse cases checked:
+  - Sensitive prompt leakage: existing busy prompt truncation remains in place before both button and fallback sends.
+  - Button spoofing or unauthorized steering: owner-bound persistent choice records and button owner checks are unchanged.
+  - Spam amplification on repeated failures: no retries were added; fallback is a single bounded text response per attempted busy-choice send.
+  - Cross-thread steering: target thread IDs and allow-steer decisions are passed through unchanged from the existing call sites.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (61 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Busy-choice send failures now emit `busy_choice_send_failed`, `busy_choice_fallback_sent`, or `busy_choice_fallback_failed` logs.
+  - If Discord rejects a busy-choice view but still allows plain messages, users receive a text fallback instead of no visible response.
+  - No command schema, mirror DB schema, session behavior, or slash command registration changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

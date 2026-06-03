@@ -1548,15 +1548,16 @@ async def handle_persistent_busy_choice_interaction(
             f"target={target_thread_id or '-'} output_len={format_log_text_len(output)}"
         )
         if is_selected_thread_busy_error(exit_code, output):
+            content, view = make_busy_choice_payload(
+                source_message,
+                prompt,
+                target_thread_id=target_thread_id,
+                allow_steer=True,
+            )
             await send_direct_followup(
                 interaction,
-                build_busy_choice_message(prompt, target_thread_id),
-                view=make_busy_choice_view(
-                    source_message,  # type: ignore[arg-type]
-                    prompt,
-                    target_thread_id=target_thread_id,
-                    allow_steer=True,
-                ),
+                content,
+                view=view,
                 log_prefix="button_followup",
                 context="persistent_steer_busy_failure",
             )
@@ -2943,16 +2944,14 @@ async def run_prompt_and_send(
             f"source_message={'yes' if has_busy_choice_source(source_message) else 'no'}"
         )
         if has_busy_choice_source(source_message):
-            await channel.send(
-                build_busy_choice_message(prompt, target_thread_id),
-                view=make_busy_choice_view(
-                    source_message,
-                    prompt,
-                    target_thread_id=target_thread_id,
-                    allow_steer=True,
-                ),
+            await send_busy_choice_message(
+                channel,
+                source_message,
+                prompt,
+                target_thread_id=target_thread_id,
+                allow_steer=True,
+                reason="late_busy_failure",
             )
-            log_busy_choice_sent("late_busy_failure", target_thread_id, prompt)
             return
         await send_chunks(
             channel,
@@ -3064,6 +3063,73 @@ def build_busy_choice_message(prompt: str, target_thread_id: str | None) -> str:
     return fit_single_message(prefix + prompt_text + footer)
 
 
+def make_busy_choice_payload(
+    source_message: object,
+    prompt: str,
+    *,
+    target_thread_id: str | None,
+    allow_steer: bool,
+) -> tuple[str, BusyChoiceView]:
+    return (
+        build_busy_choice_message(prompt, target_thread_id),
+        make_busy_choice_view(
+            source_message,  # type: ignore[arg-type]
+            prompt,
+            target_thread_id=target_thread_id,
+            allow_steer=allow_steer,
+        ),
+    )
+
+
+async def send_busy_choice_message(
+    channel: discord.abc.Messageable,
+    source_message: object,
+    prompt: str,
+    *,
+    target_thread_id: str | None,
+    allow_steer: bool,
+    reason: str,
+) -> bool:
+    try:
+        content, view = make_busy_choice_payload(
+            source_message,
+            prompt,
+            target_thread_id=target_thread_id,
+            allow_steer=allow_steer,
+        )
+        await channel.send(content, view=view)
+        log_busy_choice_sent(reason, target_thread_id, prompt)
+        return True
+    except Exception:
+        log_line(
+            f"busy_choice_send_failed reason={reason.replace(chr(10), ' ')[:80]} "
+            f"target={target_thread_id or '-'} prompt_len={format_log_text_len(prompt)}\n"
+            + traceback.format_exc()
+        )
+    try:
+        await send_chunks(
+            channel,
+            "\n\n".join(
+                [
+                    build_busy_choice_message(prompt, target_thread_id),
+                    "Discord could not attach steering buttons. Send the message again when the thread is idle, or use `/ask` from the mapped Discord thread.",
+                ]
+            ),
+        )
+        log_line(
+            f"busy_choice_fallback_sent reason={reason.replace(chr(10), ' ')[:80]} "
+            f"target={target_thread_id or '-'}"
+        )
+        return False
+    except Exception:
+        log_line(
+            f"busy_choice_fallback_failed reason={reason.replace(chr(10), ' ')[:80]} "
+            f"target={target_thread_id or '-'}\n"
+            + traceback.format_exc()
+        )
+        raise
+
+
 def log_busy_choice_sent(reason: str, target_thread_id: str | None, prompt: str) -> None:
     safe_reason = reason.replace("\n", " ")[:80]
     log_line(
@@ -3133,32 +3199,26 @@ async def handle_plain_ask(
                 [],
             )
             return
-        view = make_busy_choice_view(
+        await send_busy_choice_message(
+            message.channel,
             message,
             prompt,
             target_thread_id=target_thread_id,
             allow_steer=True,
+            reason="codex_busy_preflight",
         )
-        await message.channel.send(
-            build_busy_choice_message(prompt, target_thread_id),
-            view=view,
-        )
-        log_busy_choice_sent("codex_busy_preflight", target_thread_id, prompt)
         return
 
     if await is_thread_runner_busy(target_thread_id):
         allow_steer = True
-        view = make_busy_choice_view(
+        await send_busy_choice_message(
+            message.channel,
             message,
             prompt,
             target_thread_id=target_thread_id,
             allow_steer=allow_steer,
+            reason="runner_busy_preflight",
         )
-        await message.channel.send(
-            build_busy_choice_message(prompt, target_thread_id),
-            view=view,
-        )
-        log_busy_choice_sent("runner_busy_preflight", target_thread_id, prompt)
         return
 
     await run_prompt_flow(
@@ -3418,15 +3478,16 @@ class BusyChoiceView(discord.ui.View):
             f"output_len={format_log_text_len(output)}"
         )
         if is_selected_thread_busy_error(exit_code, output):
+            content, view = make_busy_choice_payload(
+                self.message,
+                self.prompt,
+                target_thread_id=self.target_thread_id,
+                allow_steer=True,
+            )
             await send_direct_followup(
                 interaction,
-                build_busy_choice_message(self.prompt, self.target_thread_id),
-                view=make_busy_choice_view(
-                    self.message,
-                    self.prompt,
-                    target_thread_id=self.target_thread_id,
-                    allow_steer=True,
-                ),
+                content,
+                view=view,
                 log_prefix="button_followup",
                 context="steer_busy_failure",
             )

@@ -68,6 +68,13 @@ class FakeTarget:
         self.messages.append((content, view))
 
 
+class ViewFailingTarget(FakeTarget):
+    async def send(self, content: str, view=None) -> None:
+        if view is not None:
+            raise RuntimeError("view rejected")
+        await super().send(content, view=view)
+
+
 class FakeInteraction:
     def __init__(self, command_name: str = "help", channel_id: int = 12345) -> None:
         self.command = SimpleNamespace(name=command_name)
@@ -989,6 +996,38 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.resolve_target_ref = original_resolve_target_ref
             bot.run_ask_stream = original_run_ask_stream
+            bot.build_context_warning = original_build_context_warning
+
+    async def test_busy_choice_send_falls_back_when_view_send_fails(self) -> None:
+        original_build_context_warning = bot.build_context_warning
+        try:
+            bot.build_context_warning = lambda target_thread_id: ""
+            message = FakeMessage()
+            channel = ViewFailingTarget()
+            message.channel = channel
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    sent_with_view = await bot.send_busy_choice_message(
+                        channel,
+                        message,
+                        "please steer",
+                        target_thread_id="thread-1",
+                        allow_steer=True,
+                        reason="late_busy_failure",
+                    )
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertFalse(sent_with_view)
+            self.assertGreaterEqual(len(channel.messages), 1)
+            fallback_text = "\n".join(content for content, view in channel.messages if view is None)
+            self.assertIn("This Codex thread is already working.", fallback_text)
+            self.assertIn("Discord could not attach steering buttons.", fallback_text)
+            self.assertIn("busy_choice_send_failed reason=late_busy_failure", log_text)
+            self.assertIn("busy_choice_fallback_sent reason=late_busy_failure", log_text)
+            self.assertNotIn("busy_choice_sent reason=late_busy_failure", log_text)
+        finally:
             bot.build_context_warning = original_build_context_warning
 
     async def test_steer_now_busy_failure_resends_busy_choice_view(self) -> None:
