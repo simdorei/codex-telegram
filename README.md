@@ -184,7 +184,7 @@ Useful Discord commands:
 
 Registered Discord slash commands:
 
-- `/help`, `/list`, `/archived_list`, `/use`, `/status`, `/doctor`, `/where`, `/context`, `/mirror_check`
+- `/help`, `/list`, `/archived_list`, `/use`, `/status`, `/doctor`, `/where`, `/context`, `/usage`, `/runners`, `/mirror_check`
 
 Messages inside a mirrored Discord thread are sent to that Codex thread. If a Discord project channel has multiple Codex threads, plain messages in the parent channel are blocked so they do not accidentally fall back to the selected Codex thread.
 

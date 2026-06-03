@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 11:28:39 +09:00
+- Goal: make read-only Discord status commands consistent between prefix and slash UI.
+- Key assumptions:
+  - Prefix `!usage` and `!runners` are useful status diagnostics and should be discoverable from Discord's slash UI.
+  - These commands are read-only and can reuse existing slash authorization and response logging.
+- Changes:
+  - Added slash `/usage [days]` with the same 1..30 day bound as prefix usage.
+  - Added slash `/runners`.
+  - Updated Discord slash command help text and README command list.
+  - Extended regression coverage for registered slash command names and help text.
+- Abuse cases checked:
+  - Both commands use `check_interaction_allowed` before returning data.
+  - Both commands are read-only and do not create, archive, delete, ask, or steer threads.
+  - `/usage` clamps days to 1..30 before scanning local sessions.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot`
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/usage` or `/runners` input after deployment for live proof.
+
 ## 2026-06-03 11:25:47 +09:00
 - Goal: keep Discord command documentation aligned with the stabilized frontend.
 - Key assumptions:

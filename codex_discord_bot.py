@@ -2598,7 +2598,7 @@ def build_help() -> str:
             "!ask <prompt>",
             "",
             "Plain messages in mirrored Discord threads are sent to that Codex thread.",
-            "Slash commands: /help, /list, /archived_list, /use, /status, /doctor, /where, /context, /mirror_check.",
+            "Slash commands: /help, /list, /archived_list, /use, /status, /doctor, /where, /context, /usage, /runners, /mirror_check.",
         ]
     )
 
@@ -2682,6 +2682,23 @@ def register_commands(bot: CodexDiscordBot) -> None:
         await interaction.response.defer(thinking=True)
         output = build_context_message(interaction.channel_id, all_threads=all_threads, limit=20)
         await send_interaction_chunks(interaction, output, title="Context")
+
+    @bot.tree.command(name="usage", description="Show local Codex usage estimate.")
+    async def slash_usage(interaction: discord.Interaction, days: int = 7) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        output = build_weekly_usage_message(days=max(1, min(30, days)))
+        await send_interaction_chunks(interaction, output, title="Usage")
+
+    @bot.tree.command(name="runners", description="Show Discord runner queues.")
+    async def slash_runners(interaction: discord.Interaction) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        await send_interaction_chunks(interaction, await build_runners_message(), title="Runners")
 
     @bot.tree.command(name="mirror_check", description="Check Discord mirror mappings.")
     async def slash_mirror_check(interaction: discord.Interaction) -> None:
