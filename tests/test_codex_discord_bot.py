@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import sqlite3
@@ -621,6 +622,41 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             [("Queued ask failed. Check codex_discord_bot.log.", None)],
         )
         self.assertIn("thread_runner_job_failure_reported target=thread-1", log_text)
+
+    async def test_run_prompt_flow_chunks_long_context_ack(self) -> None:
+        original_get_thread_runner = bot.get_thread_runner
+        original_build_context_warning = bot.build_context_warning
+        original_enqueue_thread_ask = bot.enqueue_thread_ask
+        try:
+            async def fake_get_thread_runner(target_thread_id):
+                return {"active": False, "queue": asyncio.Queue()}
+
+            async def fake_enqueue_thread_ask(
+                channel,
+                prompt,
+                target_thread_id,
+                *,
+                queued=False,
+                ack_sent=False,
+                source_message=None,
+            ):
+                return 1
+
+            bot.get_thread_runner = fake_get_thread_runner
+            bot.build_context_warning = lambda target_thread_id: "x" * 4100
+            bot.enqueue_thread_ask = fake_enqueue_thread_ask
+            channel = FakeTarget()
+
+            await bot.run_prompt_flow(channel, "please run", target_thread_id="thread-1")
+
+            sent = [content for content, _view in channel.messages]
+            self.assertGreater(len(sent), 1)
+            self.assertTrue(all(len(content) <= bot.DISCORD_MAX_LEN for content in sent))
+            self.assertTrue(sent[0].startswith("Ask received. Sending to Codex."))
+        finally:
+            bot.get_thread_runner = original_get_thread_runner
+            bot.build_context_warning = original_build_context_warning
+            bot.enqueue_thread_ask = original_enqueue_thread_ask
 
     async def test_interactive_approval_prompt_with_view_is_truncated(self) -> None:
         channel = FakeTarget()

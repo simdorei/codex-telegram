@@ -1111,3 +1111,25 @@
   - Test-only change; no runtime behavior changed.
 - Unresolved:
   - The runtime log contains one synthetic `chat=333` line from the pre-fix test run and should not be treated as live Discord evidence.
+
+## 2026-06-03 13:01 +09:00 - Discord ask ack chunking
+- Goal: keep Discord ask/queue acknowledgement messages reliable when extra context guidance is attached.
+- Key assumptions:
+  - Plain Discord messages should always receive visible acknowledgement before the background Codex ask is queued.
+  - Context warnings are currently short, but the send path should stay bounded if warning text grows.
+- Changes:
+  - Routed both immediate and queued `run_prompt_flow` acknowledgement messages through `send_chunks`.
+  - Added a regression test for long context-warning acknowledgement chunking.
+- Abuse cases checked:
+  - Oversized warning text causing Discord API rejection: blocked by the existing message splitter.
+  - Prompt leakage into runtime logs: unchanged; this path does not log raw prompt content.
+  - Queue spam hiding failed acknowledgements: partially mitigated by bounded visible acks; rate limiting remains outside this micro-step.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (36 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Long acknowledgements may appear as multiple Discord messages instead of one failed send.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord input after deployment to prove end-to-end hook behavior.

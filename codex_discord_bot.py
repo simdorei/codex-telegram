@@ -2267,7 +2267,8 @@ async def run_prompt_flow(
             source_message=source_message,
         )
         warning = build_context_warning(target_thread_id)
-        await channel.send(
+        await send_chunks(
+            channel,
             "\n\n".join(
                 part
                 for part in [
@@ -2279,7 +2280,8 @@ async def run_prompt_flow(
         )
         return
     warning = build_context_warning(target_thread_id)
-    await channel.send(
+    await send_chunks(
+        channel,
         "\n\n".join(
             part
             for part in [
