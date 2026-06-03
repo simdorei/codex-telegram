@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 12:04:42 +09:00
+- Goal: lock slash `/ask` busy-choice ownership for Discord interactions.
+- Key assumptions:
+  - Slash `/ask` synthesizes a source message from the interaction user/channel before reusing the plain ask flow.
+  - Busy controls must still be owned by the Discord interaction user so other users cannot click them.
+- Changes:
+  - Added a regression test that slash `/ask` against a busy mapped thread emits `BusyChoiceView`.
+  - Asserted the busy view's source message uses the interaction user and channel.
+  - Asserted `slash_ask_dispatch` and `busy_choice_sent` logs are emitted through an isolated temp log.
+- Abuse cases checked:
+  - Test-only change exposes no new behavior.
+  - The covered behavior preserves original-sender button ownership for slash-created busy controls.
+  - Log assertions avoid prompt-body logging and use temporary log files.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 17 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - None for slash ask busy-choice ownership.
+
 ## 2026-06-03 12:02:33 +09:00
 - Goal: lock slash `/ask` anti-cross-targeting behavior for mirrored project parent channels.
 - Key assumptions:

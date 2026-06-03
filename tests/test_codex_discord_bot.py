@@ -469,6 +469,48 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.describe_mirrored_project_channel = original_describe_project
             bot.handle_plain_ask = original_handle_plain_ask
 
+    async def test_slash_ask_busy_view_uses_interaction_user_owner(self) -> None:
+        original_get_mirrored = bot.get_mirrored_codex_thread_id
+        original_get_interactive_state = bot.get_interactive_state_for_thread
+        original_get_busy_state = bot.get_busy_state_for_thread
+        original_build_context_warning = bot.build_context_warning
+        original_is_thread_runner_busy = bot.is_thread_runner_busy
+        try:
+            bot.get_mirrored_codex_thread_id = lambda channel_id: "thread-1"
+            bot.get_interactive_state_for_thread = lambda target_thread_id: ("", None, "")
+            bot.get_busy_state_for_thread = lambda target_thread_id: ("busy", "thread-1", "taxlab:1")
+            bot.build_context_warning = lambda target_thread_id: ""
+
+            async def runner_idle(target_thread_id):
+                return False
+
+            bot.is_thread_runner_busy = runner_idle
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            interaction.channel = FakeTarget()
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.handle_slash_ask(interaction, "please steer")
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(interaction.followup.messages, ["Ask handling posted in this channel."])
+            self.assertEqual(len(interaction.channel.messages), 1)
+            content, view = interaction.channel.messages[0]
+            self.assertIn("This Codex thread is already working.", content)
+            self.assertIsInstance(view, bot.BusyChoiceView)
+            self.assertIs(view.message.author, interaction.user)
+            self.assertIs(view.message.channel, interaction.channel)
+            self.assertEqual(view.target_thread_id, "thread-1")
+            self.assertIn("slash_ask_dispatch command=ask channel=222", log_text)
+            self.assertIn("busy_choice_sent reason=codex_busy_preflight target=thread-1", log_text)
+        finally:
+            bot.get_mirrored_codex_thread_id = original_get_mirrored
+            bot.get_interactive_state_for_thread = original_get_interactive_state
+            bot.get_busy_state_for_thread = original_get_busy_state
+            bot.build_context_warning = original_build_context_warning
+            bot.is_thread_runner_busy = original_is_thread_runner_busy
+
     def test_new_thread_cwd_prefers_mirrored_thread_cwd(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH
         original_choose_thread = bot.bridge.choose_thread
