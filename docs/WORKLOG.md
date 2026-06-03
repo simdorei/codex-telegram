@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 11:19:57 +09:00
+- Goal: reduce Discord prefix command naming friction seen in live logs.
+- Key assumptions:
+  - A user already tried `!archive_list`, while the bot only accepted `!archived_list`.
+  - The archive list operation is read-only and safe to alias under the more obvious command name.
+- Changes:
+  - Added `!archive_list` as an alias for `!archived_list`.
+  - Updated help text to show the alias.
+  - Added a regression test that `!archive_list 5` routes to bridge `archived_list --limit 5`.
+- Abuse cases checked:
+  - Alias still goes through the same prefix authorization gate before command handling.
+  - Alias is read-only and does not archive, delete, ask, or steer a thread.
+  - Limit parsing remains bounded by the existing `archived_list` path.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 10 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `!archive_list` or `!archived_list` input after deployment for live proof.
+
 ## 2026-06-03 11:17:29 +09:00
 - Goal: lock slash/prefix mapped-thread targeting for Discord status/archive helpers.
 - Key assumptions:

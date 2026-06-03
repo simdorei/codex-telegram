@@ -192,6 +192,25 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.build_context_warning = original_build_context_warning
             bot.is_thread_runner_busy = original_is_thread_runner_busy
 
+    async def test_archive_list_alias_routes_to_archived_list(self) -> None:
+        original_run_bridge_and_send = bot.run_bridge_and_send
+        calls: list[tuple[list[str], str]] = []
+
+        async def fake_run_bridge_and_send(target, argv, title, failure_title=None):
+            calls.append((argv, title))
+            await target.send("ok")
+            return 0, "ok"
+
+        try:
+            bot.run_bridge_and_send = fake_run_bridge_and_send
+            message = FakeMessage()
+            await bot.handle_prefix_command(None, message, "archive_list 5")
+
+            self.assertEqual(calls, [(["archived_list", "--limit", "5"], "Archived list")])
+            self.assertEqual(message.channel.messages, [("ok", None)])
+        finally:
+            bot.run_bridge_and_send = original_run_bridge_and_send
+
     def test_new_thread_cwd_prefers_mirrored_thread_cwd(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH
         original_choose_thread = bot.bridge.choose_thread

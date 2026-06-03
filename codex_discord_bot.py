@@ -2353,7 +2353,7 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         limit = str(parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30))
         await run_bridge_and_send(message.channel, ["list", "--limit", limit], "List")
         return
-    if command == "archived_list":
+    if command in {"archived_list", "archive_list"}:
         limit = str(parse_bounded_int_arg(arg, default=10, minimum=1, maximum=50))
         await run_bridge_and_send(message.channel, ["archived_list", "--limit", limit], "Archived list")
         return
@@ -2574,7 +2574,7 @@ def build_help() -> str:
             "Codex Discord commands",
             "!help",
             "!list [limit]",
-            "!archived_list [limit]",
+            "!archived_list [limit]  (alias: !archive_list)",
             "!use <ref>",
             "!open <ref>",
             "!open_abort <ref>",
