@@ -86,6 +86,9 @@ class FakeMessage:
         self.channel = FakeTarget(channel_id=channel_id)
         self.author = SimpleNamespace(id=242286902982606848, bot=False)
         self.content = content
+        self.attachments: list[object] = []
+        self.embeds: list[object] = []
+        self.stickers: list[object] = []
 
 
 class FakeBot:
@@ -714,6 +717,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             is_allowed_user=lambda user_id: True,
         )
         message = FakeMessage(content="", channel_id=333)
+        bot.EMPTY_CONTENT_NOTICE_LAST_SENT.clear()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "discord-smoke.log"
@@ -721,10 +725,43 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 await bot.CodexDiscordBot.on_message(client, message)
             log_text = log_path.read_text(encoding="utf-8")
 
-        self.assertEqual(message.channel.messages, [])
+        self.assertEqual(len(message.channel.messages), 1)
+        self.assertIn("Discord did not provide the text content", message.channel.messages[0][0])
         self.assertIn("message_received chat=333", log_text)
         self.assertIn("content_len=0", log_text)
         self.assertIn("ignored_message reason=empty_content chat=333", log_text)
+        self.assertIn("empty_content_notice_sent chat=333", log_text)
+
+    async def test_empty_content_notice_uses_channel_cooldown(self) -> None:
+        bot.EMPTY_CONTENT_NOTICE_LAST_SENT.clear()
+        first = FakeMessage(content="", channel_id=333)
+        second = FakeMessage(content="", channel_id=333)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.maybe_send_empty_content_notice(first)
+                await bot.maybe_send_empty_content_notice(second)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(len(first.channel.messages), 1)
+        self.assertEqual(second.channel.messages, [])
+        self.assertIn("empty_content_notice_sent chat=333", log_text)
+        self.assertIn("empty_content_notice_skipped reason=cooldown chat=333", log_text)
+
+    async def test_empty_content_notice_skips_non_text_payload(self) -> None:
+        bot.EMPTY_CONTENT_NOTICE_LAST_SENT.clear()
+        message = FakeMessage(content="", channel_id=333)
+        message.attachments = [object()]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.maybe_send_empty_content_notice(message)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(message.channel.messages, [])
+        self.assertIn("empty_content_notice_skipped reason=non_text_payload chat=333", log_text)
 
     async def test_on_message_project_parent_response_is_chunked(self) -> None:
         original_get_mirrored = bot.get_mirrored_codex_thread_id

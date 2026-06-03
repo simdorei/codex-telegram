@@ -46,6 +46,8 @@ INTERACTIVE_STATE_APPROVAL = "waiting-approval"
 CODEX_PROJECTLESS_CHAT_KEY = "codex:chats"
 BUSY_CHOICE_CUSTOM_ID_PREFIX = "codex_busy"
 BUSY_CHOICE_TTL_SECONDS = 1800
+EMPTY_CONTENT_NOTICE_COOLDOWN_SECONDS = 300
+EMPTY_CONTENT_NOTICE_LAST_SENT: dict[int, float] = {}
 
 
 def load_local_env(path: Path) -> None:
@@ -1297,6 +1299,7 @@ class CodexDiscordBot(discord.Client):
                     f"ignored_message reason=empty_content chat={message.channel.id} "
                     f"user={message.author.id}"
                 )
+                await maybe_send_empty_content_notice(message)
                 return
             target_thread_id = get_mirrored_codex_thread_id(message.channel.id)
             target_source = "mirror" if target_thread_id else "selected"
@@ -1332,6 +1335,47 @@ class CodexDiscordBot(discord.Client):
 async def send_chunks(target: discord.abc.Messageable, text: str) -> None:
     for chunk in split_message(text):
         await target.send(chunk)
+
+
+def message_has_non_text_payload(message: discord.Message) -> bool:
+    return bool(
+        getattr(message, "attachments", None)
+        or getattr(message, "embeds", None)
+        or getattr(message, "stickers", None)
+    )
+
+
+def should_send_empty_content_notice(channel_id: int | None, *, now: float | None = None) -> bool:
+    if not channel_id:
+        return False
+    current = time.monotonic() if now is None else now
+    last_sent = EMPTY_CONTENT_NOTICE_LAST_SENT.get(int(channel_id))
+    if last_sent is not None and current - last_sent < EMPTY_CONTENT_NOTICE_COOLDOWN_SECONDS:
+        return False
+    EMPTY_CONTENT_NOTICE_LAST_SENT[int(channel_id)] = current
+    return True
+
+
+async def maybe_send_empty_content_notice(message: discord.Message) -> None:
+    if message_has_non_text_payload(message):
+        log_line(
+            f"empty_content_notice_skipped reason=non_text_payload "
+            f"chat={getattr(message.channel, 'id', '-')}"
+        )
+        return
+    channel_id = getattr(message.channel, "id", None)
+    if not should_send_empty_content_notice(channel_id):
+        log_line(
+            f"empty_content_notice_skipped reason=cooldown "
+            f"chat={channel_id or '-'}"
+        )
+        return
+    await send_chunks(
+        message.channel,
+        "I received a Discord message, but Discord did not provide the text content. "
+        "Use `/ask` or enable the bot's Message Content Intent in the Discord developer portal.",
+    )
+    log_line(f"empty_content_notice_sent chat={channel_id or '-'}")
 
 
 async def report_unhandled_component_interaction(

@@ -1402,6 +1402,31 @@
 - Unresolved:
   - Still needs fresh live Discord message/slash/button activity after deployment to prove raw gateway diagnostics in the server.
 
+## 2026-06-03 14:04 +09:00 - Discord empty-content user notice
+- Goal: avoid silent no-op when Discord delivers a user message without text content.
+- Key assumptions:
+  - If the bot receives `MESSAGE_CREATE` but message content is empty, the most likely actionable causes are Message Content Intent not being available or the user needing slash commands.
+  - Attachment/embed/sticker-only messages should not trigger a misleading text-content warning.
+- Changes:
+  - Added a user-facing notice when an allowed text message reaches `on_message` with empty content.
+  - Added per-channel cooldown for the notice to avoid repeated warnings.
+  - Skipped notices for attachment/embed/sticker-only payloads.
+  - Added regression tests for notice send, cooldown, and non-text payload skip.
+- Abuse cases checked:
+  - Warning spam from repeated empty messages: mitigated by a 5-minute per-channel cooldown.
+  - Sensitive message leakage: notice and logs use fixed text plus channel IDs only; no content is logged.
+  - Misleading warnings for attachment-only messages: blocked by non-text payload skip.
+  - Unauthorized channel/user paths: unchanged because notice only runs after existing channel/user allow checks.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (58 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Empty text messages in allowed Discord channels can now receive a fixed diagnostic reply.
+  - No command schema, mirror DB schema, session behavior, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:
