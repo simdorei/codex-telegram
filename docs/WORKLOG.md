@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 11:09:49 +09:00
+- Goal: lock in Discord frontend helper behavior with regression tests.
+- Key assumptions:
+  - Live Discord proof is still missing, but helper-level regression coverage reduces risk while waiting for real input.
+  - Tests should isolate logs and mirror DB state so they do not contaminate operational evidence.
+- Changes:
+  - Added `tests/test_codex_discord_bot.py` using stdlib `unittest`.
+  - Covered isolated log path override, mirrored channel-id slash authorization without a channel object, one-shot view claims, slash response logging, and bridge command delivery logging.
+- Abuse cases checked:
+  - Tests do not call real Discord APIs or expose new Discord command surfaces.
+  - Tests use temporary logs and a temporary mirror DB instead of production runtime files.
+  - Fake bridge command execution avoids sending prompts or mutating Codex thread state.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot`
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord user input/button clicks after deployment for final frontend stability proof.
+
 ## 2026-06-03 11:06:14 +09:00
 - Goal: keep Discord frontend smoke tests from polluting live runtime logs.
 - Key assumptions:
