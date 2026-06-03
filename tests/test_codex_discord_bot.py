@@ -748,6 +748,35 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.submit_approval_reply = original_submit_approval_reply
 
+    async def test_plain_approval_reply_log_uses_answer_length(self) -> None:
+        original_submit_approval_reply = bot.submit_approval_reply
+        try:
+            def fake_submit_approval_reply(target_thread_id, answer):
+                return 0, "approved"
+
+            bot.submit_approval_reply = fake_submit_approval_reply
+            channel = FakeTarget()
+            secret_answer = "approve this sensitive text"
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.submit_interactive_reply(
+                        channel,
+                        "thread-1",
+                        "taxlab:1",
+                        bot.INTERACTIVE_STATE_APPROVAL,
+                        secret_answer,
+                    )
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(channel.messages, [("Approval submitted\n\napproved", None)])
+            self.assertIn("approval_reply_done exit=0 target=thread-1", log_text)
+            self.assertIn(f"answer_len={len(secret_answer)}", log_text)
+            self.assertNotIn(secret_answer, log_text)
+        finally:
+            bot.submit_approval_reply = original_submit_approval_reply
+
     async def test_queue_next_immediate_uses_runner_queue(self) -> None:
         original_get_busy_state = bot.get_busy_state_for_thread
         original_is_thread_runner_busy = bot.is_thread_runner_busy

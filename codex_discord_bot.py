@@ -2481,7 +2481,7 @@ async def submit_interactive_reply(
         exit_code, output = await asyncio.to_thread(submit_approval_reply, target_thread_id, answer)
         log_line(
             f"approval_reply_done exit={exit_code} target={target_thread_id} "
-            f"answer={answer[:40].replace(chr(10), ' ')} "
+            f"answer_len={format_log_text_len(answer)} "
             f"output_len={format_log_text_len(output)}"
         )
         title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"

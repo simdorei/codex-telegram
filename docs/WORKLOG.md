@@ -1229,3 +1229,25 @@
   - No command schema, mirror DB schema, or session behavior changed.
 - Unresolved:
   - Still needs fresh live Discord message/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 13:19 +09:00 - Discord approval reply log sanitization
+- Goal: keep Discord interactive approval replies out of runtime logs while preserving diagnostic value.
+- Key assumptions:
+  - Plain-text approval replies can contain arbitrary user text and should be treated like prompt content.
+  - Length, target, exit code, and output length are sufficient for diagnostics.
+- Changes:
+  - Replaced raw `answer=` logging in `approval_reply_done` with `answer_len=`.
+  - Added a regression test proving sensitive approval reply text is not written to logs.
+- Abuse cases checked:
+  - Sensitive approval text leaking through runtime logs: blocked by length-only logging.
+  - Loss of operational diagnostics: mitigated by retaining target, exit code, answer length, and output length.
+  - Hidden behavior change in approval submission: unchanged; only the log line changed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (45 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Future `approval_reply_done` logs no longer show the approval answer body.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord approval/message/button activity after deployment to prove end-to-end behavior.
