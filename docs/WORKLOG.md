@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 11:59:51 +09:00
+- Goal: prevent future Discord slash command drift between runtime, help text, and README.
+- Key assumptions:
+  - Recent frontend issues included documented slash commands that were not actually registered.
+  - A set-equality regression test is a better guard than checking individual commands opportunistically.
+- Changes:
+  - Replaced partial slash command assertions with an exact expected command set.
+  - Verified the same set appears in `build_help()`, README's Discord slash command list, and `@bot.tree.command` registrations.
+- Abuse cases checked:
+  - Test-only change adds no externally reachable behavior.
+  - The expected set includes only existing registered commands and does not expose new Discord surfaces.
+  - README/help validation reduces accidental user-facing command drift.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 15 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - None for slash command drift prevention.
+
 ## 2026-06-03 11:57:01 +09:00
 - Goal: make live Discord slash ask routing auditable without logging prompt text.
 - Key assumptions:

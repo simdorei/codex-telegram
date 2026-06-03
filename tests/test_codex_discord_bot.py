@@ -157,23 +157,42 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(busy_view.claim())
         self.assertTrue(all(getattr(item, "disabled", False) for item in busy_view.children))
 
-    def test_help_and_registered_slash_commands_include_archived_list(self) -> None:
+    def test_help_readme_and_registered_slash_commands_match(self) -> None:
+        expected_commands = {
+            "help",
+            "list",
+            "archived_list",
+            "use",
+            "status",
+            "doctor",
+            "where",
+            "context",
+            "usage",
+            "runners",
+            "mirror_check",
+            "new",
+            "ask",
+            "ask_ipc",
+        }
+
         help_text = bot.build_help()
-        self.assertIn("/archived_list", help_text)
-        self.assertIn("/usage", help_text)
-        self.assertIn("/runners", help_text)
-        self.assertIn("/new", help_text)
-        self.assertIn("/ask", help_text)
-        self.assertIn("/ask_ipc", help_text)
+        help_match = re.search(r"Slash commands: (.+)", help_text)
+        self.assertIsNotNone(help_match)
+        help_commands = set(re.findall(r"/([a-z_]+)", help_match.group(1)))
+        self.assertEqual(help_commands, expected_commands)
+
+        readme = Path("README.md").read_text(encoding="utf-8")
+        readme_match = re.search(
+            r"Registered Discord slash commands:\s*\n\s*-\s*(.+)",
+            readme,
+        )
+        self.assertIsNotNone(readme_match)
+        readme_commands = set(re.findall(r"/([a-z_]+)", readme_match.group(1)))
+        self.assertEqual(readme_commands, expected_commands)
 
         source = Path(bot.__file__).read_text(encoding="utf-8")
         command_names = set(re.findall(r'@bot\.tree\.command\(name="([^"]+)"', source))
-        self.assertIn("archived_list", command_names)
-        self.assertIn("usage", command_names)
-        self.assertIn("runners", command_names)
-        self.assertIn("new", command_names)
-        self.assertIn("ask", command_names)
-        self.assertIn("ask_ipc", command_names)
+        self.assertEqual(command_names, expected_commands)
 
     async def test_send_interaction_chunks_logs_and_sends(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
