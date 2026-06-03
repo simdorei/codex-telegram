@@ -2474,6 +2474,49 @@ def reply_to_pending_approval(
     raise RuntimeError("\n".join(failure_lines))
 
 
+def is_windowsapps_path(path: Path | str) -> bool:
+    return "\\windowsapps\\" in str(path).lower()
+
+
+def detect_running_codex_app_server_executable() -> tuple[Path | None, str]:
+    process_path = normalize_executable_candidate(
+        run_powershell_capture(
+            "Get-CimInstance Win32_Process "
+            "| Where-Object { $_.Name -ieq 'codex.exe' -and $_.CommandLine -match 'app-server' -and $_.ExecutablePath } "
+            "| Sort-Object @{ Expression = { if ($_.ExecutablePath -like '*\\\\WindowsApps\\\\*') { 1 } else { 0 } } } "
+            "| Select-Object -First 1 -ExpandProperty ExecutablePath"
+        )
+    )
+    if process_path is not None:
+        return (process_path, "powershell:running-app-server")
+    return (None, "")
+
+
+def iter_codex_app_server_bin_candidates() -> Iterator[tuple[str, Path]]:
+    roots: list[Path] = []
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        roots.append(Path(local_app_data) / "OpenAI" / "Codex" / "bin")
+
+    seen: set[str] = set()
+    candidates: list[Path] = []
+    executable_name = "codex.exe" if os.name == "nt" else "codex"
+    for root in roots:
+        if not root.exists():
+            continue
+        for candidate in root.glob(f"*/{executable_name}"):
+            normalized = str(candidate).lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if candidate.exists() and candidate.is_file():
+                candidates.append(candidate)
+
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for candidate in candidates:
+        yield (f"local-app-bin:{candidate.parent}", candidate)
+
+
 def resolve_codex_app_server_executable() -> str:
     if CODEX_APP_SERVER_EXE:
         return CODEX_APP_SERVER_EXE
@@ -2483,10 +2526,24 @@ def resolve_codex_app_server_executable() -> str:
     if bundled_path.exists():
         return str(bundled_path)
 
+    running_path, _running_source = detect_running_codex_app_server_executable()
+    if running_path is not None:
+        return str(running_path)
+
+    for _source, candidate in iter_codex_app_server_bin_candidates():
+        return str(candidate)
+
+    windowsapps_candidate = ""
     for candidate in ("codex", "codex.exe"):
         resolved = shutil.which(candidate)
         if resolved:
+            if is_windowsapps_path(resolved):
+                windowsapps_candidate = resolved
+                continue
             return resolved
+
+    if windowsapps_candidate:
+        return windowsapps_candidate
 
     return bundled_name
 

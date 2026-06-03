@@ -2,7 +2,7 @@
 
 Unofficial Windows bridge and Telegram control layer for the Codex Desktop app without using Codex CLI.
 
-This repository is the `codex-bridge-telegram` project: a local Codex Desktop bridge plus a Telegram bot adapter for thread control, archive actions, and approval handling.
+This repository is the `codex-bridge-telegram` project: a local Codex Desktop bridge plus Telegram and Discord bot adapters for thread control, archive actions, approval handling, and mirrored mobile workflows.
 
 It works by combining:
 
@@ -16,14 +16,20 @@ It works by combining:
 - Python 3.11 or newer
 - Same Windows user session as the running Codex app
 
-No third-party Python packages are required.
+The Telegram adapter uses only the Python standard library. The Discord adapter requires `discord.py`; install dependencies with:
+
+```powershell
+py -3 -m pip install -r requirements.txt
+```
 
 ## Repository Layout
 
 - `codex_desktop_bridge.py`: local thread discovery, window activation, ask/watch flow
 - `codex_telegram_bot.py`: Telegram adapter for the `codex-bridge-telegram` flow
+- `codex_discord_bot.py`: Discord adapter with project/channel and thread mirroring
 - `codex-bridge.cmd`: main launcher
 - `codex-telegram-bot.cmd`: Telegram-only launcher
+- `codex-discord-bot.cmd`: Discord-only launcher
 - `.env.example`: local environment template
 
 ## Current Version
@@ -41,6 +47,7 @@ Compared with the last committed baseline, the current patch set adds or stabili
 - split thread targeting between `use`/`/use` and `open`/`/open`
 - Codex Desktop executable discovery and restart via `discover_codex`, `/discover_codex`, `restart_codex`, and `/restart_codex`
 - Telegram live approval handling for `waiting-approval` threads with visible `1 / 2 / 3` choices
+- Discord project/channel mirroring, per-thread routing, queued steering, approval/input buttons, and mirror diagnostics
 - Telegram follow-up delivery after approval replies so the post-approval result message is forwarded back into chat
 - Telegram follow mode now forwards approval prompts directly instead of requiring a manual `/list` and `/use` refresh
 - after `/restart_codex`, reopen the target thread with `/open <ref>` before asking if you need visible-thread/live IPC recovery
@@ -50,8 +57,9 @@ Compared with the last committed baseline, the current patch set adds or stabili
 1. Clone the repository.
 2. Copy `.env.example` to `.env`.
 3. Fill in `TELEGRAM_BOT_TOKEN` if you want Telegram control.
-4. Start the Codex Desktop app and sign in.
-5. Run:
+4. Fill in `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, and `DISCORD_ALLOWED_CHANNEL_IDS` if you want Discord control.
+5. Start the Codex Desktop app and sign in.
+6. Run:
 
 ```powershell
 .\codex-bridge.cmd
@@ -71,6 +79,10 @@ Example `.env`:
 ```env
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_CHAT_IDS=
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=
+DISCORD_ALLOWED_CHANNEL_IDS=
+DISCORD_STARTUP_CHANNEL_ID=
 CODEX_HOME=
 CODEX_DESKTOP_EXE=
 PYTHON_EXE=
@@ -81,6 +93,10 @@ Important variables:
 
 - `TELEGRAM_BOT_TOKEN`: required for Telegram mode
 - `TELEGRAM_ALLOWED_CHAT_IDS`: optional allowlist of Telegram chat IDs
+- `DISCORD_BOT_TOKEN`: required for Discord mode
+- `DISCORD_GUILD_ID`: optional guild/server ID for faster slash-command sync
+- `DISCORD_ALLOWED_CHANNEL_IDS`: optional allowlist of Discord channel/thread IDs
+- `DISCORD_STARTUP_CHANNEL_ID`: optional channel ID for startup notifications
 - `CODEX_HOME`: override default Codex state directory if needed
 - `CODEX_DESKTOP_EXE`: optional override for the Codex Desktop app executable. `/discover_codex` or `/restart_codex` auto-save it into `.env` when discovery succeeds.
 - `PYTHON_EXE`: force a specific Python interpreter
@@ -117,6 +133,9 @@ Example `.env` with explicit paths:
 ```env
 TELEGRAM_BOT_TOKEN=123456:example-token
 TELEGRAM_ALLOWED_CHAT_IDS=123456789
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=
+DISCORD_ALLOWED_CHANNEL_IDS=
 CODEX_HOME=C:\Users\your_user\.codex
 PYTHON_EXE=C:\python\python.exe
 CODEX_BRIDGE_AUTO_START_TELEGRAM=1
@@ -136,6 +155,32 @@ To find your Telegram chat ID:
 1. Send any message to your bot.
 2. Open `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`.
 3. Read `message.chat.id`.
+
+## Discord Mirror Flow
+
+Start the Discord adapter:
+
+```powershell
+.\codex-discord-bot.cmd
+```
+
+Useful Discord commands:
+
+- `!help`: show the current Discord command list
+- `!list [limit]`, `!archived_list [limit]`: show active or archived Codex threads
+- `!new <prompt>`: create a new Codex thread and send the first prompt
+- `!archive [ref]`, `!delete_archive <ref>`, `!confirm_delete_archive <ref>`: archive and local archived-thread deletion flow
+- `!use <ref>`, `!open <ref>`, `!open_abort <ref>`: select or open Codex threads
+- `!status [ref]`, `!doctor`, `!discover_codex`, `!restart_codex`: bridge diagnostics and Codex Desktop maintenance
+- `!context [all]`, `!usage [days]`, `!runners`, `!chatid`: Discord/Codex utility status
+- `!mirror sync [limit]`: create/update Discord project channels and thread mirrors from local Codex threads
+- `!mirror list [limit]`: show the current local mirror map
+- `!mirror check`: verify missing, stale, or wrong-project mappings
+- `!where`: show which Codex thread the current Discord channel/thread maps to
+- `!approval`: re-show approval buttons if the mapped Codex thread is waiting for approval
+- `!ask <prompt>`: send a prompt to the mapped or selected Codex thread
+
+Messages inside a mirrored Discord thread are sent to that Codex thread. If a Discord project channel has multiple Codex threads, plain messages in the parent channel are blocked so they do not accidentally fall back to the selected Codex thread.
 
 ## Telegram-First Flow
 

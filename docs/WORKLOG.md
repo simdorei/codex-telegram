@@ -1,5 +1,29 @@
 # WORKLOG
 
+## 2026-06-03 10:10:00 +09:00
+- Goal: stabilize the Discord-facing Codex control flow for busy-thread steering and new-thread placement.
+- Key assumptions:
+  - Discord mirror thread `1511534183540068402` maps to Codex thread `019e8afb-41a2-7ae0-8b36-d66c8e82a364`.
+  - A plain Discord message to a busy Codex thread should show explicit steering/queue UI instead of returning a raw `--force-while-busy` bridge error.
+  - `!new` from a mirrored Discord thread/project should create the new Codex thread in that mirror's original cwd when one can be resolved.
+- Changes:
+  - Added actual Codex busy-state detection before dispatching Discord plain asks, so busy threads show `Steer now`, `Queue next`, and `Ignore` controls.
+  - Made queued Discord asks wait for the target Codex thread to become idle before sending.
+  - Made `!new` resolve cwd from the mapped Discord thread/project, with projectless chats using the latest local `Documents/Codex/*/new-chat` folder.
+  - Replaced the Discord launcher temporary script path with a repo-local launcher and added single-instance lock protection for scheduled task repeats.
+- Abuse cases checked:
+  - Other Discord users clicking someone else's busy-thread controls: blocked by `BusyChoiceView.interaction_check()`.
+  - Accidental project/channel cross-targeting for new threads: reduced by resolving cwd from mirror DB/thread state and only using existing directories.
+  - Scheduled task repeat spawning duplicate bot processes and duplicate Discord responses: blocked for new launches by the launcher lock directory plus process guard.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - `cmd /c codex-discord-bot.cmd --help`
+  - Function smoke: target thread cwd resolves to `C:\taxlab`; target busy state resolves to `busy`; mirrored `!new` cwd resolves to `C:\taxlab`; projectless cwd resolves to `C:\Users\banpo\Documents\Codex\2026-06-03\new-chat`.
+  - Restarted the `Codex Discord Bot` scheduled task; log reached `ready` at `2026-06-03 10:10:02`.
+- Unresolved items:
+  - End-to-end Discord button click smoke still needs a live Discord message after this patch.
+  - This micro-step does not add rate limits or cost caps for Discord asks; existing allowlist/category controls still carry that risk.
+
 ## 2026-04-14 20:16:22 +09:00
 - Goal: stabilize Telegram interactive handling without changing plain-message behavior.
 - Findings:

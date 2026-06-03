@@ -171,6 +171,13 @@ def get_allowed_chat_ids() -> set[int]:
     return result
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
 def telegram_api(method: str, token: str, params: dict | None = None) -> dict:
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = None
@@ -235,6 +242,24 @@ def build_busy_queue_message(active_summary: str, position: int) -> str:
 
 def send_usage(token: str, chat_id: int, reply_to_message_id: int | None, usage: str) -> None:
     send_text(token, chat_id, f"Usage: {usage}", reply_to_message_id=reply_to_message_id)
+
+
+def send_startup_notifications(token: str, allowed_chat_ids: set[int]) -> None:
+    if not env_flag("TELEGRAM_STARTUP_NOTIFY", default=False):
+        return
+    if not allowed_chat_ids:
+        log_line("startup_notify_skipped reason=no_allowed_chat_ids")
+        return
+    for chat_id in sorted(allowed_chat_ids):
+        try:
+            send_text(
+                token,
+                chat_id,
+                "Codex Telegram bot online.\n/list 로 스레드 확인, /status 로 현재 상태 확인 가능해요.",
+            )
+            log_line(f"startup_notify_sent chat_id={chat_id}")
+        except Exception:
+            log_line(f"startup_notify_failed chat_id={chat_id}\n{traceback.format_exc()}")
 
 
 def send_bridge_command_result(
@@ -2280,6 +2305,7 @@ def main() -> int:
         f"skip_old_updates={args.skip_old_updates} poll_timeout={args.poll_timeout}"
     )
     print(f"Telegram bot starting. Allowed chats: {sorted(allowed_chat_ids) if allowed_chat_ids else 'ALL'}")
+    send_startup_notifications(token, allowed_chat_ids)
     run_polling(
         token=token,
         allowed_chat_ids=allowed_chat_ids,

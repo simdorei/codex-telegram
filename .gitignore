@@ -1,6 +1,8 @@
 .env
 *.log
 codex_telegram_bot.log.bak
+codex_discord_bot.log.bak
+discord_mirror.sqlite
 _ipc_probe_log.jsonl
 _ipc_probe_log.jsonl.bak
 __pycache__/
