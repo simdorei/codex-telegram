@@ -1860,3 +1860,26 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:28 +09:00 - Discord slash sync doctor health
+- Goal: make prefix `/doctor` alternatives able to show whether slash commands synced successfully.
+- Key assumptions:
+  - If slash commands appear broken, prefix `!doctor` may still be available and should show the last sync result.
+  - Command names are already public UI surface and safe to show in diagnostics.
+- Changes:
+  - Stored slash sync status, timestamp, and synced command names on the Discord bot instance.
+  - Added `slash_sync_status`, `slash_sync_last_at`, and `slash_sync_commands` to Discord adapter diagnostics.
+  - Extended the doctor regression test for the new slash sync fields.
+- Abuse cases checked:
+  - Prompt/session leakage: fields expose only command names and sync metadata.
+  - Misleading slash diagnosis: doctor now distinguishes successful sync from skipped/error state.
+  - Behavior regression: slash registration and command handlers are unchanged; only sync metadata is retained.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (65 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `/doctor` and `!doctor` output gains three slash sync health lines.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

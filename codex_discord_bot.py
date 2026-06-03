@@ -1160,6 +1160,9 @@ class CodexDiscordBot(discord.Client):
         self._history_poll_primed_channels: set[int] = set()
         self._history_poll_last_at = "-"
         self._processed_message_ids: dict[int, float] = {}
+        self._slash_sync_last_at = "-"
+        self._slash_sync_status = "-"
+        self._slash_sync_commands = "-"
 
     def is_allowed_channel(self, channel_id: int | None) -> bool:
         if not self.allowed_channel_ids:
@@ -1195,8 +1198,14 @@ class CodexDiscordBot(discord.Client):
                 log_line("setup_hook_sync_global")
                 synced = await asyncio.wait_for(self.tree.sync(), timeout=20)
             command_names = sorted(command.name for command in synced)
+            self._slash_sync_last_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._slash_sync_status = "ok"
+            self._slash_sync_commands = ",".join(command_names) or "-"
             log_line(f"setup_hook_synced commands={','.join(command_names) or '-'}")
         except Exception as exc:
+            self._slash_sync_last_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._slash_sync_status = f"skipped:{type(exc).__name__}"
+            self._slash_sync_commands = "-"
             log_line(f"setup_hook_sync_skipped error={exc}")
         log_line("setup_hook_done")
 
@@ -3001,6 +3010,9 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
         f"history_poll_alive: {history_poll_alive}",
         f"history_poll_last_at: {getattr(bot, '_history_poll_last_at', '-')}",
         f"history_poll_primed_channels: {len(getattr(bot, '_history_poll_primed_channels', set()))}",
+        f"slash_sync_status: {getattr(bot, '_slash_sync_status', '-')}",
+        f"slash_sync_last_at: {getattr(bot, '_slash_sync_last_at', '-')}",
+        f"slash_sync_commands: {getattr(bot, '_slash_sync_commands', '-')}",
         f"allowed_channels: {format_discord_id_list(getattr(bot, 'allowed_channel_ids', set()))}",
         f"allowed_users: {format_discord_id_list(getattr(bot, 'allowed_user_ids', set()))}",
         f"startup_channel_id: {getattr(bot, 'startup_channel_id', None) or '-'}",
