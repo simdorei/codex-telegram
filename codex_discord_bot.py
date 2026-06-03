@@ -21,6 +21,7 @@ import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import discord
 from discord import app_commands
@@ -1056,6 +1057,28 @@ async def run_discord_new_thread(
             log_line("new_thread_mirror_skipped reason=no_thread_id")
             parts.append("Mirror update skipped: new thread id was not found in bridge output.")
     return exit_code, "\n\n".join(parts)
+
+
+async def handle_slash_ask(interaction: discord.Interaction, prompt: str) -> None:
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "send"):
+        await send_interaction_chunks(
+            interaction,
+            "This Discord interaction has no messageable channel.",
+            title="Ask",
+        )
+        return
+
+    target_thread_id = get_mirrored_codex_thread_id(interaction.channel_id)
+    if target_thread_id is None:
+        project_message = describe_mirrored_project_channel(interaction.channel_id)
+        if project_message:
+            await send_interaction_chunks(interaction, project_message, title="Ask")
+            return
+
+    await interaction.followup.send("Ask handling posted in this channel.", ephemeral=True)
+    source_message = SimpleNamespace(channel=channel, author=interaction.user)
+    await handle_plain_ask(source_message, prompt, target_thread_id=target_thread_id)  # type: ignore[arg-type]
 
 
 async def get_mirror_guild(bot: CodexDiscordBot) -> discord.Guild:
@@ -2706,7 +2729,7 @@ def build_help() -> str:
             "!ask <prompt>",
             "",
             "Plain messages in mirrored Discord threads are sent to that Codex thread.",
-            "Slash commands: /help, /list, /archived_list, /use, /status, /doctor, /where, /context, /usage, /runners, /mirror_check, /new.",
+            "Slash commands: /help, /list, /archived_list, /use, /status, /doctor, /where, /context, /usage, /runners, /mirror_check, /new, /ask, /ask_ipc.",
         ]
     )
 
@@ -2816,6 +2839,22 @@ def register_commands(bot: CodexDiscordBot) -> None:
         await interaction.response.defer(thinking=True)
         exit_code, output = await run_discord_new_thread(bot, interaction.channel_id, prompt)
         await send_interaction_chunks(interaction, output, title="New", exit_code=exit_code)
+
+    @bot.tree.command(name="ask", description="Send a prompt to the mapped or selected Codex thread.")
+    async def slash_ask(interaction: discord.Interaction, prompt: str) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        await handle_slash_ask(interaction, prompt)
+
+    @bot.tree.command(name="ask_ipc", description="Alias of /ask.")
+    async def slash_ask_ipc(interaction: discord.Interaction, prompt: str) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        await handle_slash_ask(interaction, prompt)
 
     @bot.tree.command(name="mirror_check", description="Check Discord mirror mappings.")
     async def slash_mirror_check(interaction: discord.Interaction) -> None:

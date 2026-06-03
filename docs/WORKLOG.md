@@ -1,5 +1,27 @@
 # WORKLOG
 
+## 2026-06-03 11:53:56 +09:00
+- Goal: align Discord slash frontend with the documented ask flow.
+- Key assumptions:
+  - Discord docs and user expectations reference `/ask <prompt>`, but the adapter did not register slash `/ask`.
+  - Slash asks should reuse the existing plain-message ask/busy routing instead of creating a separate behavior path.
+- Changes:
+  - Added slash `/ask <prompt>` and `/ask_ipc <prompt>`.
+  - Routed slash asks through `handle_plain_ask()` using the interaction user/channel as the source message.
+  - Added an ephemeral slash acknowledgement so deferred interactions do not stay pending while progress is posted in-channel.
+  - Updated Discord help and README slash command lists.
+  - Added regression coverage for slash command registration and slash ask routing.
+- Abuse cases checked:
+  - Both slash commands use `check_interaction_allowed` before dispatching prompts.
+  - Project parent channels with multiple mirrored threads still return the existing anti-cross-targeting message instead of falling back to the selected thread.
+  - Busy controls inherit the interaction user as the original sender, preserving per-user button ownership.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 15 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/ask` input after deployment to prove live slash ack and busy routing.
+
 ## 2026-06-03 11:49:27 +09:00
 - Goal: keep Discord `/new` regression tests from polluting live bot logs.
 - Key assumptions:

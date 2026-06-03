@@ -12,9 +12,11 @@ import codex_discord_bot as bot
 class FakeFollowup:
     def __init__(self) -> None:
         self.messages: list[object] = []
+        self.kwargs: list[dict[str, object]] = []
 
-    async def send(self, content: str, view=None) -> None:
+    async def send(self, content: str, view=None, **kwargs) -> None:
         self.messages.append(content if view is None else (content, view))
+        self.kwargs.append(kwargs)
 
 
 class FakeResponse:
@@ -161,6 +163,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/usage", help_text)
         self.assertIn("/runners", help_text)
         self.assertIn("/new", help_text)
+        self.assertIn("/ask", help_text)
+        self.assertIn("/ask_ipc", help_text)
 
         source = Path(bot.__file__).read_text(encoding="utf-8")
         command_names = set(re.findall(r'@bot\.tree\.command\(name="([^"]+)"', source))
@@ -168,6 +172,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("usage", command_names)
         self.assertIn("runners", command_names)
         self.assertIn("new", command_names)
+        self.assertIn("ask", command_names)
+        self.assertIn("ask_ipc", command_names)
 
     async def test_send_interaction_chunks_logs_and_sends(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -372,6 +378,34 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.resolve_discord_new_thread_cwd = original_resolve_cwd
             bot.run_bridge_command = original_run_bridge_command
             bot.mirror_single_codex_thread = original_mirror_single
+
+    async def test_slash_ask_routes_to_existing_ask_flow(self) -> None:
+        original_get_mirrored = bot.get_mirrored_codex_thread_id
+        original_handle_plain_ask = bot.handle_plain_ask
+        calls: list[tuple[object, str, str | None]] = []
+
+        async def fake_handle_plain_ask(message, prompt, *, target_thread_id=None):
+            calls.append((message, prompt, target_thread_id))
+
+        try:
+            bot.get_mirrored_codex_thread_id = lambda channel_id: "thread-1"
+            bot.handle_plain_ask = fake_handle_plain_ask
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            interaction.channel = FakeTarget()
+
+            await bot.handle_slash_ask(interaction, "please run")
+
+            self.assertEqual(interaction.followup.messages, ["Ask handling posted in this channel."])
+            self.assertEqual(interaction.followup.kwargs, [{"ephemeral": True}])
+            self.assertEqual(len(calls), 1)
+            source_message, prompt, target_thread_id = calls[0]
+            self.assertEqual(prompt, "please run")
+            self.assertEqual(target_thread_id, "thread-1")
+            self.assertIs(source_message.channel, interaction.channel)
+            self.assertIs(source_message.author, interaction.user)
+        finally:
+            bot.get_mirrored_codex_thread_id = original_get_mirrored
+            bot.handle_plain_ask = original_handle_plain_ask
 
     def test_new_thread_cwd_prefers_mirrored_thread_cwd(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH
