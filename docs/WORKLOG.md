@@ -1156,3 +1156,30 @@
   - No command schema, mirror DB schema, or session behavior changed.
 - Unresolved:
   - Still needs fresh live Discord input/button interaction after deployment to prove end-to-end Discord behavior.
+
+## 2026-06-03 13:09 +09:00 - Discord busy button direct fallback
+- Goal: keep Discord busy-choice buttons visible when direct follow-up sends fail.
+- Key assumptions:
+  - Busy-choice button paths are public channel workflows and should not silently disappear after a deferred interaction.
+  - View-bearing fallback messages must preserve the replacement `BusyChoiceView`, not degrade to plain text.
+- Changes:
+  - Added `send_direct_followup` for short public button follow-ups, with channel fallback and sanitized failure logs.
+  - Routed direct `BusyChoiceView` follow-ups through the new helper:
+    - steering rejected for cross-thread messages
+    - steering busy failure re-shown as a new busy-choice view
+    - queue-next immediate acknowledgement
+    - queue-next queued acknowledgement
+  - Added regression tests for view fallback and `Steer now` busy fallback.
+- Abuse cases checked:
+  - Raw prompt/output leakage into logs: blocked by logging content length, context label, view flag, and exception type only.
+  - Oversized view fallback content causing Discord rejection: mitigated by `fit_single_message` when a view is attached.
+  - Accidental private disclosure: accepted only for existing public busy-choice button paths; helper should not be reused for ephemeral-only data without review.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (40 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - If a busy-choice follow-up webhook fails, the bot may post the public response or replacement busy-choice view in the channel.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord message/button interaction after deployment to prove end-to-end Discord behavior.

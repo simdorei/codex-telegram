@@ -307,6 +307,32 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("posting remaining response here", fallback_text)
         self.assertIn("sent=1", log_text)
 
+    async def test_send_direct_followup_falls_back_to_channel_with_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            interaction.followup = FailingFollowup()
+            interaction.channel = FakeTarget()
+            view = object()
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.send_direct_followup(
+                    interaction,
+                    "button view",
+                    view=view,
+                    log_prefix="button_followup",
+                    context="steer_busy_failure",
+                )
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(interaction.followup.messages, [])
+        self.assertEqual(len(interaction.channel.messages), 1)
+        content, sent_view = interaction.channel.messages[0]
+        self.assertIn("Discord follow-up delivery failed; posting response here.", content)
+        self.assertIn("button view", content)
+        self.assertIs(sent_view, view)
+        self.assertIn("button_followup_failed command=ask context=steer_busy_failure", log_text)
+        self.assertIn("button_followup_fallback_sent command=ask context=steer_busy_failure", log_text)
+
     async def test_on_message_logs_received_before_empty_content_ignore(self) -> None:
         client = SimpleNamespace(
             enable_prefix_commands=True,
@@ -580,6 +606,46 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(followup_view, bot.BusyChoiceView)
             self.assertEqual(followup_view.target_thread_id, "thread-1")
             self.assertNotIn("waiting on a follow-up", content.lower())
+            self.assertIn("busy_choice_sent reason=steer_busy_failure target=thread-1", log_text)
+        finally:
+            bot.run_steering_prompt = original_run_steering_prompt
+            bot.build_context_warning = original_build_context_warning
+
+    async def test_steer_now_busy_failure_falls_back_when_followup_fails(self) -> None:
+        original_run_steering_prompt = bot.run_steering_prompt
+        original_build_context_warning = bot.build_context_warning
+        try:
+            def fake_run_steering_prompt(prompt, target_thread_id):
+                return (
+                    1,
+                    "ERROR: The selected thread is still busy. Wait, switch to another thread.",
+                )
+
+            bot.run_steering_prompt = fake_run_steering_prompt
+            bot.build_context_warning = lambda target_thread_id: ""
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                message = FakeMessage()
+                view = bot.BusyChoiceView(message, "please steer", target_thread_id="thread-1")
+                button = next(item for item in view.children if getattr(item, "label", "") == "Steer now")
+                interaction = FakeInteraction(command_name="ask", channel_id=222)
+                interaction.followup = FailingFollowup()
+                interaction.channel = FakeTarget()
+
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await button.callback(interaction)
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(interaction.followup.messages, [])
+            self.assertEqual(len(interaction.channel.messages), 1)
+            content, fallback_view = interaction.channel.messages[0]
+            self.assertIn("Discord follow-up delivery failed; posting response here.", content)
+            self.assertIn("This Codex thread is already working.", content)
+            self.assertIsInstance(fallback_view, bot.BusyChoiceView)
+            self.assertEqual(fallback_view.target_thread_id, "thread-1")
+            self.assertIn("button_followup_failed command=ask context=steer_busy_failure", log_text)
+            self.assertIn("button_followup_fallback_sent command=ask context=steer_busy_failure", log_text)
             self.assertIn("busy_choice_sent reason=steer_busy_failure target=thread-1", log_text)
         finally:
             bot.run_steering_prompt = original_run_steering_prompt

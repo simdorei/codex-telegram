@@ -1124,6 +1124,50 @@ async def send_followup_chunks(
     )
 
 
+async def send_direct_followup(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    view=None,
+    log_prefix: str = "direct_followup",
+    context: str = "",
+) -> None:
+    command_name = get_interaction_command_name(interaction)
+    safe_context = format_discord_command_label(context, limit=80)
+    has_view = view is not None
+    failure: Exception | None = None
+    try:
+        await interaction.followup.send(content, view=view)
+        log_line(
+            f"{log_prefix}_sent command={command_name} context={safe_context or '-'} "
+            f"has_view={has_view} content_len={format_log_text_len(content)}"
+        )
+        return
+    except Exception as exc:
+        failure = exc
+        log_line(
+            f"{log_prefix}_failed command={command_name} context={safe_context or '-'} "
+            f"has_view={has_view} content_len={format_log_text_len(content)} "
+            f"error_type={type(exc).__name__}"
+        )
+    channel = getattr(interaction, "channel", None)
+    if channel is None or not hasattr(channel, "send"):
+        raise failure
+    prefix = "Discord follow-up delivery failed; posting response here."
+    try:
+        if has_view:
+            await channel.send(fit_single_message(f"{prefix}\n\n{content}"), view=view)
+        else:
+            await send_chunks(channel, f"{prefix}\n\n{content}")
+        log_line(
+            f"{log_prefix}_fallback_sent command={command_name} context={safe_context or '-'} "
+            f"has_view={has_view}"
+        )
+    except Exception:
+        log_line(f"{log_prefix}_fallback_failed\n" + traceback.format_exc())
+        raise
+
+
 async def run_interaction_bridge_and_send(
     interaction: discord.Interaction,
     argv: list[str],
@@ -2619,7 +2663,12 @@ class BusyChoiceView(discord.ui.View):
         except Exception:
             pass
         if not self.allow_steer:
-            await interaction.followup.send("This message targets a different Codex thread. Queue it instead.")
+            await send_direct_followup(
+                interaction,
+                "This message targets a different Codex thread. Queue it instead.",
+                log_prefix="button_followup",
+                context="steer_not_allowed",
+            )
             log_line(
                 f"steer_now_rejected user={interaction.user.id} "
                 f"target={self.target_thread_id or '-'} reason=not_allowed"
@@ -2639,7 +2688,8 @@ class BusyChoiceView(discord.ui.View):
             f"output_len={format_log_text_len(output)}"
         )
         if is_selected_thread_busy_error(exit_code, output):
-            await interaction.followup.send(
+            await send_direct_followup(
+                interaction,
                 build_busy_choice_message(self.prompt, self.target_thread_id),
                 view=BusyChoiceView(
                     self.message,
@@ -2647,6 +2697,8 @@ class BusyChoiceView(discord.ui.View):
                     target_thread_id=self.target_thread_id,
                     allow_steer=True,
                 ),
+                log_prefix="button_followup",
+                context="steer_busy_failure",
             )
             log_busy_choice_sent("steer_busy_failure", self.target_thread_id, self.prompt)
             log_line(
@@ -2684,7 +2736,12 @@ class BusyChoiceView(discord.ui.View):
                 f"target={self.target_thread_id or '-'} "
                 f"prompt_len={format_log_text_len(self.prompt)}"
             )
-            await interaction.followup.send("No active job now. Starting this message.")
+            await send_direct_followup(
+                interaction,
+                "No active job now. Starting this message.",
+                log_prefix="button_followup",
+                context="queue_next_immediate",
+            )
             log_line(
                 f"queue_next_immediate_sent user={interaction.user.id} "
                 f"target={self.target_thread_id or '-'}"
@@ -2714,7 +2771,12 @@ class BusyChoiceView(discord.ui.View):
             f"queue_next user={interaction.user.id} position={position} target={self.target_thread_id or '-'} "
             f"prompt_len={format_log_text_len(self.prompt)}"
         )
-        await interaction.followup.send(f"Queued at position {position}.")
+        await send_direct_followup(
+            interaction,
+            f"Queued at position {position}.",
+            log_prefix="button_followup",
+            context="queue_next",
+        )
         log_line(
             f"queue_next_sent user={interaction.user.id} position={position} "
             f"target={self.target_thread_id or '-'}"
