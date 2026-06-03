@@ -1,5 +1,23 @@
 # WORKLOG
 
+## 2026-06-03 11:17:29 +09:00
+- Goal: lock slash/prefix mapped-thread targeting for Discord status/archive helpers.
+- Key assumptions:
+  - In mirrored Discord threads, commands without an explicit ref should target the mapped Codex thread id.
+  - This target resolution is shared by prefix `!status`, prefix `!archive`, and slash `/status`.
+- Changes:
+  - Added a regression test for `resolve_discord_thread_target_args()` returning `--thread-id` for a mapped Discord thread.
+- Abuse cases checked:
+  - Test uses a temporary mirror DB only and does not call Discord APIs.
+  - Test does not invoke bridge commands or mutate Codex state.
+  - No externally reachable behavior changed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 9 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/status` or `!status` input after deployment to prove live mapped-thread targeting.
+
 ## 2026-06-03 11:15:25 +09:00
 - Goal: lock `!new` cwd routing for mirrored Discord threads and project channels.
 - Key assumptions:

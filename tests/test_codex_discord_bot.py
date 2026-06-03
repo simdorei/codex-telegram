@@ -96,6 +96,30 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 bot.MIRROR_DB_PATH = old_db_path
 
+    def test_discord_thread_target_args_prefer_mapped_thread(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                bot.init_mirror_db()
+                with sqlite3.connect(bot.MIRROR_DB_PATH) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO mirror_threads (
+                            codex_thread_id, project_key, thread_title,
+                            discord_channel_id, discord_thread_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("thread-1", "project", "title", 111, 222, 1.0),
+                    )
+
+                self.assertEqual(
+                    bot.resolve_discord_thread_target_args(222, None),
+                    ["--thread-id", "thread-1"],
+                )
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
     def test_choice_views_claim_once_and_disable_buttons(self) -> None:
         input_view = bot.InputChoiceView("thread-1", [("1", "First"), ("2", "Second")])
         self.assertTrue(input_view.claim())
