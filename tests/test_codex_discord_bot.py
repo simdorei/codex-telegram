@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -436,6 +437,10 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         fake_client.format_socket_interaction_user = (
             lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
         )
+        async def fake_log_socket_payload(payload):
+            await bot.CodexDiscordBot.log_socket_payload(fake_client, payload)
+
+        fake_client.log_socket_payload = fake_log_socket_payload
 
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "discord-smoke.log"
@@ -456,6 +461,36 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("content_len=16", log_text)
         self.assertNotIn("sensitive prompt", log_text)
 
+    async def test_socket_raw_receive_dispatches_gateway_payload(self) -> None:
+        fake_client = SimpleNamespace(
+            is_allowed_channel=lambda channel_id: channel_id == 222,
+        )
+        fake_client.format_socket_interaction_user = (
+            lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
+        )
+        async def fake_log_socket_payload(payload):
+            await bot.CodexDiscordBot.log_socket_payload(fake_client, payload)
+
+        fake_client.log_socket_payload = fake_log_socket_payload
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            payload = {
+                "t": "MESSAGE_CREATE",
+                "d": {
+                    "channel_id": "222",
+                    "guild_id": "111",
+                    "content": "raw message",
+                    "author": {"id": "999", "bot": False},
+                },
+            }
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.CodexDiscordBot.on_socket_raw_receive(fake_client, json.dumps(payload))
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("socket_message_create channel=222 tracked=True", log_text)
+        self.assertNotIn("raw message", log_text)
+
     async def test_socket_message_create_untracked_omits_author_and_content_len(self) -> None:
         fake_client = SimpleNamespace(
             is_allowed_channel=lambda channel_id: False,
@@ -463,6 +498,10 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         fake_client.format_socket_interaction_user = (
             lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
         )
+        async def fake_log_socket_payload(payload):
+            await bot.CodexDiscordBot.log_socket_payload(fake_client, payload)
+
+        fake_client.log_socket_payload = fake_log_socket_payload
         old_db_path = bot.MIRROR_DB_PATH
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
@@ -495,6 +534,10 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         fake_client.format_socket_interaction_user = (
             lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
         )
+        async def fake_log_socket_payload(payload):
+            await bot.CodexDiscordBot.log_socket_payload(fake_client, payload)
+
+        fake_client.log_socket_payload = fake_log_socket_payload
 
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "discord-smoke.log"

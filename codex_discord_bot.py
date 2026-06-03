@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import hashlib
 import io
+import json
 import os
 import re
 import sqlite3
@@ -1198,7 +1199,22 @@ class CodexDiscordBot(discord.Client):
         if getattr(interaction, "type", None) == discord.InteractionType.component:
             asyncio.create_task(report_unhandled_component_interaction(interaction))
 
+    async def on_socket_raw_receive(self, message: str | bytes) -> None:
+        try:
+            if isinstance(message, bytes):
+                raw_text = message.decode("utf-8", errors="replace")
+            else:
+                raw_text = str(message)
+            payload = json.loads(raw_text)
+        except Exception:
+            return
+        if isinstance(payload, dict):
+            await self.log_socket_payload(payload)
+
     async def on_socket_response(self, payload: dict[str, object]) -> None:
+        await self.log_socket_payload(payload)
+
+    async def log_socket_payload(self, payload: dict[str, object]) -> None:
         event_type = str(payload.get("t") or "")
         data = payload.get("d")
         if not isinstance(data, dict):

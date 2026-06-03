@@ -1337,7 +1337,7 @@
   - Startup probes proved channel/thread visibility, so the next useful evidence is whether raw `MESSAGE_CREATE` and `INTERACTION_CREATE` events arrive.
   - Raw diagnostics must not log message text or arbitrary option values.
 - Changes:
-  - Added `on_socket_response` diagnostics for `MESSAGE_CREATE` and `INTERACTION_CREATE`.
+  - Added raw gateway payload diagnostics for `MESSAGE_CREATE` and `INTERACTION_CREATE`.
   - Tracked message events log channel, guild, author ID, bot flag, and `content_len` only.
   - Untracked message events log only channel and guild, omitting author and content length.
   - Interaction events log channel, guild, user ID, type, and sanitized command/custom ID.
@@ -1353,6 +1353,29 @@
   - `git diff --check`
 - Side effects:
   - Runtime logs now include raw gateway diagnostics for Discord message and interaction creation events.
+  - No command schema, mirror DB schema, session behavior, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord message/slash/button activity after deployment to prove whether gateway events arrive in the server.
+
+## 2026-06-03 13:55 +09:00 - Discord raw receive hook correction
+- Goal: ensure raw gateway diagnostics attach to the actual discord.py 2.7.1 event hook.
+- Key assumptions:
+  - discord.py 2.7.1 dispatches raw gateway payloads through `on_socket_raw_receive`, not `on_socket_response`.
+  - Keeping the existing structured payload logger behind both entry points is useful for tests and compatibility.
+- Changes:
+  - Added `on_socket_raw_receive` with JSON parsing and shared payload logging.
+  - Moved raw gateway logging into `log_socket_payload`.
+  - Added a regression test proving a raw JSON gateway payload reaches the diagnostic logger.
+- Abuse cases checked:
+  - Malformed raw payloads causing runtime errors: blocked by parse failure return.
+  - Raw payload body leaking into logs on parse failure: blocked by not logging malformed raw text.
+  - Diagnostic behavior diverging between test and runtime entry points: mitigated by shared `log_socket_payload`.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (55 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Runtime now observes actual raw gateway receives in discord.py 2.7.1.
   - No command schema, mirror DB schema, session behavior, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord message/slash/button activity after deployment to prove whether gateway events arrive in the server.
