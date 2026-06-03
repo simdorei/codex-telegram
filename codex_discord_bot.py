@@ -2642,6 +2642,10 @@ class BusyChoiceView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.message.author.id:
             return True
+        log_line(
+            f"busy_choice_denied user={interaction.user.id} "
+            f"owner={self.message.author.id} target={self.target_thread_id or '-'}"
+        )
         await interaction.response.send_message("Only the original sender can choose this.", ephemeral=True)
         return False
 
@@ -2655,6 +2659,10 @@ class BusyChoiceView(discord.ui.View):
     @discord.ui.button(label="Steer now", style=discord.ButtonStyle.primary)
     async def steer_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not self.claim():
+            log_line(
+                f"busy_choice_already_handled action=steer_now user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'}"
+            )
             await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
@@ -2719,6 +2727,10 @@ class BusyChoiceView(discord.ui.View):
     @discord.ui.button(label="Queue next", style=discord.ButtonStyle.secondary)
     async def queue_next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not self.claim():
+            log_line(
+                f"busy_choice_already_handled action=queue_next user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'}"
+            )
             await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
@@ -2785,11 +2797,21 @@ class BusyChoiceView(discord.ui.View):
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.danger)
     async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not self.claim():
+            log_line(
+                f"busy_choice_already_handled action=ignore user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'}"
+            )
             await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
             return
-        log_line(f"ignore_busy_prompt user={interaction.user.id}")
+        log_line(
+            f"ignore_busy_prompt user={interaction.user.id} "
+            f"target={self.target_thread_id or '-'}"
+        )
         await interaction.response.send_message("Ignored.")
-        log_line(f"ignore_busy_prompt_sent user={interaction.user.id}")
+        log_line(
+            f"ignore_busy_prompt_sent user={interaction.user.id} "
+            f"target={self.target_thread_id or '-'}"
+        )
         try:
             await interaction.message.edit(view=self)
         except Exception:

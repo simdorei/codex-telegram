@@ -216,6 +216,39 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(busy_view.claim())
         self.assertTrue(all(getattr(item, "disabled", False) for item in busy_view.children))
 
+    async def test_busy_choice_denied_user_is_logged(self) -> None:
+        message = FakeMessage()
+        view = bot.BusyChoiceView(message, "please steer", target_thread_id="thread-1")
+        interaction = FakeInteraction(command_name="ask", channel_id=222)
+        interaction.user = SimpleNamespace(id=999)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                allowed = await view.interaction_check(interaction)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertFalse(allowed)
+        self.assertEqual(interaction.response.messages, ["Only the original sender can choose this."])
+        self.assertIn("busy_choice_denied user=999 owner=242286902982606848 target=thread-1", log_text)
+
+    async def test_busy_choice_duplicate_click_is_logged(self) -> None:
+        message = FakeMessage()
+        view = bot.BusyChoiceView(message, "please steer", target_thread_id="thread-1")
+        self.assertTrue(view.claim())
+        button = next(item for item in view.children if getattr(item, "label", "") == "Queue next")
+        interaction = FakeInteraction(command_name="ask", channel_id=222)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await button.callback(interaction)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(interaction.response.messages, ["This busy choice was already handled."])
+        self.assertIn("busy_choice_already_handled action=queue_next", log_text)
+        self.assertIn("target=thread-1", log_text)
+
     def test_fit_single_message_truncates_to_discord_limit(self) -> None:
         fitted = bot.fit_single_message("x" * 4100)
         self.assertLessEqual(len(fitted), bot.DISCORD_MAX_LEN)

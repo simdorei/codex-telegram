@@ -1205,3 +1205,27 @@
   - No command schema, mirror DB schema, or session behavior changed.
 - Unresolved:
   - Still needs fresh live Discord slash/message/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 13:16 +09:00 - Discord busy button observability
+- Goal: distinguish busy-choice button hook failures from owner/duplicate/ignore handling.
+- Key assumptions:
+  - Rejected or repeated button clicks can look like a broken frontend unless runtime logs identify the reason.
+  - Busy-choice logs should identify state transitions without storing prompt text.
+- Changes:
+  - Added sanitized logs for busy-choice owner denial.
+  - Added sanitized logs for repeated `Steer now`, `Queue next`, and `Ignore` clicks after the view is claimed.
+  - Added target-aware logs for `Ignore` acknowledgement.
+  - Added regression tests for owner denial and duplicate click logging.
+- Abuse cases checked:
+  - Prompt leakage into logs: blocked; logs include user/owner IDs, target ID, and action only.
+  - Button hijacking by another user: unchanged structurally; owner check still denies before action execution.
+  - Replay/double-click confusion: mitigated by logging repeated clicks while preserving single-claim behavior.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (44 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Runtime logs now include sanitized busy-choice denial/replay events.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord message/button activity after deployment to prove end-to-end behavior.
