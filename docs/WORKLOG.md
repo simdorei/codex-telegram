@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 11:15:25 +09:00
+- Goal: lock `!new` cwd routing for mirrored Discord threads and project channels.
+- Key assumptions:
+  - `!new` in a mirrored Discord thread should create the Codex thread in that mapped thread's cwd.
+  - `!new` in a mirrored project channel should fall back to the mirrored project path when no thread cwd applies.
+- Changes:
+  - Added regression tests for `resolve_discord_new_thread_cwd()` mirrored-thread cwd priority.
+  - Added regression tests for project-channel cwd fallback.
+- Abuse cases checked:
+  - Tests use temporary mirror DB rows and temporary directories only.
+  - Tests patch `bridge.choose_thread` locally and restore it, avoiding Codex state mutation.
+  - No new externally reachable behavior is exposed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 8 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `!new` input after deployment to prove live cwd behavior.
+
 ## 2026-06-03 11:12:54 +09:00
 - Goal: lock the busy-thread Discord frontend behavior that originally regressed.
 - Key assumptions:
