@@ -1,5 +1,23 @@
 # WORKLOG
 
+## 2026-06-03 10:13:30 +09:00
+- Goal: make Discord steering and slash-command failures diagnosable after the busy-thread UI stabilization.
+- Key assumptions:
+  - Mirrored Discord threads and the `Codex` category should be accepted for slash-command checks the same way prefix/plain-message handling accepts them.
+  - Steering failures need file-log evidence because Discord follow-up messages are not otherwise recoverable from the local repo.
+- Changes:
+  - Added result logging for streaming asks, steering button submissions, approval replies, and input replies.
+  - Broadened slash-command authorization to allow mirrored/category channels after the user allowlist check passes.
+- Abuse cases checked:
+  - Unauthorized users invoking slash commands: still blocked by `DISCORD_ALLOWED_USER_IDS` before channel checks.
+  - Slash commands in unrelated channels: still rejected unless the channel is allowlisted, mirrored, or under the `Codex` category.
+  - Sensitive prompt contents in logs: logging is capped to short prefixes, but prompts/output can still contain user text and remain a local operational risk.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - Function smoke for direct allowlist, mirrored/category channel allowance, and user allowance.
+- Unresolved items:
+  - Live slash-command and steering-button click smoke still depends on a new Discord interaction after this patch is deployed.
+
 ## 2026-06-03 10:10:00 +09:00
 - Goal: stabilize the Discord-facing Codex control flow for busy-thread steering and new-thread placement.
 - Key assumptions:

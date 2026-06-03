@@ -1800,6 +1800,11 @@ async def run_prompt_and_send(
         relay,
         target_thread_id=target_thread_id,
     )
+    log_line(
+        f"ask_stream_done exit={exit_code} target={target_thread_id or '-'} "
+        f"sent_live={relay.sent_live} final={relay.saw_final} aborted={relay.saw_aborted} "
+        f"timeout={relay.saw_timeout} output={(output or '')[:500].replace(chr(10), ' ')}"
+    )
     if relay.sent_live:
         if exit_code == 0 and not relay.saw_aborted:
             await channel.send("Done.")
@@ -1920,11 +1925,21 @@ async def submit_interactive_reply(
 ) -> None:
     if state == INTERACTIVE_STATE_APPROVAL:
         exit_code, output = await asyncio.to_thread(submit_approval_reply, target_thread_id, answer)
+        log_line(
+            f"approval_reply_done exit={exit_code} target={target_thread_id} "
+            f"answer={answer[:40].replace(chr(10), ' ')} "
+            f"output={(output or '')[:300].replace(chr(10), ' ')}"
+        )
         title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
         await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
         return
     if state == INTERACTIVE_STATE_INPUT:
         exit_code, output = await asyncio.to_thread(submit_input_reply, target_thread_id, answer)
+        log_line(
+            f"input_reply_done exit={exit_code} target={target_thread_id} "
+            f"answer={answer[:40].replace(chr(10), ' ')} "
+            f"output={(output or '')[:300].replace(chr(10), ' ')}"
+        )
         title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
         await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
         return
@@ -2038,6 +2053,10 @@ class BusyChoiceView(discord.ui.View):
             run_steering_prompt,
             self.prompt,
             self.target_thread_id,
+        )
+        log_line(
+            f"steer_now_done exit={exit_code} target={self.target_thread_id or '-'} "
+            f"output={(output or '')[:500].replace(chr(10), ' ')}"
         )
         title = "Steering sent" if exit_code == 0 else f"Steering failed (exit {exit_code})"
         await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
@@ -2400,7 +2419,14 @@ def register_commands(bot: CodexDiscordBot) -> None:
 
 
 def check_interaction_allowed(bot: CodexDiscordBot, interaction: discord.Interaction) -> bool:
-    return bot.is_allowed_channel(interaction.channel_id) and bot.is_allowed_user(interaction.user.id)
+    if not bot.is_allowed_user(interaction.user.id):
+        return False
+    if bot.is_allowed_channel(interaction.channel_id):
+        return True
+    channel = interaction.channel
+    if channel is not None and bot.is_allowed_message_channel(channel):
+        return True
+    return False
 
 
 def build_parser() -> argparse.ArgumentParser:
