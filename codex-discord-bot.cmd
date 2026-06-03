@@ -76,6 +76,6 @@ if exist "%PID_FILE%" (
   exit /b 1
 )
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$procs=Get-CimInstance Win32_Process; $cmdParents=@{}; foreach ($p in $procs) { if ($p.Name -eq 'cmd.exe') { $cmdParents[[int]$p.ProcessId]=$true } }; foreach ($p in $procs) { if (($p.Name -eq 'py.exe' -or $p.Name -eq 'python.exe') -and $cmdParents.ContainsKey([int]$p.ParentProcessId)) { exit 0 } }; exit 1" >nul 2>nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$script=$env:SCRIPT; if (-not $script) { exit 1 }; $needle=$script.ToLowerInvariant(); foreach ($p in Get-CimInstance Win32_Process) { $cmd=[string]$p.CommandLine; if (($p.Name -eq 'py.exe' -or $p.Name -eq 'python.exe' -or $p.Name -eq 'pythonw.exe') -and $cmd.ToLowerInvariant().Contains($needle)) { exit 0 } }; exit 1" >nul 2>nul
 if not errorlevel 1 exit /b 0
 exit /b 1

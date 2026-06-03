@@ -300,7 +300,7 @@ CODEX_DESKTOP_EXE_ENV = "CODEX_DESKTOP_EXE"
 CODEX_APP_SERVER_EXE = os.environ.get(CODEX_APP_SERVER_EXE_ENV, "").strip()
 SINGLE_BACKUP_LOG_LIMIT_BYTES = 500 * 1024
 IPC_PROBE_LOG_PATH = SCRIPT_DIR / "_ipc_probe_log.jsonl"
-HIGH_CONTEXT_INPUT_RATIO_THRESHOLD = 0.60
+HIGH_CONTEXT_INPUT_RATIO_THRESHOLD = 0.70
 CRITICAL_CONTEXT_INPUT_RATIO_THRESHOLD = 0.80
 ARCHIVE_RECOMMEND_TOKENS_USED_THRESHOLD = 50_000_000
 ARCHIVE_RECOMMEND_CONTEXT_TOKENS_THRESHOLD = 200_000
@@ -479,6 +479,9 @@ class ThreadContextUsage:
     peak_input_tokens: int
     peak_total_tokens: int
     usage_ratio: float
+    inferred_compactions: int = 0
+    last_compaction_before_input_tokens: int = 0
+    last_compaction_after_input_tokens: int = 0
 
 
 @dataclass
@@ -1295,6 +1298,10 @@ def get_thread_context_usage(thread: ThreadInfo) -> ThreadContextUsage | None:
     last_total_tokens = 0
     peak_input_tokens = 0
     peak_total_tokens = 0
+    previous_input_tokens = 0
+    inferred_compactions = 0
+    last_compaction_before_input_tokens = 0
+    last_compaction_after_input_tokens = 0
     saw_token_count = False
 
     for event in iter_session_events(session_path):
@@ -1322,6 +1329,17 @@ def get_thread_context_usage(thread: ThreadInfo) -> ThreadContextUsage | None:
             saw_token_count = True
             last_input_tokens = coerce_nonnegative_int(last_usage.get("input_tokens"))
             last_total_tokens = coerce_nonnegative_int(last_usage.get("total_tokens"))
+            if (
+                previous_input_tokens >= 50_000
+                and last_input_tokens > 0
+                and last_input_tokens < previous_input_tokens * 0.80
+                and previous_input_tokens - last_input_tokens >= 25_000
+            ):
+                inferred_compactions += 1
+                last_compaction_before_input_tokens = previous_input_tokens
+                last_compaction_after_input_tokens = last_input_tokens
+            if last_input_tokens > 0:
+                previous_input_tokens = last_input_tokens
             peak_input_tokens = max(peak_input_tokens, last_input_tokens)
             peak_total_tokens = max(peak_total_tokens, last_total_tokens)
 
@@ -1336,6 +1354,9 @@ def get_thread_context_usage(thread: ThreadInfo) -> ThreadContextUsage | None:
         peak_input_tokens=peak_input_tokens,
         peak_total_tokens=peak_total_tokens,
         usage_ratio=usage_ratio,
+        inferred_compactions=inferred_compactions,
+        last_compaction_before_input_tokens=last_compaction_before_input_tokens,
+        last_compaction_after_input_tokens=last_compaction_after_input_tokens,
     )
 
 
@@ -3219,6 +3240,7 @@ def watch_for_final_answer(
     seen_agent_messages: set[str] = set()
     seen_interactive_notices: set[str] = set()
     did_stream_live = False
+    did_stream_final_live = False
 
     while deadline is None or time.time() < deadline:
         events, cursor = read_new_session_events(session_path, cursor)
@@ -3250,6 +3272,7 @@ def watch_for_final_answer(
                     "commentary": commentary,
                     "final_answer": final_answer,
                     "streamed_live": did_stream_live,
+                    "final_streamed_live": did_stream_final_live,
                 }
 
             if event.get("type") != "response_item":
@@ -3300,6 +3323,7 @@ def watch_for_final_answer(
                 final_answer = text
                 if stream_live:
                     did_stream_live = True
+                    did_stream_final_live = True
                     with PRINT_LOCK:
                         prefix = f"{stream_label} " if stream_label else ""
                         print(f"{prefix}[final_answer]")
@@ -3310,6 +3334,7 @@ def watch_for_final_answer(
                     "commentary": commentary,
                     "final_answer": final_answer,
                     "streamed_live": did_stream_live,
+                    "final_streamed_live": did_stream_final_live,
                 }
 
             if include_commentary and phase == "commentary":
@@ -3330,6 +3355,7 @@ def watch_for_final_answer(
         "commentary": commentary,
         "final_answer": final_answer,
         "streamed_live": did_stream_live,
+        "final_streamed_live": did_stream_final_live,
     }
 
 
@@ -5796,7 +5822,7 @@ def command_ask(args: argparse.Namespace) -> int:
                 print("")
 
         if result["final_answer"]:
-            if result.get("streamed_live"):
+            if result.get("final_streamed_live"):
                 print("[ready]")
             else:
                 print("[final_answer]")

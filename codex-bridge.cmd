@@ -76,7 +76,7 @@ if not exist "%TELEGRAM_PY%" exit /b 0
 
 set "HAS_TELEGRAM_TOKEN="
 if defined TELEGRAM_BOT_TOKEN set "HAS_TELEGRAM_TOKEN=1"
-if not defined HAS_TELEGRAM_TOKEN findstr /R /I /C:"^[ ]*TELEGRAM_BOT_TOKEN[ ]*=" "%ENV_FILE%" >nul 2>nul && set "HAS_TELEGRAM_TOKEN=1"
+if not defined HAS_TELEGRAM_TOKEN call :env_has_value "TELEGRAM_BOT_TOKEN" && set "HAS_TELEGRAM_TOKEN=1"
 if not defined HAS_TELEGRAM_TOKEN exit /b 0
 
 set "TELEGRAM_PYTHON_EXE=%PYTHON_EXE%"
@@ -97,8 +97,14 @@ if not exist "%TELEGRAM_PY%" exit /b 0
 
 set "HAS_TELEGRAM_TOKEN="
 if defined TELEGRAM_BOT_TOKEN set "HAS_TELEGRAM_TOKEN=1"
-if not defined HAS_TELEGRAM_TOKEN findstr /R /I /C:"^[ ]*TELEGRAM_BOT_TOKEN[ ]*=" "%ENV_FILE%" >nul 2>nul && set "HAS_TELEGRAM_TOKEN=1"
+if not defined HAS_TELEGRAM_TOKEN call :env_has_value "TELEGRAM_BOT_TOKEN" && set "HAS_TELEGRAM_TOKEN=1"
 if not defined HAS_TELEGRAM_TOKEN exit /b 0
 
 start "Codex Telegram Bot" /min %PY_LAUNCHER% "%TELEGRAM_PY%" --skip-old-updates
 exit /b 0
+
+:env_has_value
+if not exist "%ENV_FILE%" exit /b 1
+set "CHECK_ENV_NAME=%~1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$name=$env:CHECK_ENV_NAME; $path=$env:ENV_FILE; if (-not $name -or -not (Test-Path -LiteralPath $path)) { exit 1 }; $line=Get-Content -LiteralPath $path | Where-Object { $_ -match ('^\s*' + [regex]::Escape($name) + '\s*=') } | Select-Object -First 1; if (-not $line) { exit 1 }; $value=($line -split '=',2)[1].Trim() -replace '^[\x22'']+|[\x22'']+$',''; if ($value.Trim()) { exit 0 }; exit 1" >nul 2>nul
+exit /b %errorlevel%

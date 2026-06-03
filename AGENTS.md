@@ -12,6 +12,14 @@ Make the smallest safe change that solves the requested problem without breaking
 - If the root cause is uncertain, do not guess. First identify the likely cause from code evidence.
 - If multiple files may be affected, explain the dependency briefly before patching.
 
+## Design Principles
+- Keep feature cohesion high: code that changes together should live together.
+- Keep coupling low: avoid making unrelated features depend on each other's internals.
+- Keep one module/function responsible for one clear job whenever practical.
+- Prefer explicit boundaries between Discord UI handling, Codex bridge/session logic, persistence, and QA helpers.
+- Do not trade away existing behavior for a new feature; every patch should preserve or improve the current user-facing flow.
+- When a larger rewrite is justified, move in reviewable slices with tests that protect the old behavior before replacing it.
+
 ## Patch Policy
 - One patch should solve one clear problem.
 - Avoid opportunistic cleanup.

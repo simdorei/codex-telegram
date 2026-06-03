@@ -34,8 +34,8 @@ py -3 -m pip install -r requirements.txt
 
 ## Current Version
 
-- Patch level: `2026.04.18-1`
-- This README reflects the current bridge and Telegram patch set in this workspace.
+- Patch level: `2026.06.03-1`
+- This README reflects the current bridge, Telegram, and Discord patch set in this workspace.
 
 ## Current Patch Summary
 
@@ -48,6 +48,7 @@ Compared with the last committed baseline, the current patch set adds or stabili
 - Codex Desktop executable discovery and restart via `discover_codex`, `/discover_codex`, `restart_codex`, and `/restart_codex`
 - Telegram live approval handling for `waiting-approval` threads with visible `1 / 2 / 3` choices
 - Discord project/channel mirroring, per-thread routing, queued steering, approval/input buttons, and mirror diagnostics
+- Discord `Steer now` streaming, typing indicators while Codex is working, and `!context` compaction/status visibility
 - Telegram follow-up delivery after approval replies so the post-approval result message is forwarded back into chat
 - Telegram follow mode now forwards approval prompts directly instead of requiring a manual `/list` and `/use` refresh
 - after `/restart_codex`, reopen the target thread with `/open <ref>` before asking if you need visible-thread/live IPC recovery
@@ -67,6 +68,12 @@ Compared with the last committed baseline, the current patch set adds or stabili
 
 If `TELEGRAM_BOT_TOKEN` is configured in `.env`, `codex-bridge.cmd` also starts the Telegram adapter automatically.
 
+Start the Discord adapter separately when `DISCORD_BOT_TOKEN` is configured:
+
+```powershell
+.\codex-discord-bot.cmd
+```
+
 Optional launcher flags:
 
 - `.\codex-bridge.cmd --no-bot`
@@ -82,8 +89,16 @@ TELEGRAM_ALLOWED_CHAT_IDS=
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 DISCORD_ALLOWED_CHANNEL_IDS=
+DISCORD_ALLOWED_USER_IDS=
+DISCORD_ALLOW_ALL_CHANNELS=0
 DISCORD_STARTUP_CHANNEL_ID=
+DISCORD_STARTUP_NOTIFY=1
+DISCORD_ENABLE_MESSAGE_CONTENT=1
+DISCORD_ENABLE_QA_COMMANDS=0
 DISCORD_HISTORY_POLL_SECONDS=15
+DISCORD_HISTORY_BOOTSTRAP_LOOKBACK_SECONDS=120
+DISCORD_STEERING_DELIVERY_CONFIRM_TIMEOUT_SECONDS=25
+DISCORD_STEERING_PENDING_WATCH_TIMEOUT_SECONDS=120
 CODEX_DISCORD_LOG_PATH=
 CODEX_HOME=
 CODEX_DESKTOP_EXE=
@@ -97,9 +112,17 @@ Important variables:
 - `TELEGRAM_ALLOWED_CHAT_IDS`: optional allowlist of Telegram chat IDs
 - `DISCORD_BOT_TOKEN`: required for Discord mode
 - `DISCORD_GUILD_ID`: optional guild/server ID for faster slash-command sync
-- `DISCORD_ALLOWED_CHANNEL_IDS`: optional allowlist of Discord channel/thread IDs
+- `DISCORD_ALLOWED_CHANNEL_IDS`: allowlist of Discord channel/thread IDs; required unless `DISCORD_ALLOW_ALL_CHANNELS=1`
+- `DISCORD_ALLOWED_USER_IDS`: optional allowlist of Discord user IDs
+- `DISCORD_ALLOW_ALL_CHANNELS`: set `1` only for a private test server where every channel is safe for Codex control
 - `DISCORD_STARTUP_CHANNEL_ID`: optional channel ID for startup notifications
+- `DISCORD_STARTUP_NOTIFY`: set `1` to send an online notification at startup
+- `DISCORD_ENABLE_MESSAGE_CONTENT`: set `0` to disable prefix/plain-message handling and use slash commands only
+- `DISCORD_ENABLE_QA_COMMANDS`: set `1` to expose Discord QA smoke commands such as `!qa buttons` and `/qa_buttons`
 - `DISCORD_HISTORY_POLL_SECONDS`: optional fallback interval for checking recent allowed/mirrored channel history; set `0` to disable
+- `DISCORD_HISTORY_BOOTSTRAP_LOOKBACK_SECONDS`: optional startup lookback window for recent history polling
+- `DISCORD_STEERING_DELIVERY_CONFIRM_TIMEOUT_SECONDS`: optional extra wait for delayed Codex IPC steering delivery confirmation
+- `DISCORD_STEERING_PENDING_WATCH_TIMEOUT_SECONDS`: optional max wait for a steering watch after IPC accepted delivery but local recording lagged
 - `CODEX_DISCORD_LOG_PATH`: optional Discord adapter log path override, useful for smoke tests or isolated diagnostics
 - `CODEX_HOME`: override default Codex state directory if needed
 - `CODEX_DESKTOP_EXE`: optional override for the Codex Desktop app executable. `/discover_codex` or `/restart_codex` auto-save it into `.env` when discovery succeeds.
@@ -135,17 +158,20 @@ python -c "import sys; print(sys.executable)"
 Example `.env` with explicit paths:
 
 ```env
-TELEGRAM_BOT_TOKEN=123456:example-token
+TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_CHAT_IDS=123456789
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 DISCORD_ALLOWED_CHANNEL_IDS=
+DISCORD_ALLOWED_USER_IDS=
+DISCORD_ALLOW_ALL_CHANNELS=0
 CODEX_HOME=C:\Users\your_user\.codex
 PYTHON_EXE=C:\python\python.exe
 CODEX_BRIDGE_AUTO_START_TELEGRAM=1
 ```
 
 After editing `.env`, restart the running bridge/bot process so the new values are loaded.
+Put your real bot token only in the local `.env` file. Do not commit token values.
 
 Advanced overrides used by the bridge:
 
@@ -188,6 +214,16 @@ Registered Discord slash commands:
 
 - `/help`, `/list`, `/archived_list`, `/use`, `/status`, `/doctor`, `/where`, `/context`, `/usage`, `/runners`, `/mirror_check`, `/new`, `/ask`, `/ask_ipc`
 
+Optional Discord QA commands:
+
+- set `DISCORD_ENABLE_QA_COMMANDS=1` to expose `!qa buttons` and `/qa_buttons`
+- use them only in a test channel; they create temporary Discord button messages and clear their controls during the smoke test
+- button QA covers busy-choice `Ignore`, stale/missing busy controls, synthetic `Steer now`, persistent approval, and persistent input-choice handlers without submitting a real Codex prompt
+- `!steer <prompt>` is also exposed only when QA commands are enabled; it is a text-path smoke test for the same steering backend, not the normal user workflow
+- persistent approval/input fallback buttons are single-use per Discord message, so replayed or double-clicked restart buttons do not submit twice
+- startup cleanup removes stale busy-choice buttons whose backing DB records expired or were already handled, while preserving active in-flight controls
+- `/doctor` reports whether QA commands are enabled, persistent component claim counts, the last button QA result, and last steering-button elapsed time from the Discord log
+
 Messages inside a mirrored Discord thread are sent to that Codex thread. If a Discord project channel has multiple Codex threads, plain messages in the parent channel are blocked so they do not accidentally fall back to the selected Codex thread.
 
 ## Telegram-First Flow
@@ -199,47 +235,34 @@ Recommended Telegram workflow:
 3. Optional: `/open <ref>` if you need the visible Codex UI thread, or if you just ran `/restart_codex`
 4. Send plain text or `/ask <prompt>`
 
-권장 텔레그램 흐름:
-
-1. `/list`
-2. `/use <ref>`
-3. 일반 텍스트 또는 `/ask <prompt>` 전송
-
 Plain text messages are treated like `/ask <message>`, except for interactive states:
 
 - if the selected thread is `waiting-input`, plain text replies to that prompt
 - if the selected thread is `waiting-approval`, reply with the visible `1`, `2`, or `3` option
 
-일반 텍스트 메시지는 기본적으로 `/ask <message>`처럼 처리되지만, 상호작용 상태에서는 다르게 동작합니다.
-
-- 선택한 스레드가 `waiting-input`이면 일반 텍스트가 그 입력에 대한 답변으로 전달됩니다.
-- 선택한 스레드가 `waiting-approval`이면 화면에 보이는 `1`, `2`, `3` 중 하나로 응답합니다.
-
 `/use` only stores the default target thread. `/open` actually opens that thread in the visible Codex UI.
 
 After `/restart_codex`, run `/open <ref>` again before asking if you want live IPC / follow / approval visibility to recover reliably. `/use` alone does not reopen the Codex UI thread after restart.
 
-텔레그램에서는 더 이상 `/open`을 쓰지 않습니다. `/use`로 대상 스레드를 선택한 뒤 그 스레드에 질문을 보냅니다.
-
 ## Telegram Menu
 
-| Command | English | 한국어 |
-| --- | --- | --- |
-| `/list [limit]` | Show recent active threads and states such as `idle`, `busy`, `waiting-input`, `waiting-approval`. | 최근 활성 스레드와 상태(`idle`, `busy`, `waiting-input`, `waiting-approval`)를 보여줍니다. |
-| `/archived_list [limit]` | Show archived threads. | 보관된 스레드를 보여줍니다. |
-| `/new <prompt>` | Create a new thread and send the first prompt. | 새 스레드를 만들고 첫 질문을 보냅니다. |
-| `/archive [ref]` | Archive the selected thread or a specific ref. | 선택된 스레드 또는 지정한 ref를 보관합니다. |
-| `/delete_archive <ref>` | Preview local archived-thread deletion. | 로컬 보관 스레드 삭제 전 미리보기를 보여줍니다. |
-| `/confirm_delete_archive <ref>` | Actually delete the archived thread locally. | 보관 스레드를 로컬에서 실제 삭제합니다. |
-| `/use <ref>` | Persist the default target thread without opening UI. | UI를 열지 않고 기본 대상 스레드를 선택합니다. |
-| `/status [ref]` | Show status for the current or specified thread. | 현재 또는 지정한 스레드 상태를 보여줍니다. |
-| `/doctor` | Print Discord adapter and bridge diagnostics. | 브리지 진단 정보를 출력합니다. |
-| `/ask <prompt>` | Send a prompt through the default IPC path. | 기본 IPC 경로로 질문을 보냅니다. |
-| `/ask_ipc <prompt>` | Alias of `/ask`. | `/ask`의 별칭입니다. |
-| `/discover_codex` | Discover the Codex Desktop executable and persist it into `.env`. | Codex Desktop 실행 파일을 찾아 `.env`에 저장합니다. |
-| `/restart_codex` | Restart the Codex Desktop app using the saved executable path. | 저장된 실행 파일 경로를 사용해 Codex Desktop 앱을 재시작합니다. |
-| `/restart_bot` | Restart only the Telegram bot process. | 텔레그램 봇 프로세스만 재시작합니다. |
-| `/chatid` | Show the current Telegram chat id. | 현재 텔레그램 chat id를 보여줍니다. |
+| Command | Description |
+| --- | --- |
+| `/list [limit]` | Show recent active threads and states such as `idle`, `busy`, `waiting-input`, `waiting-approval`. |
+| `/archived_list [limit]` | Show archived threads. |
+| `/new <prompt>` | Create a new thread and send the first prompt. |
+| `/archive [ref]` | Archive the selected thread or a specific ref. |
+| `/delete_archive <ref>` | Preview local archived-thread deletion. |
+| `/confirm_delete_archive <ref>` | Actually delete the archived thread locally. |
+| `/use <ref>` | Persist the default target thread without opening UI. |
+| `/status [ref]` | Show status for the current or specified thread. |
+| `/doctor` | Print adapter and bridge diagnostics. |
+| `/ask <prompt>` | Send a prompt through the default IPC path. |
+| `/ask_ipc <prompt>` | Alias of `/ask`. |
+| `/discover_codex` | Discover the Codex Desktop executable and persist it into `.env`. |
+| `/restart_codex` | Restart the Codex Desktop app using the saved executable path. |
+| `/restart_bot` | Restart only the Telegram bot process. |
+| `/chatid` | Show the current Telegram chat id. |
 
 Telegram notes:
 
@@ -250,13 +273,6 @@ Telegram notes:
 - Live `waiting-approval` prompts are shown in Telegram with visible `1 / 2 / 3` options.
 - When a followed thread enters `waiting-approval`, the approval prompt is forwarded into Telegram directly.
 - Current tested Telegram approval flow is the live `commandExecution` prompt path.
-
-추가 메모:
-
-- 텔레그램의 기본 `ask`는 UI 복붙이 아니라 IPC를 사용합니다.
-- 아주 오래된 스레드가 데스크톱 앱에 아직 로드되지 않은 경우, 앱에서 한 번 열어 준 뒤 다시 시도해야 할 수 있습니다.
-- `waiting-approval` 상태의 live 승인 프롬프트는 텔레그램에서도 `1 / 2 / 3` 선택지로 그대로 표시됩니다.
-- 현재 확인된 텔레그램 승인 경로는 live `commandExecution` 프롬프트 기준입니다.
 
 Additional Telegram commands:
 
@@ -323,13 +339,16 @@ Default REPL behavior:
 
 - `.env` is ignored by Git.
 - `*.log` is ignored by Git.
-- `requirements.txt` is intentionally empty because the project uses only the Python standard library.
+- Telegram mode uses only the Python standard library.
+- Discord mode requires `discord.py`, tracked in `requirements.txt`.
 
 ## Log Rotation
 
 Managed runtime logs:
 
 - `codex_telegram_bot.log`
+- `codex_discord_bot.log`
+- `discord_launcher.log`
 - `_ipc_probe_log.jsonl`
 
 Rotation rule:

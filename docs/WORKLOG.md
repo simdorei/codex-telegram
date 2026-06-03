@@ -2053,3 +2053,299 @@
   - No Discord command schema, mirror project/thread schema behavior, session behavior, slash handling, approval/input, or busy-choice behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 16:35 +09:00 - Discord quiet progress notice
+- Goal: keep Discord mirrored chats from looking empty while Codex is waiting silently, especially during high-context compaction.
+- Key assumptions:
+  - Codex session logs do not currently expose a stable explicit compaction event for this bridge to forward.
+  - A delayed one-shot notice after `[waiting_for_final_answer]` is safer than treating encrypted reasoning or token-count events as user-visible progress.
+- Changes:
+  - Added a delayed quiet-progress notice to `DiscordAskRelay`.
+  - The notice fires only if no commentary, final answer, timeout, or abort has been streamed within the delay window.
+  - The notice does not mark model output as streamed, so final-output fallback behavior remains available.
+  - Added regression tests for notice delivery and cancellation after a fast final answer.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (73 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Long quiet asks now show one Discord message: `Codex is still working.`
+  - Fast asks and normal commentary/final streaming are unchanged.
+- Unresolved:
+  - Needs one live high-context/compaction Discord ask after deployment to confirm the notice appears at the right moment.
+
+## 2026-06-03 16:48 +09:00 - Discord steering final stream guard
+- Goal: keep Discord hooked after a steering ask when Codex Desktop continues normally but Discord only saw commentary or quiet progress.
+- Root cause:
+  - `watch_for_final_answer()` used one `streamed_live` flag for commentary and final output.
+  - The ask command skipped printing `[final_answer]` whenever any live commentary had already streamed.
+  - Discord then saw `sent_live=True` and `saw_final=False`, but closed the ask with `Done.`.
+- Changes:
+  - Added a separate `final_streamed_live` result flag in `codex_desktop_bridge.py`.
+  - The ask command now suppresses final fallback only when the final answer itself was streamed live.
+  - Discord now sends an `Ask finished` fallback instead of bare `Done.` if live output occurred but no final answer marker arrived.
+  - Added regression tests for the no-final live-output case and bridge final-stream flag.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (75 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+- Side effects:
+  - Normal final streaming still ends with `Done.`.
+  - Aborted, timeout, busy-choice, and failed asks keep their existing behavior.
+
+## 2026-06-03 16:58 +09:00 - Discord Steer now watch attachment
+- Goal: make `Steer now` continue streaming the steered Codex turn back into Discord after the steering prompt is delivered.
+- Root cause:
+  - The busy-choice steering path used `ask --no-wait` to inject the prompt into the busy Codex thread.
+  - After sending the `Steering sent` acknowledgement, it did not attach a watcher to the delivered turn.
+  - Normal asks still streamed correctly, so the failure only appeared on the busy button steering path.
+- Changes:
+  - Added `SteeringPromptResult` so steering delivery keeps the pre-send session path and offset.
+  - Added a steering watch stream that starts from that offset and feeds `DiscordAskRelay` without resending the prompt.
+  - Wired both normal busy-choice buttons and persistent busy-choice buttons to attach the watch after successful steering.
+  - Kept tuple unpacking compatibility for existing callers and tests.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (77 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `Steer now` now behaves like an ask stream after delivery: commentary/final are relayed, quiet notices can fire, and final completion sends `Done.`.
+  - Failed/busy steering still resends busy-choice controls as before.
+
+## 2026-06-03 17:20 +09:00 - Discord steering handoff duplicate suppression
+- Goal: prevent confusing duplicate-looking Discord output when a busy runner finishes without a final answer at the same time a `Steer now` handoff starts streaming.
+- Root cause:
+  - `Steer now` now correctly attaches a watcher to the steered turn.
+  - The pre-existing runner for the original ask can finish around the same time with `final=False` and emit a generic fallback.
+  - That fallback appears next to the steering acknowledgement and steered final answer, making the Discord output look duplicated or unrelated to the user's actual prompt.
+- Changes:
+  - Added a per-thread steering handoff marker.
+  - `Steer now` and persistent steering mark the handoff before injecting the prompt.
+  - `run_prompt_and_send()` suppresses successful no-final runner fallback if a steering handoff happened after that runner started.
+  - Added a regression test for suppressing no-final fallback after steering handoff.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (78 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+- Side effects:
+  - Normal successful asks with final answers are unchanged.
+  - No-final asks still fall back unless they were overtaken by an explicit steering handoff.
+
+## 2026-06-03 17:43 +09:00 - Context compaction history warning
+- Goal: surface whether a thread has likely been compacted, not just its current context percentage.
+- Key findings:
+  - Session logs do not expose a stable explicit `compaction` event name.
+  - `turn_context.summary=auto` appears on every inspected turn, so it is not reliable as a compaction marker.
+  - A large drop in successive `last_input_tokens` from `token_count` events is a practical inferred compaction signal.
+- Changes:
+  - Added inferred compaction fields to `ThreadContextUsage`.
+  - Detect a likely compaction when `last_input_tokens` drops by at least 20% and at least 25k tokens from a prior value of 50k+.
+  - Added `compactions=N` and latest `before->after` drop details to Discord context lines.
+  - Context warning now includes compaction history even when current context usage has dropped back below the high threshold.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (79 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+- Current observed thread:
+  - The active `new-chat:1` thread is around 70% context and has no inferred compaction drop yet.
+
+## 2026-06-03 17:48 +09:00 - Discord typing indicator during Codex work
+- Goal: make Discord show that the bot is actively working while Codex is generating or a steering watch is attached.
+- Changes:
+  - Added a safe `channel_typing()` async context helper.
+  - Wrapped normal ask streaming, `Steer now` prompt injection, persistent steering injection, and steering watch streaming with Discord typing indicators.
+  - Typing start/stop failures are logged but do not block message delivery.
+  - Added a regression test proving `run_prompt_and_send()` enters and exits typing while streaming.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (80 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Users should see the Discord bot typing during long Codex waits instead of only seeing occasional progress messages.
+
+## 2026-06-03 17:58 +09:00 - Context compaction zero-token gap fix
+- Goal: make inferred context compaction counts show up reliably on real Codex session logs.
+- Root cause:
+  - Real session logs can include an intermediate `token_count` event with `last_token_usage.input_tokens=0` immediately after compaction.
+  - The previous detector treated that zero value as the next baseline, so the following nonzero compacted value was not counted as a large drop.
+- Changes:
+  - Kept zero-token events from replacing the previous nonzero compaction baseline.
+  - Updated the regression test to cover `100k -> 0 -> 35k`.
+- Verification:
+  - Focused tests for inferred compaction display and Discord typing indicator passed.
+  - Current `new-chat:1` context output now shows `compactions=2 last=231.6k->29.6k`.
+
+## 2026-06-03 18:08 +09:00 - Context warning threshold policy
+- Goal: keep automatic context warnings quiet during normal operation while preserving detailed status in `!context`.
+- Changes:
+  - Raised the high-context threshold from 60% to 70%.
+  - Changed automatic context warnings to fire only for `high` or `critical` context status.
+  - Kept `!context` showing `last`, `peak`, `window`, `compactions`, and `archive_recommended` even below the warning threshold.
+- Verification:
+  - Added tests that below-threshold threads stay quiet even with compaction/archive history.
+  - Added a test that warnings start at 70%.
+  - Current `new-chat:1` warning output is empty, while `!context` still shows `compactions=2` and `archive_recommended=yes`.
+
+## 2026-06-03 18:32 +09:00 - Disable default quiet progress chat notice
+- Goal: avoid confusing progress notices that look like context warnings below the 70% threshold.
+- Changes:
+  - Disabled the default delayed `Codex is still working` chat notice.
+  - Kept the relay helper testable with an explicit delay for future opt-in use.
+- Reason:
+  - Discord typing now covers the "bot is still working" signal without adding extra chat messages.
+  - Context-related chat warnings should only appear at the configured high/critical threshold.
+
+## 2026-06-03 19:12 +09:00 - Discord shipping polish
+- Goal: make the Discord additions fit the public repo and deployment docs cleanly.
+- Changes:
+  - Moved steering handoff markers to successful steering delivery only, so failed `Steer now` attempts cannot suppress an existing runner fallback.
+  - Added `DISCORD_ALLOWED_USER_IDS` and `DISCORD_HISTORY_BOOTSTRAP_LOOKBACK_SECONDS` to `.env.example`.
+  - Updated README version, Discord dependency/env notes, startup flow, and public repo notes.
+  - Removed corrupted Telegram README text and kept the Telegram command table in English.
+- Verification:
+  - Focused steering handoff tests passed.
+  - `py -3 codex_discord_bot.py --help` and `py -3 codex_telegram_bot.py --help` both print help successfully.
+
+## 2026-06-03 19:28 +09:00 - Steering race duplicate suppression
+- Goal: prevent `Steer now` from looking ignored when the original runner finishes at the same time as the steering watch.
+- Root cause:
+  - The original ask relay could still stream commentary/final output after a successful steering handoff.
+  - The steering watch then streamed the same nearby final output, making Discord show duplicate content and making the actual steering attempt feel swallowed.
+- Changes:
+  - Added relay-level suppression for commentary/final blocks after a steering handoff on the same target.
+  - Kept the steering watch responsible for Discord output after the handoff.
+  - Added a regression test for final output suppressed after steering handoff.
+- Verification:
+  - Focused steering race tests passed.
+  - `py -3 -m unittest tests.test_codex_discord_bot` (84 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - Restarted the Discord bot scheduled task.
+
+## 2026-06-03 20:10 +09:00 - Reduce pre-steering Discord noise
+- Goal: avoid multiple chat messages before `Steer now` when the first ask is immediately followed by a steering prompt.
+- Changes:
+  - Removed the generic immediate `Ask received. Sending to Codex.` acknowledgement.
+  - Immediate asks now only send a pre-run message when a context warning is actually present.
+  - Removed context warning text from busy-choice messages so warnings are not repeated beside the steering buttons.
+- Verification:
+  - Added/updated tests for context-warning-only ask acknowledgement and warning-free busy-choice messages.
+  - `py -3 -m unittest tests.test_codex_discord_bot` (84 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - Restarted the Discord bot scheduled task.
+
+## 2026-06-03 20:36 +09:00 - Treat delayed IPC steering as pending
+- Goal: prevent Discord `Steer now` from reporting a hard failure when Codex IPC accepted the prompt but local session recording lags behind.
+- Root cause:
+  - IPC could return success while the session jsonl had not yet recorded the user message within the old confirmation window.
+  - The steering prompt could still land later, so Discord showed `Steering failed (exit 1)` even though Codex eventually received the steering text.
+- Changes:
+  - Increased Discord-side steering delivery confirmation wait to 25 seconds by default.
+  - Added `DISCORD_STEERING_DELIVERY_CONFIRM_TIMEOUT_SECONDS` for deployment tuning.
+  - Treat IPC-success/session-recording-delay errors as `[delivery_pending]` success so the steering watch stays attached instead of surfacing a false hard failure.
+  - Added `DISCORD_STEERING_PENDING_WATCH_TIMEOUT_SECONDS` so delivery-pending watches cannot wait forever.
+  - Suppressed older steering watches when a newer `Steer now` handoff starts on the same target thread.
+- Verification:
+  - Added regression tests for delayed delivery confirmation and pending IPC delivery watch attachment.
+  - Added regression tests for finite pending watch timeout and older-watch suppression.
+
+## 2026-06-03 21:36 +09:00 - Discord desktop live recognition and relay generation guard
+- Goal: verify the live Discord surface after context grew large, and keep only one Discord relay speaking for each Codex target thread.
+- Live findings:
+  - Installed Discord Desktop with `winget install --id Discord.Discord -e`.
+  - Confirmed RustDesk is running.
+  - Confirmed the bot gateway sees the mirrored Discord thread `1511630781561442436` and maps it to Codex thread `019e8c5b-5720-7142-b266-f03718364c57`.
+  - Confirmed Discord Desktop launches and is readable through Computer Use; it currently stops at the Discord login screen.
+  - Reproduced duplicate bot output during repeated busy-thread `Steer now` tests before the new guard was deployed.
+- Root cause:
+  - Multiple live relays could follow the same Codex session at once: the original ask stream plus one or more steering watches.
+  - Timestamp-based steering handoff suppression was not strong enough to stop every overlapping relay in live Discord traffic.
+- Changes:
+  - Added per-target Discord relay generations.
+  - Each new live relay now makes older relays for the same target stale, so stale commentary/final blocks are suppressed before sending to Discord.
+  - Added a regression test for older-relay suppression after a newer relay starts on the same thread.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot.DiscordBotHelperTests.test_older_relay_suppresses_after_newer_relay_for_same_thread tests.test_codex_discord_bot.DiscordBotHelperTests.test_older_steering_watch_suppresses_after_newer_handoff tests.test_codex_discord_bot.DiscordBotHelperTests.test_ask_stream_final_is_suppressed_after_steering_handoff`
+  - `py -3 -m unittest tests.test_codex_discord_bot` (89 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - Restarted the Discord bot scheduled task at 21:36 KST; startup probes for the mirrored Discord threads passed.
+- Remaining live check:
+  - Desktop Discord still needs user login before a post-restart UI-level `Steer now` test can prove duplicate suppression in production traffic.
+
+## 2026-06-03 21:45 +09:00 - Discord desktop login confirmed
+- Goal: leave a clean handoff point for the next Codex thread.
+- Live findings:
+  - Discord Desktop is now logged in.
+  - Computer Use can read the Discord Desktop window without the browser URL safety block.
+  - Current Discord Desktop title shows the mirrored Korean-named thread in `Codex app bridge - Discord`.
+  - Accessibility tree confirms the app is in server `Codex app bridge`, mirrored thread `1511630781561442436`.
+  - User area shows the logged-in Discord account ending in `dr_patience`, confirming a real logged-in session.
+  - Recent duplicate bot messages are visible in the thread from before the latest relay-generation guard was deployed.
+- Current bot state:
+  - `Codex Discord Bot` scheduled task is running after the 21:36 restart.
+  - Startup probes passed for the mirrored Discord thread `1511630781561442436`.
+  - The active Codex target thread remains `019e8c5b-5720-7142-b266-f03718364c57`.
+- Next thread should start with:
+  - Run a fresh post-restart `Steer now` live test from Discord Desktop.
+  - Check `codex_discord_bot.log` for duplicate `socket_message_create` entries after the new relay-generation guard.
+  - If duplicates still appear, inspect whether they are Discord retries, multiple bot processes, or multiple relay generations still being registered for the same target.
+
+## 2026-06-04 01:49 +09:00 - Live steering latency and button QA hardening
+- Goal: make busy-thread steering safer under live Discord QA, especially when IPC accepts steering but Codex session recording lags.
+- Live findings:
+  - Computer Use can read the logged-in Discord Desktop thread and identify the message composer and busy-choice buttons.
+  - In this run, Discord element click/key input failed at Windows activation with `failed to activate captured window`; this is a desktop automation limitation, not evidence that the bot handler is missing.
+  - A real Discord component interaction for `Ignore` was received and handled after restart, proving component events reach the bot and persistent busy-choice fallback is active.
+  - Direct CT-6 steering confirmed the extra Discord-side 25 second wait was removed; pending IPC delivery now returns quickly and keeps the watch attached.
+- Changes:
+  - Treat the known IPC delivery-confirmation timeout from `run_ask(wait=False)` as `[delivery_pending]` immediately instead of waiting a second time.
+  - Added synthetic `steer_success` coverage to `run_discord_button_qa`, so the opt-in QA command now exercises successful persistent `Steer now` followup and watch attachment without sending a real Codex prompt.
+  - Expanded button QA to cover persistent approval and persistent input-choice handlers without submitting real Codex replies.
+  - Persistent approval/input fallback now clears rendered Discord message components before submitting, reducing repeated stale-button submissions after bot restart.
+  - Added message-id based single-use claims for persistent approval/input fallback clicks, preventing replayed or double-clicked restart buttons from submitting more than once.
+  - Added elapsed seconds to live `Steer now` and persistent steering completion logs for latency QA.
+  - Added `/doctor` visibility for QA commands, persistent component claim counts, the last button QA result, and the last steering-button elapsed time.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (105 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - Restarted the Discord bot scheduled task at 02:05 KST; startup probes for mirrored channels and threads passed.
+  - Computer Use re-read the logged-in Discord Desktop thread after restart; the composer and old busy controls were visible, but no fresh enabled `Steer now` control was present for a clean live click.
+  - Computer Use later found an enabled old `Steer now` control in the same Discord thread, but it was intentionally not clicked because it would not prove a fresh steering path.
+- Remaining live check:
+  - A fresh live `Steer now` click should be performed from Discord Desktop once Windows activation/input succeeds or the user clicks it manually, then verify `steer_now_done ... elapsed_sec=...` and `steer_watch_done ... final=True` without duplicate final copies.
+
+## 2026-06-04 02:17 +09:00 - Startup cleanup for stale busy buttons
+- Goal: remove stale `Steer now` / `Queue next` / `Ignore` controls that remain visible after their persistent busy-choice DB records expire or are claimed.
+- Live findings:
+  - Discord Desktop accessibility still showed an old enabled `Steer now` button from 01:10 even though `busy_choices` had 0 rows.
+  - Discord app direct text input remained blocked by Windows activation errors (`failed to activate captured window` / `SetIsBorderRequired failed`), so this run used a real Discord message created through discord.py for server-side live verification.
+  - A real Discord QA message `1511780765162143966` was created with stale `codex_busy:*` controls and no DB record.
+- Changes:
+  - Added startup cleanup that scans recent allowed/startup/mirrored channel history for bot messages with `codex_busy:*` components.
+  - Cleanup removes components only when none of the message's busy-choice custom IDs have an active DB record.
+  - Active busy-choice records are preserved so fresh in-flight controls are not disabled by startup cleanup.
+- Verification:
+  - Restarted the Discord bot scheduled task at 02:17 KST.
+  - Logs show cleanup removed the QA message controls plus stale controls in mirrored threads: `stale_busy_choice_component_cleanup_done count=7`.
+  - Fetched QA message `1511780765162143966` through discord.py after restart and confirmed `component_rows: 0`.
+  - Fetched the old 01:10 CT busy message `1511764104086294560` through discord.py and confirmed `component_rows: 0`.
+  - `py -3 -m unittest tests.test_codex_discord_bot` (107 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+- Remaining live check:
+  - True user-account Discord text entry is still unverified because Computer Use cannot activate the Discord Desktop window and the Chrome extension backend is unavailable in this session.
+
+## 2026-06-04 02:30 +09:00 - RustDesk-assisted direct input and QA-only text steering
+- Goal: keep the normal Discord UX button-based while adding a reliable QA-only text path for steering when desktop button automation cannot click Discord components.
+- Live findings:
+  - After the user focused the Discord Desktop composer through RustDesk, Computer Use successfully typed and sent a real user-account Discord message:
+    `QA-LIVE-CT-8: RustDesk focused direct Discord input smoke. Reply CT-8 only.`
+  - The gateway received it in mirrored thread `1511713799386693695`, and the bot sent a busy-choice message with enabled `Steer now`, `Queue next`, and `Ignore` controls.
+  - Computer Use still could not click the Discord component button: element click reported `call get_window_state before issuing coordinate input`, screenshot capture failed with `SetIsBorderRequired`, and UIA secondary action did not support `Invoke`.
+- Changes:
+  - Added `!steer <prompt>` as a QA-only text path for the same steering backend used by `Steer now`.
+  - Gated `!steer` behind `DISCORD_ENABLE_QA_COMMANDS=1`, so it is hidden/disabled by default and does not become the normal user workflow.
+  - Added tests that verify `!steer` is disabled by default, shown only with QA commands enabled, and calls the same steering runner/streamer without requiring a button click.
+  - Isolated new tests to temporary log files so unit tests do not pollute the live Discord bot log.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (109 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - Restarted the Discord bot scheduled task after the QA-only gate was added.
+- Remaining live check:
+  - With `DISCORD_ENABLE_QA_COMMANDS=1` in a test environment, send `!steer <prompt>` through the focused Discord composer to verify the text steering path end-to-end.
+  - The main product path remains plain Discord message -> busy choice -> `Steer now` button. The text command is only a QA/diagnostic fallback.

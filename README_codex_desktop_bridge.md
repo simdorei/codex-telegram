@@ -100,7 +100,7 @@ python -c "import sys; print(sys.executable)"
 Example `.env` with explicit paths:
 
 ```env
-TELEGRAM_BOT_TOKEN=123456:example-token
+TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_CHAT_IDS=123456789
 CODEX_HOME=C:\Users\your_user\.codex
 PYTHON_EXE=C:\python\python.exe
@@ -142,14 +142,16 @@ Recommended environment variable:
 Add them to the local `.env` file in the same folder as the scripts:
 
 ```env
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_ALLOWED_CHAT_IDS=your_chat_id
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_ALLOWED_CHAT_IDS=
 ```
+
+Put your real bot token only in the local `.env` file. Do not commit token values.
 
 Example:
 
 ```powershell
-$env:TELEGRAM_BOT_TOKEN = '123456:example-token'
+$env:TELEGRAM_BOT_TOKEN = 'your_telegram_bot_token'
 $env:TELEGRAM_ALLOWED_CHAT_IDS = '123456789'
 .\codex-telegram-bot.cmd
 ```

@@ -6,6 +6,7 @@ discord_mirror.sqlite
 .codex_discord_bot.lock/
 _ipc_probe_log.jsonl
 _ipc_probe_log.jsonl.bak
+WORKLOAD_HANDOFF_*.md
 __pycache__/
 *.pyc
 .vscode/
