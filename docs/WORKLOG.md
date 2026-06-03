@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 11:25:47 +09:00
+- Goal: keep Discord command documentation aligned with the stabilized frontend.
+- Key assumptions:
+  - Discord users rely on README and `!help` to discover commands.
+  - Recent additions `!archive_list` and `/archived_list` should be visible in the Discord-specific section.
+- Changes:
+  - Documented `!archive_list [limit]` as an alias for `!archived_list [limit]`.
+  - Added the exact registered Discord slash command list to the Discord Mirror Flow section.
+- Abuse cases checked:
+  - Documentation-only change exposes no new command path.
+  - The documented slash list matches the runtime sync log and current code.
+  - No secret values or local IDs were added to docs.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot`
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord command input after deployment for final live proof.
+
 ## 2026-06-03 11:23:01 +09:00
 - Goal: align Discord slash commands with archived thread listing docs and prefix behavior.
 - Key assumptions:

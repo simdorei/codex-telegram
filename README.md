@@ -169,7 +169,7 @@ Start the Discord adapter:
 Useful Discord commands:
 
 - `!help`: show the current Discord command list
-- `!list [limit]`, `!archived_list [limit]`: show active or archived Codex threads
+- `!list [limit]`, `!archived_list [limit]` / `!archive_list [limit]`: show active or archived Codex threads
 - `!new <prompt>`: create a new Codex thread and send the first prompt
 - `!archive [ref]`, `!delete_archive <ref>`, `!confirm_delete_archive <ref>`: archive and local archived-thread deletion flow
 - `!use <ref>`, `!open <ref>`, `!open_abort <ref>`: select or open Codex threads
@@ -181,6 +181,10 @@ Useful Discord commands:
 - `!where`: show which Codex thread the current Discord channel/thread maps to
 - `!approval`: re-show approval buttons if the mapped Codex thread is waiting for approval
 - `!ask <prompt>`: send a prompt to the mapped or selected Codex thread
+
+Registered Discord slash commands:
+
+- `/help`, `/list`, `/archived_list`, `/use`, `/status`, `/doctor`, `/where`, `/context`, `/mirror_check`
 
 Messages inside a mirrored Discord thread are sent to that Codex thread. If a Discord project channel has multiple Codex threads, plain messages in the parent channel are blocked so they do not accidentally fall back to the selected Codex thread.
 
