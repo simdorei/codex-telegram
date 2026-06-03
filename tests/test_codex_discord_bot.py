@@ -11,10 +11,30 @@ import codex_discord_bot as bot
 
 class FakeFollowup:
     def __init__(self) -> None:
-        self.messages: list[str] = []
+        self.messages: list[object] = []
 
-    async def send(self, content: str) -> None:
+    async def send(self, content: str, view=None) -> None:
+        self.messages.append(content if view is None else (content, view))
+
+
+class FakeResponse:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self.deferred = False
+
+    async def send_message(self, content: str, ephemeral: bool = False) -> None:
         self.messages.append(content)
+
+    async def defer(self, thinking: bool = False) -> None:
+        self.deferred = True
+
+
+class FakeInteractionMessage:
+    def __init__(self) -> None:
+        self.edits: list[object | None] = []
+
+    async def edit(self, view=None) -> None:
+        self.edits.append(view)
 
 
 class FakeTarget:
@@ -30,8 +50,10 @@ class FakeInteraction:
         self.command = SimpleNamespace(name=command_name)
         self.channel_id = channel_id
         self.followup = FakeFollowup()
+        self.response = FakeResponse()
         self.user = SimpleNamespace(id=242286902982606848)
         self.channel = None
+        self.message = FakeInteractionMessage()
 
 
 class FakeMessage:
@@ -248,6 +270,41 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.resolve_target_ref = original_resolve_target_ref
             bot.run_ask_stream = original_run_ask_stream
+            bot.build_context_warning = original_build_context_warning
+
+    async def test_steer_now_busy_failure_resends_busy_choice_view(self) -> None:
+        original_run_steering_prompt = bot.run_steering_prompt
+        original_build_context_warning = bot.build_context_warning
+        try:
+            def fake_run_steering_prompt(prompt, target_thread_id):
+                return (
+                    1,
+                    "ERROR: The selected thread is still busy. Wait, switch to another thread, or pass --force-while-busy.",
+                )
+
+            bot.run_steering_prompt = fake_run_steering_prompt
+            bot.build_context_warning = lambda target_thread_id: ""
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                message = FakeMessage()
+                view = bot.BusyChoiceView(message, "please steer", target_thread_id="thread-1")
+                button = next(item for item in view.children if getattr(item, "label", "") == "Steer now")
+                interaction = FakeInteraction()
+
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await button.callback(interaction)
+
+            self.assertTrue(interaction.response.deferred)
+            self.assertEqual(len(interaction.followup.messages), 1)
+            content, followup_view = interaction.followup.messages[0]
+            self.assertIn("This Codex thread is already working.", content)
+            self.assertIn("please steer", content)
+            self.assertIsInstance(followup_view, bot.BusyChoiceView)
+            self.assertEqual(followup_view.target_thread_id, "thread-1")
+            self.assertNotIn("selected thread is still busy", content.lower())
+        finally:
+            bot.run_steering_prompt = original_run_steering_prompt
             bot.build_context_warning = original_build_context_warning
 
     async def test_archive_list_alias_routes_to_archived_list(self) -> None:

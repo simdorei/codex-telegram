@@ -2334,6 +2334,21 @@ class BusyChoiceView(discord.ui.View):
             f"steer_now_done exit={exit_code} target={self.target_thread_id or '-'} "
             f"output_len={format_log_text_len(output)}"
         )
+        if is_selected_thread_busy_error(exit_code, output):
+            await interaction.followup.send(
+                build_busy_choice_message(self.prompt, self.target_thread_id),
+                view=BusyChoiceView(
+                    self.message,
+                    self.prompt,
+                    target_thread_id=self.target_thread_id,
+                    allow_steer=True,
+                ),
+            )
+            log_line(
+                f"steer_now_busy_choice_resent exit={exit_code} "
+                f"target={self.target_thread_id or '-'}"
+            )
+            return
         title = "Steering sent" if exit_code == 0 else f"Steering failed (exit {exit_code})"
         await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
         log_line(f"steer_now_sent exit={exit_code} target={self.target_thread_id or '-'}")
@@ -2367,6 +2382,7 @@ class BusyChoiceView(discord.ui.View):
                 run_prompt_flow(
                     self.message.channel,
                     self.prompt,
+                    source_message=self.message,
                     target_thread_id=self.target_thread_id,
                 )
             )
@@ -2377,6 +2393,7 @@ class BusyChoiceView(discord.ui.View):
             self.prompt,
             self.target_thread_id,
             queued=True,
+            source_message=self.message,
         )
         log_line(
             f"queue_next user={interaction.user.id} position={position} target={self.target_thread_id or '-'} "

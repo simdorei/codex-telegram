@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 11:38:43 +09:00
+- Goal: keep Discord busy steering buttons from surfacing raw transport busy errors.
+- Key assumptions:
+  - A `Steer now` button click can still receive Codex's `selected thread is still busy` transport error.
+  - That case should reopen the busy-choice UI instead of sending `Steering failed` with raw bridge output.
+- Changes:
+  - Converted `Steer now` busy transport failures into a fresh `BusyChoiceView`.
+  - Passed the source Discord message through `Queue next` jobs so delayed fallback controls keep the original author restriction.
+  - Added regression coverage for the `Steer now` busy failure path.
+- Abuse cases checked:
+  - Re-sent busy controls still use `BusyChoiceView.interaction_check()` to limit clicks to the original sender.
+  - Queue jobs carry only the original message reference needed for ownership, preserving per-message control isolation.
+  - Raw transport busy output is suppressed in the button path to avoid leaking diagnostic text into Discord.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 13 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `Steer now` click against a busy mapped thread after deployment for final live proof.
+
 ## 2026-06-03 11:35:35 +09:00
 - Goal: keep Discord busy-fallback regression tests isolated from the live bot log.
 - Key assumptions:
