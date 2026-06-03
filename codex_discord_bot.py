@@ -793,6 +793,31 @@ def run_ask_stream(
     return exit_code, output
 
 
+class LoggingCommandTree(app_commands.CommandTree):
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+        /,
+    ) -> None:
+        command_name = get_interaction_command_name(interaction)
+        log_line(
+            f"slash_command_error command={command_name} "
+            f"channel={interaction.channel_id} user={getattr(interaction.user, 'id', '-')} "
+            f"error={type(error).__name__}: {error}"
+        )
+        try:
+            message = "Discord slash command error. Check codex_discord_bot.log."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+                log_line(f"slash_command_error_sent command={command_name} response=followup")
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+                log_line(f"slash_command_error_sent command={command_name} response=initial")
+        except Exception:
+            log_line("slash_command_error_report_failed\n" + traceback.format_exc())
+
+
 class CodexDiscordBot(discord.Client):
     def __init__(
         self,
@@ -806,7 +831,7 @@ class CodexDiscordBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = enable_prefix_commands
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = LoggingCommandTree(self)
         self.allowed_channel_ids = allowed_channel_ids
         self.allowed_user_ids = allowed_user_ids
         self.startup_channel_id = startup_channel_id

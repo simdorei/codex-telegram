@@ -23,12 +23,18 @@ class FakeResponse:
     def __init__(self) -> None:
         self.messages: list[str] = []
         self.deferred = False
+        self.done = False
 
     async def send_message(self, content: str, ephemeral: bool = False) -> None:
         self.messages.append(content)
+        self.done = True
 
     async def defer(self, thinking: bool = False) -> None:
         self.deferred = True
+        self.done = True
+
+    def is_done(self) -> bool:
+        return self.done
 
 
 class FakeInteractionMessage:
@@ -205,6 +211,48 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             log_text = log_path.read_text(encoding="utf-8")
             self.assertIn("slash_response_start command=where", log_text)
             self.assertIn("slash_response_sent command=where", log_text)
+
+    async def test_slash_error_handler_reports_before_initial_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.LoggingCommandTree.on_error(
+                    SimpleNamespace(),
+                    interaction,
+                    bot.app_commands.AppCommandError("boom"),
+                )
+
+            self.assertEqual(
+                interaction.response.messages,
+                ["Discord slash command error. Check codex_discord_bot.log."],
+            )
+            self.assertEqual(interaction.followup.messages, [])
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("slash_command_error command=ask channel=222", log_text)
+            self.assertIn("slash_command_error_sent command=ask response=initial", log_text)
+
+    async def test_slash_error_handler_reports_after_defer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            await interaction.response.defer(thinking=True)
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.LoggingCommandTree.on_error(
+                    SimpleNamespace(),
+                    interaction,
+                    bot.app_commands.AppCommandError("boom"),
+                )
+
+            self.assertEqual(interaction.response.messages, [])
+            self.assertEqual(
+                interaction.followup.messages,
+                ["Discord slash command error. Check codex_discord_bot.log."],
+            )
+            self.assertEqual(interaction.followup.kwargs, [{"ephemeral": True}])
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("slash_command_error command=ask channel=222", log_text)
+            self.assertIn("slash_command_error_sent command=ask response=followup", log_text)
 
     async def test_run_bridge_and_send_logs_and_sends(self) -> None:
         original_run_bridge_command = bot.run_bridge_command

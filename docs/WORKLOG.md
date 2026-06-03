@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 12:09:55 +09:00
+- Goal: prevent Discord slash command exceptions from surfacing as silent interaction failures.
+- Key assumptions:
+  - Prefix/plain-message handling already has a top-level error report path, but slash commands relied on the default `CommandTree` error behavior.
+  - A failed slash command should log a useful diagnostic and send a short user-facing error whether the interaction was already deferred or not.
+- Changes:
+  - Added `LoggingCommandTree` with `on_error()` logging command/channel/user/error metadata.
+  - Replaced the default `app_commands.CommandTree` with `LoggingCommandTree`.
+  - Added user-facing slash error responses for both initial-response and deferred/followup cases.
+  - Added regression tests for both response states using isolated temp logs.
+- Abuse cases checked:
+  - Error responses do not include exception details or prompt/session content.
+  - Logs include only command/channel/user/error metadata.
+  - The change does not bypass existing slash authorization checks.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 20 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real slash-command exception evidence only if a future runtime error occurs.
+
 ## 2026-06-03 12:07:06 +09:00
 - Goal: lock Discord `new` failure behavior so failed thread creation cannot mutate mirror state.
 - Key assumptions:
