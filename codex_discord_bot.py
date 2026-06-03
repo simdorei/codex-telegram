@@ -1070,13 +1070,29 @@ async def handle_slash_ask(interaction: discord.Interaction, prompt: str) -> Non
         return
 
     target_thread_id = get_mirrored_codex_thread_id(interaction.channel_id)
+    target_source = "mirror" if target_thread_id else "selected"
     if target_thread_id is None:
         project_message = describe_mirrored_project_channel(interaction.channel_id)
         if project_message:
+            log_line(
+                f"slash_ask_blocked command={get_interaction_command_name(interaction)} "
+                f"channel={interaction.channel_id} user={interaction.user.id} "
+                f"reason=project_parent prompt_len={format_log_text_len(prompt)}"
+            )
             await send_interaction_chunks(interaction, project_message, title="Ask")
             return
 
+    log_line(
+        f"slash_ask_dispatch command={get_interaction_command_name(interaction)} "
+        f"channel={interaction.channel_id} user={interaction.user.id} "
+        f"target_source={target_source} target={target_thread_id or '-'} "
+        f"prompt_len={format_log_text_len(prompt)}"
+    )
     await interaction.followup.send("Ask handling posted in this channel.", ephemeral=True)
+    log_line(
+        f"slash_ask_ack_sent command={get_interaction_command_name(interaction)} "
+        f"channel={interaction.channel_id}"
+    )
     source_message = SimpleNamespace(channel=channel, author=interaction.user)
     await handle_plain_ask(source_message, prompt, target_thread_id=target_thread_id)  # type: ignore[arg-type]
 

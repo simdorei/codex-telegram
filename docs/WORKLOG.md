@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 11:57:01 +09:00
+- Goal: make live Discord slash ask routing auditable without logging prompt text.
+- Key assumptions:
+  - `/ask` and `/ask_ipc` were synced, but live dispatch evidence should identify target routing and acknowledgement.
+  - Prompt content should not be logged for verification.
+- Changes:
+  - Added `slash_ask_dispatch` logs with command, channel, user, target source, target id, and prompt length.
+  - Added `slash_ask_ack_sent` logs after the ephemeral slash acknowledgement.
+  - Added `slash_ask_blocked` logs for project parent channels that are intentionally blocked from selected-thread fallback.
+  - Extended the slash ask routing regression test to assert the isolated dispatch/ack logs.
+- Abuse cases checked:
+  - Logs include prompt length only, not prompt content.
+  - Authorization remains enforced before any slash ask dispatch logging or prompt routing.
+  - Project parent channel blocking remains structural and does not fall back to the selected thread.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 15 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/ask` input after deployment to capture live `slash_ask_dispatch` and downstream ask/busy evidence.
+
 ## 2026-06-03 11:53:56 +09:00
 - Goal: align Discord slash frontend with the documented ask flow.
 - Key assumptions:

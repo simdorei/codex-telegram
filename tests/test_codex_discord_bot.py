@@ -393,7 +393,11 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             interaction = FakeInteraction(command_name="ask", channel_id=222)
             interaction.channel = FakeTarget()
 
-            await bot.handle_slash_ask(interaction, "please run")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.handle_slash_ask(interaction, "please run")
+                log_text = log_path.read_text(encoding="utf-8")
 
             self.assertEqual(interaction.followup.messages, ["Ask handling posted in this channel."])
             self.assertEqual(interaction.followup.kwargs, [{"ephemeral": True}])
@@ -403,6 +407,10 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target_thread_id, "thread-1")
             self.assertIs(source_message.channel, interaction.channel)
             self.assertIs(source_message.author, interaction.user)
+            self.assertIn("slash_ask_dispatch command=ask channel=222", log_text)
+            self.assertIn("target_source=mirror target=thread-1", log_text)
+            self.assertIn("prompt_len=10", log_text)
+            self.assertIn("slash_ask_ack_sent command=ask channel=222", log_text)
         finally:
             bot.get_mirrored_codex_thread_id = original_get_mirrored
             bot.handle_plain_ask = original_handle_plain_ask
