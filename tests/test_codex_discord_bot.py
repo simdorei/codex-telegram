@@ -199,6 +199,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         source = Path(bot.__file__).read_text(encoding="utf-8")
         command_names = set(re.findall(r'@bot\.tree\.command\(name="([^"]+)"', source))
         self.assertEqual(command_names, expected_commands)
+        self.assertIn("slash_new_dispatch", source)
+        self.assertIn("slash_new_done", source)
 
     async def test_send_interaction_chunks_logs_and_sends(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

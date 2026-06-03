@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 12:12:44 +09:00
+- Goal: make live Discord slash `/new` execution auditable without logging prompt text.
+- Key assumptions:
+  - `new_thread_cwd` logs show cwd resolution, but not whether the source was slash `/new`.
+  - Live verification should be able to distinguish slash `/new` from prefix `!new`.
+- Changes:
+  - Added `slash_new_dispatch` logs with channel, user, and prompt length.
+  - Added `slash_new_done` logs with channel and bridge exit code.
+  - Extended the slash command drift test to assert the `/new` dispatch/done log hooks remain present.
+- Abuse cases checked:
+  - Logs include prompt length only, not prompt content.
+  - Slash `/new` authorization still runs before dispatch logging or bridge execution.
+  - The change does not alter cwd resolution, bridge execution, or mirror mutation behavior.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 20 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/new` input after deployment to capture live `slash_new_dispatch` and `slash_new_done`.
+
 ## 2026-06-03 12:09:55 +09:00
 - Goal: prevent Discord slash command exceptions from surfacing as silent interaction failures.
 - Key assumptions:
