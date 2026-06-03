@@ -172,6 +172,13 @@ def format_log_text_len(text: str | None) -> int:
     return len(str(text or ""))
 
 
+def format_discord_command_label(command: str, *, limit: int = 80) -> str:
+    label = str(command or "").replace("\n", " ").replace("\r", " ").strip()
+    if len(label) <= limit:
+        return label
+    return label[: max(0, limit - 3)].rstrip() + "..."
+
+
 def run_bridge_command(argv: list[str]) -> tuple[int, str]:
     parser = bridge.build_parser()
     stdout_buffer = io.StringIO()
@@ -2888,7 +2895,7 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         await handle_plain_ask(message, arg, target_thread_id=target_thread_id)
         return
 
-    await message.channel.send(f"Unknown command: !{command}")
+    await message.channel.send(f"Unknown command: !{format_discord_command_label(command)}")
 
 
 def build_help() -> str:

@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 12:44:42 +09:00
+- Goal: bound Discord unknown-prefix-command responses for malformed or oversized command names.
+- Key assumptions:
+  - Unknown `!<command>` text is externally supplied and can be arbitrarily long or contain newlines.
+  - Echoing it directly can exceed Discord message limits or make the frontend response messy.
+- Changes:
+  - Added `format_discord_command_label()` to flatten and cap command labels.
+  - Applied it to unknown prefix command responses.
+  - Added regression coverage for formatter truncation and bounded unknown-command responses.
+- Abuse cases checked:
+  - Oversized unknown commands no longer produce oversized Discord responses.
+  - Newline/control-style command labels are flattened before display.
+  - The change does not affect known command routing or authorization.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 33 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need live Discord command input after deployment for final frontend proof.
+
 ## 2026-06-03 12:41:19 +09:00
 - Goal: make Discord queued ask runner failures visible to the user instead of log-only.
 - Key assumptions:

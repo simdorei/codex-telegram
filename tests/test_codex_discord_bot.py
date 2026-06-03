@@ -168,6 +168,12 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(fitted), bot.DISCORD_MAX_LEN)
         self.assertTrue(fitted.endswith("[truncated for Discord]"))
 
+    def test_format_discord_command_label_truncates_and_flattens(self) -> None:
+        label = bot.format_discord_command_label("x" * 100 + "\nboom")
+        self.assertLessEqual(len(label), 80)
+        self.assertNotIn("\n", label)
+        self.assertTrue(label.endswith("..."))
+
     def test_help_readme_and_registered_slash_commands_match(self) -> None:
         expected_commands = {
             "help",
@@ -595,6 +601,17 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.channel.messages, [("ok", None)])
         finally:
             bot.run_bridge_and_send = original_run_bridge_and_send
+
+    async def test_unknown_prefix_command_response_is_bounded(self) -> None:
+        message = FakeMessage()
+        await bot.handle_prefix_command(None, message, "x" * 4100)
+
+        self.assertEqual(len(message.channel.messages), 1)
+        content, view = message.channel.messages[0]
+        self.assertLessEqual(len(content), 100)
+        self.assertIsNone(view)
+        self.assertTrue(content.startswith("Unknown command: !"))
+        self.assertTrue(content.endswith("..."))
 
     async def test_new_thread_flow_uses_resolved_cwd_and_mirrors(self) -> None:
         original_resolve_cwd = bot.resolve_discord_new_thread_cwd
