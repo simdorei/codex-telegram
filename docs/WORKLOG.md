@@ -1,5 +1,23 @@
 # WORKLOG
 
+## 2026-06-03 11:49:27 +09:00
+- Goal: keep Discord `/new` regression tests from polluting live bot logs.
+- Key assumptions:
+  - Synthetic `new_thread_*` test logs can be mistaken for live Discord evidence.
+  - Production logging behavior should remain unchanged.
+- Changes:
+  - Wrapped the new-thread flow regression test with `CODEX_DISCORD_LOG_PATH` pointing at a temporary file.
+- Abuse cases checked:
+  - Test-only change adds no externally reachable behavior.
+  - Temporary log path is scoped to the test process and restored after the test.
+  - `/new` runtime authorization and cwd/mirror behavior remain unchanged.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 14 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - None for test isolation.
+
 ## 2026-06-03 11:47:30 +09:00
 - Goal: align Discord slash frontend with the documented new-thread flow.
 - Key assumptions:

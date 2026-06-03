@@ -355,11 +355,14 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.run_bridge_command = fake_run_bridge_command
             bot.mirror_single_codex_thread = fake_mirror_single_codex_thread
 
-            exit_code, output = await bot.run_discord_new_thread(
-                SimpleNamespace(),
-                222,
-                "start here",
-            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    exit_code, output = await bot.run_discord_new_thread(
+                        SimpleNamespace(),
+                        222,
+                        "start here",
+                    )
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(argv_seen, ["new", "--cwd", r"C:\taxlab", "start here"])
