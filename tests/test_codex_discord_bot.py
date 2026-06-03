@@ -20,6 +20,17 @@ class FakeFollowup:
         self.kwargs.append(kwargs)
 
 
+class FailingFollowup:
+    def __init__(self, fail_after: int = 0) -> None:
+        self.messages: list[object] = []
+        self.fail_after = fail_after
+
+    async def send(self, content: str, view=None, **kwargs) -> None:
+        if len(self.messages) >= self.fail_after:
+            raise RuntimeError("followup unavailable")
+        self.messages.append(content if view is None else (content, view))
+
+
 class FakeResponse:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -247,6 +258,54 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(message) <= bot.DISCORD_MAX_LEN for message in interaction.followup.messages))
         self.assertIn("button_response_start command=ask title='Steering' exit=1", log_text)
         self.assertIn("button_response_sent command=ask title='Steering' exit=1", log_text)
+
+    async def test_send_followup_chunks_falls_back_to_channel_on_send_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            interaction.followup = FailingFollowup()
+            interaction.channel = FakeTarget()
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.send_followup_chunks(
+                    interaction,
+                    "button result",
+                    title="Steering",
+                    exit_code=1,
+                    log_prefix="button_response",
+                )
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(interaction.followup.messages, [])
+        self.assertEqual(len(interaction.channel.messages), 1)
+        content, view = interaction.channel.messages[0]
+        self.assertIsNone(view)
+        self.assertIn("Discord follow-up delivery failed; posting response here.", content)
+        self.assertIn("button result", content)
+        self.assertIn("button_response_failed command=ask title='Steering' exit=1", log_text)
+        self.assertIn("error_type=RuntimeError", log_text)
+        self.assertIn("button_response_fallback_sent command=ask title='Steering' exit=1", log_text)
+
+    async def test_send_followup_chunks_falls_back_with_remaining_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            interaction.followup = FailingFollowup(fail_after=1)
+            interaction.channel = FakeTarget()
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.send_followup_chunks(
+                    interaction,
+                    "x" * 4100,
+                    title="Steering",
+                    exit_code=1,
+                    log_prefix="button_response",
+                )
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(len(interaction.followup.messages), 1)
+        self.assertGreater(len(interaction.channel.messages), 0)
+        fallback_text = "\n".join(content for content, _view in interaction.channel.messages)
+        self.assertIn("posting remaining response here", fallback_text)
+        self.assertIn("sent=1", log_text)
 
     async def test_on_message_logs_received_before_empty_content_ignore(self) -> None:
         client = SimpleNamespace(

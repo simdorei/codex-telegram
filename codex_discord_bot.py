@@ -1089,8 +1089,35 @@ async def send_followup_chunks(
         f"{log_prefix}_start command={command_name} title={title!r} "
         f"exit={exit_part} chunks={len(chunks)} channel={interaction.channel_id}"
     )
-    for chunk in chunks:
-        await interaction.followup.send(chunk)
+    sent_count = 0
+    try:
+        for chunk in chunks:
+            await interaction.followup.send(chunk)
+            sent_count += 1
+    except Exception as exc:
+        log_line(
+            f"{log_prefix}_failed command={command_name} title={title!r} "
+            f"exit={exit_part} sent={sent_count} chunks={len(chunks)} "
+            f"error_type={type(exc).__name__}"
+        )
+        channel = getattr(interaction, "channel", None)
+        if channel is not None and hasattr(channel, "send"):
+            remaining = "\n\n".join(chunks[sent_count:]) or "(no output)"
+            prefix = (
+                "Discord follow-up delivery failed; posting remaining response here."
+                if sent_count
+                else "Discord follow-up delivery failed; posting response here."
+            )
+            try:
+                await send_chunks(channel, f"{prefix}\n\n{remaining}")
+                log_line(
+                    f"{log_prefix}_fallback_sent command={command_name} title={title!r} "
+                    f"exit={exit_part} sent={sent_count} chunks={len(chunks)}"
+                )
+                return
+            except Exception:
+                log_line(f"{log_prefix}_fallback_failed\n" + traceback.format_exc())
+        raise
     log_line(
         f"{log_prefix}_sent command={command_name} title={title!r} "
         f"exit={exit_part} chunks={len(chunks)}"

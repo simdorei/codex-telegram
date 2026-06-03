@@ -1133,3 +1133,26 @@
   - No command schema, mirror DB schema, or session behavior changed.
 - Unresolved:
   - Still needs fresh live Discord input after deployment to prove end-to-end hook behavior.
+
+## 2026-06-03 13:04 +09:00 - Discord followup fallback
+- Goal: avoid silent Discord UI failures when slash/button follow-up delivery fails after a deferred interaction.
+- Key assumptions:
+  - Slash responses and button result messages should not disappear silently if the interaction follow-up webhook fails.
+  - Existing `send_followup_chunks` callers are public response paths; fallback can post to the same channel.
+- Changes:
+  - Added failure logging around `send_followup_chunks` without logging response bodies.
+  - Added channel fallback for unsent or remaining chunks when `interaction.followup.send` fails.
+  - Added regression tests for first-chunk failure and mid-stream failure.
+- Abuse cases checked:
+  - Raw prompt/output leakage into failure logs: blocked by logging counts and exception type only.
+  - Oversized fallback response causing Discord API rejection: blocked by reusing `send_chunks`.
+  - Private/unauthorized disclosure through fallback: accepted for existing public slash/button result paths; do not reuse this helper for future ephemeral-only responses without revisiting.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (38 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - If a follow-up webhook fails, the bot may post the remaining public response in the Discord channel instead of staying silent.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord input/button interaction after deployment to prove end-to-end Discord behavior.
