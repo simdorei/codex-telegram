@@ -1305,6 +1305,32 @@
 - Unresolved:
   - Live Discord button/ask behavior still needs a fresh post-deploy click/message to prove end-to-end behavior in the server.
 
+## 2026-06-03 13:46 +09:00 - Discord startup channel diagnostics
+- Goal: make Discord event-hooking failures diagnosable from runtime logs by proving whether the bot can see configured and mirrored channels.
+- Key assumptions:
+  - If live Discord messages/buttons still do not appear in logs, the next useful split is channel/thread visibility versus Discord event delivery.
+  - Channel IDs, source type, parent IDs, and boolean access flags are sufficient diagnostics without logging message content.
+- Changes:
+  - Added startup probe target selection for startup, allowed, mirror project, and mirror thread channels.
+  - Added startup diagnostics that logs cache/fetch access, channel/thread type, parent ID, messageable status, and `allowed_message` status.
+  - Added startup notify success/failure/skip logging.
+  - Added a regression test for startup probe target selection and de-duplication.
+- Abuse cases checked:
+  - Leaking message/prompt content through diagnostics: blocked by logging only IDs, type names, booleans, and exception type.
+  - Excessive probing or log spam from many mirrors: bounded by a 30-target limit and de-duplication.
+  - Startup diagnostics breaking bot readiness: wrapped in failure logging so exceptions do not escape the ready handler.
+  - Startup notify failure becoming silent: now logged structurally without exposing content beyond the fixed online message.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (51 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Startup logs now include channel probe lines for configured and mirrored Discord channels.
+  - Startup notify send failures are explicitly logged.
+  - No command schema, mirror DB schema, session behavior, or BusyChoice behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

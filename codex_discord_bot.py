@@ -419,6 +419,51 @@ def format_busy_choice_custom_id(choice_id: str, action: str) -> str:
     return f"{BUSY_CHOICE_CUSTOM_ID_PREFIX}:{choice_id}:{action}"
 
 
+def get_startup_probe_targets(
+    allowed_channel_ids: set[int],
+    startup_channel_id: int | None,
+    *,
+    limit: int = 30,
+) -> list[tuple[str, int]]:
+    seen: set[int] = set()
+    targets: list[tuple[str, int]] = []
+
+    def add(label: str, channel_id: int | None) -> None:
+        if not channel_id:
+            return
+        normalized = int(channel_id)
+        if normalized in seen or len(targets) >= limit:
+            return
+        seen.add(normalized)
+        targets.append((label, normalized))
+
+    add("startup", startup_channel_id)
+    for channel_id in sorted(allowed_channel_ids):
+        add("allowed", channel_id)
+
+    init_mirror_db()
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        for row in conn.execute(
+            """
+            SELECT discord_channel_id FROM mirror_projects
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall():
+            add("mirror_project", int(row[0]))
+        for row in conn.execute(
+            """
+            SELECT discord_thread_id FROM mirror_threads
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall():
+            add("mirror_thread", int(row[0]))
+    return targets
+
+
 def normalize_discord_name(value: str, *, prefix: str = "", max_len: int = 90) -> str:
     text = (value or "").strip().lower()
     text = re.sub(r"[^0-9a-z가-힣_-]+", "-", text)
@@ -1061,8 +1106,56 @@ class CodexDiscordBot(discord.Client):
             log_line(f"setup_hook_sync_skipped error={exc}")
         log_line("setup_hook_done")
 
+    def get_cached_channel_or_thread(self, channel_id: int) -> tuple[object | None, str]:
+        channel = self.get_channel(channel_id)
+        if channel is not None:
+            return channel, "client_channel_cache"
+        for guild in self.guilds:
+            thread = guild.get_thread(channel_id)
+            if thread is not None:
+                return thread, "guild_thread_cache"
+            guild_channel = guild.get_channel(channel_id)
+            if guild_channel is not None:
+                return guild_channel, "guild_channel_cache"
+        return None, "-"
+
+    async def probe_channel_access(self, label: str, channel_id: int) -> None:
+        channel, source = self.get_cached_channel_or_thread(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+                source = "fetch"
+            except Exception as exc:
+                log_line(
+                    f"startup_channel_probe label={label} channel={channel_id} "
+                    f"status=failed source=fetch error_type={type(exc).__name__}"
+                )
+                return
+        try:
+            allowed_message = self.is_allowed_message_channel(channel)  # type: ignore[arg-type]
+        except Exception:
+            allowed_message = False
+        log_line(
+            f"startup_channel_probe label={label} channel={channel_id} status=ok "
+            f"source={source} type={type(channel).__name__} "
+            f"parent={getattr(channel, 'parent_id', '-')} "
+            f"messageable={isinstance(channel, discord.abc.Messageable)} "
+            f"allowed_message={allowed_message}"
+        )
+
+    async def log_startup_diagnostics(self) -> None:
+        try:
+            targets = get_startup_probe_targets(self.allowed_channel_ids, self.startup_channel_id)
+            log_line(f"startup_diagnostics_start targets={len(targets)}")
+            for label, channel_id in targets:
+                await self.probe_channel_access(label, channel_id)
+            log_line("startup_diagnostics_done")
+        except Exception:
+            log_line("startup_diagnostics_failed\n" + traceback.format_exc())
+
     async def on_ready(self) -> None:
         log_line(f"ready user={self.user} guilds={len(self.guilds)}")
+        await self.log_startup_diagnostics()
         if env_flag("DISCORD_STARTUP_NOTIFY", default=False) and self.startup_channel_id:
             channel = self.get_channel(self.startup_channel_id)
             if channel is None:
@@ -1072,7 +1165,13 @@ class CodexDiscordBot(discord.Client):
                     log_line("startup_channel_fetch_failed\n" + traceback.format_exc())
                     return
             if isinstance(channel, discord.abc.Messageable):
-                await send_chunks(channel, "Codex Discord bot online. Try `!list` or `/list`.")
+                try:
+                    await send_chunks(channel, "Codex Discord bot online. Try `!list` or `/list`.")
+                    log_line(f"startup_notify_sent channel={self.startup_channel_id}")
+                except Exception:
+                    log_line("startup_notify_failed\n" + traceback.format_exc())
+            else:
+                log_line(f"startup_notify_skipped channel={self.startup_channel_id} reason=not_messageable")
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         interaction_type = format_interaction_type(interaction)

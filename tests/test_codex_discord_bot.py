@@ -389,6 +389,46 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("busy_choice_persistent_denied", log_text)
         self.assertNotIn("please queue", log_text)
 
+    def test_startup_probe_targets_include_allowed_and_mirror_channels(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                bot.init_mirror_db()
+                with sqlite3.connect(bot.MIRROR_DB_PATH) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO mirror_projects (
+                            project_key, project_name, discord_channel_id, updated_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        ("c:/taxlab", "taxlab", 333, 20.0),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO mirror_threads (
+                            codex_thread_id, project_key, thread_title,
+                            discord_channel_id, discord_thread_id, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("thread-1", "c:/taxlab", "title", 333, 444, 30.0),
+                    )
+                targets = bot.get_startup_probe_targets({111, 222}, 111)
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertEqual(
+            targets,
+            [
+                ("startup", 111),
+                ("allowed", 222),
+                ("mirror_project", 333),
+                ("mirror_thread", 444),
+            ],
+        )
+
     def test_help_readme_and_registered_slash_commands_match(self) -> None:
         expected_commands = {
             "help",
