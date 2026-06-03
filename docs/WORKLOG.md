@@ -1883,3 +1883,26 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:33 +09:00 - Discord interaction marker diagnostics
+- Goal: make `/doctor` distinguish raw interaction receipt, dispatched interactions, and component/button handling.
+- Key assumptions:
+  - Slash/button failures can stop at different layers, so doctor should show the last timestamp for each layer.
+  - The recent event list is bounded and can push older interaction evidence out of view.
+- Changes:
+  - Added `last_raw_interaction_at`, `last_interaction_at`, and `last_component_at` log markers.
+  - Added those markers to Discord adapter diagnostics.
+  - Extended the doctor regression test with raw slash, application-command, component, and component fallback log lines.
+- Abuse cases checked:
+  - Prompt leakage: markers expose timestamps only.
+  - Custom ID overexposure: no new custom ID fields were added beyond the already sanitized recent-event summary.
+  - Misdiagnosis from bounded recent logs: last-marker fields remain visible even when recent-event slots are consumed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (65 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `/doctor` and `!doctor` output gains three interaction timestamp lines.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

@@ -2967,6 +2967,9 @@ def get_discord_log_markers(*, max_lines: int = 2000) -> dict[str, str]:
     markers = {
         "last_ready_at": "-",
         "last_gateway_event_at": "-",
+        "last_raw_interaction_at": "-",
+        "last_interaction_at": "-",
+        "last_component_at": "-",
         "last_user_or_control_hook_at": "-",
     }
     try:
@@ -2982,6 +2985,14 @@ def get_discord_log_markers(*, max_lines: int = 2000) -> dict[str, str]:
             markers["last_ready_at"] = timestamp
         if body.startswith(("socket_message_create ", "socket_message_create_untracked ", "socket_interaction_create ")):
             markers["last_gateway_event_at"] = timestamp
+        if body.startswith("socket_interaction_create "):
+            markers["last_raw_interaction_at"] = timestamp
+        if body.startswith("interaction_received "):
+            markers["last_interaction_at"] = timestamp
+            if " type=component " in f" {body} ":
+                markers["last_component_at"] = timestamp
+        if body.startswith(("component_interaction_", "busy_choice_persistent_")):
+            markers["last_component_at"] = timestamp
         summary = summarize_discord_hook_log_line(line)
         if summary and is_user_or_control_hook_summary(summary):
             markers["last_user_or_control_hook_at"] = timestamp
@@ -3021,6 +3032,9 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
         f"busy_choices_stale: {stale_busy_choices}",
         f"last_ready_at: {log_markers['last_ready_at']}",
         f"last_gateway_event_at: {log_markers['last_gateway_event_at']}",
+        f"last_raw_interaction_at: {log_markers['last_raw_interaction_at']}",
+        f"last_interaction_at: {log_markers['last_interaction_at']}",
+        f"last_component_at: {log_markers['last_component_at']}",
         f"last_user_or_control_hook_at: {log_markers['last_user_or_control_hook_at']}",
         "",
         *mirror_lines,

@@ -541,6 +541,10 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                             "[2026-06-03 14:00:02] busy_choice_sent reason=late_busy_failure target=thread-1 prompt_len=16",
                             "[2026-06-03 14:00:03] slash_ask_dispatch command=ask channel=222 user=2 target_source=mirror target=thread-1 prompt_len=9",
                             "[2026-06-03 14:00:04] slash_response_sent command=doctor title='Doctor' exit=0 chunks=1",
+                            "[2026-06-03 14:00:05] socket_interaction_create channel=222 guild=1 user=2 type=2 command=ask",
+                            "[2026-06-03 14:00:06] interaction_received type=application_command command=ask custom_id=- channel=222 user=2",
+                            "[2026-06-03 14:00:07] interaction_received type=component command=- custom_id=codex_busy:abcd:queue channel=222 user=2",
+                            "[2026-06-03 14:00:08] component_interaction_unhandled_reported custom_id=codex_busy:abcd:queue channel=222",
                         ]
                     ),
                     encoding="utf-8",
@@ -564,17 +568,22 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("slash_sync_commands: ask,doctor,new", output)
         self.assertIn("allowed_channels: 222", output)
         self.assertIn("last_ready_at: 2026-06-03 13:59:57", output)
-        self.assertIn("last_gateway_event_at: 2026-06-03 14:00:00", output)
-        self.assertIn("last_user_or_control_hook_at: 2026-06-03 14:00:04", output)
+        self.assertIn("last_gateway_event_at: 2026-06-03 14:00:05", output)
+        self.assertIn("last_raw_interaction_at: 2026-06-03 14:00:05", output)
+        self.assertIn("last_interaction_at: 2026-06-03 14:00:07", output)
+        self.assertIn("last_component_at: 2026-06-03 14:00:08", output)
+        self.assertIn("last_user_or_control_hook_at: 2026-06-03 14:00:08", output)
         self.assertIn("Mirror check", output)
         self.assertIn("Expected live log sequence:", output)
         self.assertIn("Recent user/control hook events:", output)
         self.assertIn("Recent hook events:", output)
-        self.assertIn("raw_message channel=222 source=client_channel_cache bot=False", output)
         self.assertIn("message_routed channel=222", output)
         self.assertIn("busy_choice_event reason=late_busy_failure", output)
         self.assertIn("slash_ask_dispatch channel=222 command=ask", output)
         self.assertIn("slash_response_sent channel=- command=doctor exit=0", output)
+        self.assertIn("raw_interaction channel=222 type=2 command=ask", output)
+        self.assertIn("interaction_received channel=222 type=component command=-", output)
+        self.assertIn("component_event channel=222 custom_id=codex_busy:abcd:queue", output)
         user_section = output.split("Recent user/control hook events:", 1)[1].split("Recent hook events:", 1)[0]
         self.assertNotIn("bot=True", user_section)
         self.assertNotIn("sensitive prompt", output)
