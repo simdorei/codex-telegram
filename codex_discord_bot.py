@@ -825,10 +825,12 @@ class CodexDiscordBot(discord.Client):
                 guild = discord.Object(id=self.guild_id)
                 self.tree.copy_global_to(guild=guild)
                 log_line(f"setup_hook_sync_guild guild_id={self.guild_id}")
-                await asyncio.wait_for(self.tree.sync(guild=guild), timeout=20)
+                synced = await asyncio.wait_for(self.tree.sync(guild=guild), timeout=20)
             else:
                 log_line("setup_hook_sync_global")
-                await asyncio.wait_for(self.tree.sync(), timeout=20)
+                synced = await asyncio.wait_for(self.tree.sync(), timeout=20)
+            command_names = sorted(command.name for command in synced)
+            log_line(f"setup_hook_synced commands={','.join(command_names) or '-'}")
         except Exception as exc:
             log_line(f"setup_hook_sync_skipped error={exc}")
         log_line("setup_hook_done")

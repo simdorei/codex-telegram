@@ -1,5 +1,23 @@
 # WORKLOG
 
+## 2026-06-03 10:50:23 +09:00
+- Goal: make Discord slash sync verification visible in runtime logs.
+- Key assumptions:
+  - Direct Discord API reads for guild application commands can be forbidden even when the bot can sync commands.
+  - `CommandTree.sync()` returns the authoritative command objects for the sync attempt inside the bot process.
+- Changes:
+  - Logged the sorted slash command names returned by `tree.sync()` as `setup_hook_synced commands=...`.
+- Abuse cases checked:
+  - The new log line contains command names only, not token, channel, user, prompt, or session content.
+  - No new Discord command surface is exposed by this patch.
+  - Sync failure handling remains unchanged and still logs a compact error.
+- Verification:
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, and `codex_desktop_bridge.py`.
+  - `git diff --check`
+  - Source smoke confirmed the sync log marker exists and the registered slash commands are `context`, `doctor`, `help`, `list`, `mirror_check`, `status`, `use`, `where`.
+- Unresolved items:
+  - Need bot restart log to capture the actual synced command names from Discord.
+
 ## 2026-06-03 10:46:31 +09:00
 - Goal: align Discord slash-command frontend with advertised diagnostics.
 - Key assumptions:
