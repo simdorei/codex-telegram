@@ -292,7 +292,10 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             )
             message = FakeMessage(content="please hook", channel_id=333)
 
-            await bot.CodexDiscordBot.on_message(client, message)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.CodexDiscordBot.on_message(client, message)
 
             sent = [content for content, _view in message.channel.messages]
             self.assertGreater(len(sent), 1)

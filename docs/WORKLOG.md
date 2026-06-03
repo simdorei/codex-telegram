@@ -1092,3 +1092,22 @@
   - No route/schema/session behavior changed.
 - Unresolved:
   - Needs a fresh live Discord message after deployment to confirm whether the event reaches `on_message`.
+
+## 2026-06-03 12:56 +09:00 - Discord hook test log isolation
+- Goal: prevent Discord hook observability tests from writing synthetic entries into the runtime Discord log.
+- Key assumptions:
+  - Test diagnostics must stay isolated from live Discord evidence because runtime logs are used to validate user reports.
+- Changes:
+  - Wrapped the project-parent `on_message` chunking regression test in `CODEX_DISCORD_LOG_PATH` temp-log isolation.
+- Abuse cases checked:
+  - Synthetic test evidence mistaken for live Discord activity: blocked by per-test temp log isolation.
+  - Runtime log growth from test loops: blocked by avoiding writes to the default runtime log.
+  - Raw prompt leakage through tests: still blocked; the tested runtime code logs lengths only.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (35 tests)
+  - `py -3` temp `py_compile` for `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Test-only change; no runtime behavior changed.
+- Unresolved:
+  - The runtime log contains one synthetic `chat=333` line from the pre-fix test run and should not be treated as live Discord evidence.
