@@ -1267,8 +1267,8 @@ class CodexDiscordBot(discord.Client):
         log_line(f"history_poll_started seconds={self.history_poll_seconds:g}")
 
     async def history_poll_loop(self) -> None:
-        try:
-            while not self.is_closed():
+        while not self.is_closed():
+            try:
                 self._history_poll_last_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 targets = get_startup_probe_targets(
                     self.allowed_channel_ids,
@@ -1277,11 +1277,11 @@ class CodexDiscordBot(discord.Client):
                 )
                 for label, channel_id in targets:
                     await self.poll_history_channel(label, channel_id)
-                await asyncio.sleep(self.history_poll_seconds)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log_line("history_poll_loop_failed\n" + traceback.format_exc())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log_line("history_poll_cycle_failed\n" + traceback.format_exc())
+            await asyncio.sleep(self.history_poll_seconds)
 
     async def poll_history_channel(self, label: str, channel_id: int) -> None:
         channel, source = self.get_cached_channel_or_thread(channel_id)

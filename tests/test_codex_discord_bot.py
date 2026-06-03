@@ -680,6 +680,53 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.is_thread_runner_busy = original_is_thread_runner_busy
             bot.get_busy_state_for_thread = original_get_busy_state
 
+    async def test_history_poll_loop_continues_after_cycle_error(self) -> None:
+        original_get_targets = bot.get_startup_probe_targets
+        original_sleep = bot.asyncio.sleep
+        calls: list[str] = []
+        sleeps = 0
+
+        def fake_get_targets(allowed_channel_ids, startup_channel_id, *, limit=50):
+            calls.append("targets")
+            if len(calls) == 1:
+                raise RuntimeError("temporary db error")
+            return [("allowed", 333)]
+
+        async def fake_sleep(_seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps >= 2:
+                raise asyncio.CancelledError
+
+        async def fake_poll(label, channel_id):
+            calls.append(f"poll:{label}:{channel_id}")
+
+        client = SimpleNamespace(
+            is_closed=lambda: False,
+            allowed_channel_ids={333},
+            startup_channel_id=None,
+            history_poll_seconds=0.01,
+            _history_poll_last_at="-",
+            poll_history_channel=fake_poll,
+        )
+
+        try:
+            bot.get_startup_probe_targets = fake_get_targets
+            bot.asyncio.sleep = fake_sleep
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await bot.CodexDiscordBot.history_poll_loop(client)
+                log_text = log_path.read_text(encoding="utf-8")
+        finally:
+            bot.get_startup_probe_targets = original_get_targets
+            bot.asyncio.sleep = original_sleep
+
+        self.assertEqual(calls, ["targets", "targets", "poll:allowed:333"])
+        self.assertIn("history_poll_cycle_failed", log_text)
+        self.assertIn("temporary db error", log_text)
+
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
         fake_client = SimpleNamespace(
             is_allowed_channel=lambda channel_id: channel_id == 222,

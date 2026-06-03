@@ -1906,3 +1906,26 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:36 +09:00 - Discord history poll cycle recovery
+- Goal: keep the history polling fallback alive after transient DB/cache/API failures.
+- Key assumptions:
+  - Polling is a fallback safety net; it should not exit permanently because one cycle fails.
+  - Cancellation should still stop the task normally during shutdown/restart.
+- Changes:
+  - Changed `history_poll_loop()` to catch normal exceptions per cycle, log `history_poll_cycle_failed`, then continue after the configured sleep.
+  - Kept `asyncio.CancelledError` as a real task cancellation path.
+  - Added a regression test proving a failed cycle is followed by a successful poll cycle.
+- Abuse cases checked:
+  - Permanent fallback loss from transient errors: mitigated by cycle-level recovery.
+  - Shutdown hang: cancellation is still re-raised.
+  - Log spam from repeated failures: failures are logged once per failed cycle; interval remains configurable and bounded.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (66 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - History polling no longer dies silently after a recoverable cycle error.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
