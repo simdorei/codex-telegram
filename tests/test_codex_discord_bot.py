@@ -527,6 +527,36 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.run_bridge_command = original_run_bridge_command
             bot.mirror_single_codex_thread = original_mirror_single
 
+    async def test_slash_new_dispatch_logs_and_sends_response(self) -> None:
+        original_run_discord_new_thread = bot.run_discord_new_thread
+        calls: list[tuple[object, int | None, str]] = []
+        try:
+            async def fake_run_discord_new_thread(fake_bot, channel_id, prompt):
+                calls.append((fake_bot, channel_id, prompt))
+                return 0, "New\n\ntarget_thread: thread-new"
+
+            bot.run_discord_new_thread = fake_run_discord_new_thread
+            fake_bot = SimpleNamespace()
+            interaction = FakeInteraction(command_name="new", channel_id=222)
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.handle_slash_new(fake_bot, interaction, "start here")
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(calls, [(fake_bot, 222, "start here")])
+            self.assertEqual(interaction.followup.messages, ["New\n\ntarget_thread: thread-new"])
+            self.assertEqual(interaction.followup.kwargs, [{}])
+            self.assertIn("slash_new_dispatch channel=222", log_text)
+            self.assertIn("user=242286902982606848", log_text)
+            self.assertIn("prompt_len=10", log_text)
+            self.assertIn("slash_new_done channel=222 exit=0", log_text)
+            self.assertIn("slash_response_start command=new title='New' exit=0", log_text)
+            self.assertIn("slash_response_sent command=new title='New' exit=0", log_text)
+        finally:
+            bot.run_discord_new_thread = original_run_discord_new_thread
+
     async def test_slash_ask_routes_to_existing_ask_flow(self) -> None:
         original_get_mirrored = bot.get_mirrored_codex_thread_id
         original_handle_plain_ask = bot.handle_plain_ask

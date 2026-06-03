@@ -1084,6 +1084,20 @@ async def run_discord_new_thread(
     return exit_code, "\n\n".join(parts)
 
 
+async def handle_slash_new(
+    bot: "CodexDiscordBot",
+    interaction: discord.Interaction,
+    prompt: str,
+) -> None:
+    log_line(
+        f"slash_new_dispatch channel={interaction.channel_id} "
+        f"user={interaction.user.id} prompt_len={format_log_text_len(prompt)}"
+    )
+    exit_code, output = await run_discord_new_thread(bot, interaction.channel_id, prompt)
+    log_line(f"slash_new_done channel={interaction.channel_id} exit={exit_code}")
+    await send_interaction_chunks(interaction, output, title="New", exit_code=exit_code)
+
+
 async def handle_slash_ask(interaction: discord.Interaction, prompt: str) -> None:
     channel = interaction.channel
     if channel is None or not hasattr(channel, "send"):
@@ -2880,13 +2894,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        log_line(
-            f"slash_new_dispatch channel={interaction.channel_id} "
-            f"user={interaction.user.id} prompt_len={format_log_text_len(prompt)}"
-        )
-        exit_code, output = await run_discord_new_thread(bot, interaction.channel_id, prompt)
-        log_line(f"slash_new_done channel={interaction.channel_id} exit={exit_code}")
-        await send_interaction_chunks(interaction, output, title="New", exit_code=exit_code)
+        await handle_slash_new(bot, interaction, prompt)
 
     @bot.tree.command(name="ask", description="Send a prompt to the mapped or selected Codex thread.")
     async def slash_ask(interaction: discord.Interaction, prompt: str) -> None:

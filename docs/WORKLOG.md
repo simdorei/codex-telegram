@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 12:20:52 +09:00
+- Goal: make Discord slash `/new` dispatch behavior directly testable.
+- Key assumptions:
+  - Slash `/new` should keep using the same cwd and mirror flow as prefix `!new`.
+  - A direct handler-level regression is stronger evidence than checking only for log marker strings in source.
+- Changes:
+  - Extracted `handle_slash_new()` for slash `/new` dispatch, bridge execution, completion logging, and response sending.
+  - Added a regression test that verifies `/new` passes the interaction channel id and prompt into `run_discord_new_thread()`, logs dispatch/done, and sends the slash response.
+- Abuse cases checked:
+  - Authorization remains in the registered slash command before the extracted handler is called.
+  - Logs include prompt length only, not prompt content.
+  - The change does not alter cwd resolution, mirror mutation, bridge execution, or Discord thread creation placement.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 22 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/new` input after deployment to capture live `slash_new_dispatch`, `new_thread_cwd`, and `new_thread_mirrored` together.
+
 ## 2026-06-03 12:17:07 +09:00
 - Goal: keep Discord `Steer now` from falling back to raw failure when Codex is waiting for input.
 - Key assumptions:
