@@ -1452,6 +1452,30 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:16 +09:00 - Discord raw tracking source alignment
+- Goal: align raw `MESSAGE_CREATE` tracked classification with the same allowed-channel logic used by `on_message`.
+- Key assumptions:
+  - Live Discord hook debugging needs raw gateway logs to treat cached threads under allowed or mirrored parents as tracked.
+  - This is diagnostics-only and should not alter message handling, command routing, session state, or UI behavior.
+- Changes:
+  - Added `is_tracked_socket_message_channel` to centralize raw message tracking checks.
+  - Raw `MESSAGE_CREATE` logs now include the tracking source such as cache, allowlist, or mirror mapping.
+  - Updated raw socket diagnostics tests for cached tracked channels and untracked channels.
+- Abuse cases checked:
+  - Sensitive prompt leakage: raw logs still record only message content length, never message text.
+  - Unauthorized channel leakage: untracked raw messages still omit author ID and content length.
+  - Cache/adapter failure during diagnostics: cache check failures fail closed as untracked with minimal source detail.
+  - Diagnostic change becoming behavior change: no command handlers, message execution paths, DB schema, or button state logic changed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (59 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Raw `MESSAGE_CREATE` diagnostics now include `source=...` to explain why a channel was considered tracked or untracked.
+  - No command schema, mirror DB schema, session behavior, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

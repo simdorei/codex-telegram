@@ -463,9 +463,16 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
         fake_client = SimpleNamespace(
             is_allowed_channel=lambda channel_id: channel_id == 222,
+            is_allowed_message_channel=lambda channel: getattr(channel, "id", None) == 222,
+            get_cached_channel_or_thread=lambda channel_id: (
+                (SimpleNamespace(id=222), "test_cache") if channel_id == 222 else (None, "-")
+            ),
         )
         fake_client.format_socket_interaction_user = (
             lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
+        )
+        fake_client.is_tracked_socket_message_channel = (
+            lambda channel_id: bot.CodexDiscordBot.is_tracked_socket_message_channel(fake_client, channel_id)
         )
         async def fake_log_socket_payload(payload):
             await bot.CodexDiscordBot.log_socket_payload(fake_client, payload)
@@ -488,15 +495,21 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             log_text = log_path.read_text(encoding="utf-8")
 
         self.assertIn("socket_message_create channel=222 tracked=True", log_text)
+        self.assertIn("source=test_cache", log_text)
         self.assertIn("content_len=16", log_text)
         self.assertNotIn("sensitive prompt", log_text)
 
     async def test_socket_raw_receive_dispatches_gateway_payload(self) -> None:
         fake_client = SimpleNamespace(
             is_allowed_channel=lambda channel_id: channel_id == 222,
+            is_allowed_message_channel=lambda channel: False,
+            get_cached_channel_or_thread=lambda channel_id: (None, "-"),
         )
         fake_client.format_socket_interaction_user = (
             lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
+        )
+        fake_client.is_tracked_socket_message_channel = (
+            lambda channel_id: bot.CodexDiscordBot.is_tracked_socket_message_channel(fake_client, channel_id)
         )
         async def fake_log_socket_payload(payload):
             await bot.CodexDiscordBot.log_socket_payload(fake_client, payload)
@@ -528,9 +541,14 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_socket_message_create_untracked_omits_author_and_content_len(self) -> None:
         fake_client = SimpleNamespace(
             is_allowed_channel=lambda channel_id: False,
+            is_allowed_message_channel=lambda channel: False,
+            get_cached_channel_or_thread=lambda channel_id: (None, "-"),
         )
         fake_client.format_socket_interaction_user = (
             lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
+        )
+        fake_client.is_tracked_socket_message_channel = (
+            lambda channel_id: bot.CodexDiscordBot.is_tracked_socket_message_channel(fake_client, channel_id)
         )
         async def fake_log_socket_payload(payload):
             await bot.CodexDiscordBot.log_socket_payload(fake_client, payload)

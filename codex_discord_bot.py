@@ -1216,6 +1216,22 @@ class CodexDiscordBot(discord.Client):
     async def on_socket_response(self, payload: dict[str, object]) -> None:
         await self.log_socket_payload(payload)
 
+    def is_tracked_socket_message_channel(self, channel_id: int | None) -> tuple[bool, str]:
+        if channel_id is None:
+            return False, "missing_channel"
+        channel, source = self.get_cached_channel_or_thread(channel_id)
+        if channel is not None:
+            try:
+                if self.is_allowed_message_channel(channel):  # type: ignore[arg-type]
+                    return True, source
+            except Exception:
+                return False, "cache_error"
+        if self.is_allowed_channel(channel_id):
+            return True, "allowed_channel_id"
+        if is_mirrored_channel_id(channel_id):
+            return True, "mirror_channel_id"
+        return False, source
+
     async def log_socket_payload(self, payload: dict[str, object]) -> None:
         event_type = str(payload.get("t") or "")
         data = payload.get("d")
@@ -1233,20 +1249,17 @@ class CodexDiscordBot(discord.Client):
             if isinstance(author, dict):
                 author_id = str(author.get("id") or "-")
                 author_bot = str(bool(author.get("bot", False)))
-            tracked = (
-                channel_id is not None
-                and (self.is_allowed_channel(channel_id) or is_mirrored_channel_id(channel_id))
-            )
+            tracked, track_source = self.is_tracked_socket_message_channel(channel_id)
             if not tracked:
                 log_line(
                     f"socket_message_create_untracked channel={channel_id or '-'} "
-                    f"guild={data.get('guild_id') or '-'}"
+                    f"guild={data.get('guild_id') or '-'} source={track_source}"
                 )
                 return
             log_line(
                 f"socket_message_create channel={channel_id or '-'} tracked={tracked} "
-                f"guild={data.get('guild_id') or '-'} author={author_id} bot={author_bot} "
-                f"content_len={format_log_text_len(data.get('content'))}"
+                f"source={track_source} guild={data.get('guild_id') or '-'} "
+                f"author={author_id} bot={author_bot} content_len={format_log_text_len(data.get('content'))}"
             )
             return
         if event_type == "INTERACTION_CREATE":
