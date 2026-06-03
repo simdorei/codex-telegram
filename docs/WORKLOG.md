@@ -2027,3 +2027,29 @@
   - No Discord command schema, mirror DB schema, session behavior, slash handling, approval/input, or busy-choice behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 16:06 +09:00 - Discord persistent message dedupe
+- Goal: cover Discord messages sent during a short bot restart/offline gap without duplicating already handled messages.
+- Key assumptions:
+  - Discord message IDs are stable enough to use as a dedupe key across bot restarts.
+  - A short bootstrap lookback should cover scheduled-task stop/start gaps while bounded persistent dedupe blocks repeat delivery.
+- Changes:
+  - Added a `discord_processed_messages` SQLite table.
+  - Persisted claimed Discord message IDs across restarts with a one-day cleanup window.
+  - Added `DISCORD_HISTORY_BOOTSTRAP_LOOKBACK_SECONDS` with a bounded default of 120 seconds.
+  - Exposed bootstrap lookback/cutoff in doctor diagnostics.
+  - Added a regression test proving message claims persist across simulated restarts.
+- Abuse cases checked:
+  - Duplicate prompt delivery after bot restart: blocked by persisted message ID claims.
+  - Old conversation replay: bounded by the bootstrap cutoff/lookback and one-day dedupe retention.
+  - DB growth from message claims: bounded by startup cleanup of old processed-message rows.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (71 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Internal mirror SQLite schema gains `discord_processed_messages`.
+  - Doctor output includes history bootstrap lookback metadata.
+  - No Discord command schema, mirror project/thread schema behavior, session behavior, slash handling, approval/input, or busy-choice behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

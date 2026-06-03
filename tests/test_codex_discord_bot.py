@@ -153,6 +153,16 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(log_path.exists())
             self.assertIn("isolated_smoke_log", log_path.read_text(encoding="utf-8"))
 
+    def test_discord_message_claim_persists_across_restart(self) -> None:
+        first_owner = SimpleNamespace(_processed_message_ids={})
+        restarted_owner = SimpleNamespace(_processed_message_ids={})
+        message = FakeMessage(content="please hook", message_id=123)
+        other_message = FakeMessage(content="next hook", message_id=124)
+
+        self.assertTrue(bot.claim_discord_message(first_owner, message))
+        self.assertFalse(bot.claim_discord_message(restarted_owner, message))
+        self.assertTrue(bot.claim_discord_message(restarted_owner, other_message))
+
     def test_mirrored_channel_id_authorizes_interaction_without_channel_object(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
@@ -597,6 +607,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                     allowed_user_ids=set(),
                     startup_channel_id=222,
                     history_poll_seconds=15.0,
+                    history_poll_bootstrap_lookback_seconds=120.0,
+                    _history_poll_bootstrap_after="2026-06-03T06:21:10+00:00",
                     _history_poll_task=SimpleNamespace(done=lambda: False),
                     _history_poll_last_at="2026-06-03T06:23:10+00:00",
                     _history_poll_primed_channels={111, 222},
@@ -635,6 +647,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("intent_message_content: True", output)
         self.assertIn("raw_debug_events: True", output)
         self.assertIn("history_poll_seconds: 15.0", output)
+        self.assertIn("history_poll_bootstrap_lookback_seconds: 120.0", output)
+        self.assertIn("history_poll_bootstrap_after: 2026-06-03T06:21:10+00:00", output)
         self.assertIn("history_poll_alive: True", output)
         self.assertIn("history_poll_last_at: 2026-06-03T06:23:10+00:00", output)
         self.assertIn("history_poll_primed_channels: 2", output)

@@ -52,7 +52,9 @@ EMPTY_CONTENT_NOTICE_COOLDOWN_SECONDS = 300
 EMPTY_CONTENT_NOTICE_LAST_SENT: dict[int, float] = {}
 HISTORY_POLL_DEFAULT_SECONDS = 15.0
 HISTORY_POLL_HISTORY_LIMIT = 10
+HISTORY_POLL_BOOTSTRAP_LOOKBACK_DEFAULT_SECONDS = 120.0
 PROCESSED_MESSAGE_ID_LIMIT = 2000
+PROCESSED_MESSAGE_RETENTION_SECONDS = 86400.0
 
 
 def load_local_env(path: Path) -> None:
@@ -340,6 +342,14 @@ def init_mirror_db() -> None:
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL,
                 claimed_at REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS discord_processed_messages (
+                message_id INTEGER PRIMARY KEY,
+                seen_at REAL NOT NULL
             )
             """
         )
@@ -783,6 +793,34 @@ def get_discord_message_id(message: object) -> int | None:
         return None
 
 
+def cleanup_processed_discord_messages(now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    init_mirror_db()
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        result = conn.execute(
+            "DELETE FROM discord_processed_messages WHERE seen_at < ?",
+            (current - PROCESSED_MESSAGE_RETENTION_SECONDS,),
+        )
+        return result.rowcount
+
+
+def claim_persistent_discord_message_id(message_id: int, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    try:
+        init_mirror_db()
+        with sqlite3.connect(MIRROR_DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO discord_processed_messages (message_id, seen_at) VALUES (?, ?)",
+                (int(message_id), current),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as exc:
+        log_line(f"processed_message_persist_failed message={message_id} error_type={type(exc).__name__}")
+        return True
+
+
 def claim_discord_message(owner: object, message: object) -> bool:
     message_id = get_discord_message_id(message)
     if message_id is None:
@@ -795,6 +833,8 @@ def claim_discord_message(owner: object, message: object) -> bool:
         except Exception:
             return True
     if message_id in processed:
+        return False
+    if not claim_persistent_discord_message_id(message_id):
         return False
     processed[message_id] = time.monotonic()
     if len(processed) > PROCESSED_MESSAGE_ID_LIMIT:
@@ -1212,10 +1252,18 @@ class CodexDiscordBot(discord.Client):
             minimum=0.0,
             maximum=300.0,
         )
+        self.history_poll_bootstrap_lookback_seconds = parse_bounded_float_env(
+            "DISCORD_HISTORY_BOOTSTRAP_LOOKBACK_SECONDS",
+            default=HISTORY_POLL_BOOTSTRAP_LOOKBACK_DEFAULT_SECONDS,
+            minimum=0.0,
+            maximum=600.0,
+        )
         self._history_poll_task: asyncio.Task[None] | None = None
         self._history_poll_primed_channels: set[int] = set()
         self._history_poll_last_at = "-"
-        self._history_poll_bootstrap_after = datetime.now(timezone.utc)
+        self._history_poll_bootstrap_after = datetime.now(timezone.utc) - timedelta(
+            seconds=self.history_poll_bootstrap_lookback_seconds
+        )
         self._processed_message_ids: dict[int, float] = {}
         self._slash_sync_last_at = "-"
         self._slash_sync_status = "-"
@@ -1403,6 +1451,12 @@ class CodexDiscordBot(discord.Client):
                 log_line(f"busy_choice_cleanup_deleted count={deleted_busy_choices}")
         except Exception:
             log_line("busy_choice_cleanup_failed\n" + traceback.format_exc())
+        try:
+            deleted_processed_messages = await asyncio.to_thread(cleanup_processed_discord_messages)
+            if deleted_processed_messages:
+                log_line(f"processed_message_cleanup_deleted count={deleted_processed_messages}")
+        except Exception:
+            log_line("processed_message_cleanup_failed\n" + traceback.format_exc())
         await self.log_startup_diagnostics()
         if hasattr(self, "start_history_polling"):
             await self.start_history_polling()
@@ -3175,6 +3229,8 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
         f"intent_message_content: {bool(getattr(getattr(bot, 'intents', None), 'message_content', False))}",
         f"raw_debug_events: {bool(getattr(bot, '_enable_debug_events', False))}",
         f"history_poll_seconds: {getattr(bot, 'history_poll_seconds', '-')}",
+        f"history_poll_bootstrap_lookback_seconds: {getattr(bot, 'history_poll_bootstrap_lookback_seconds', '-')}",
+        f"history_poll_bootstrap_after: {getattr(bot, '_history_poll_bootstrap_after', '-')}",
         f"history_poll_alive: {history_poll_alive}",
         f"history_poll_last_at: {getattr(bot, '_history_poll_last_at', '-')}",
         f"history_poll_primed_channels: {len(getattr(bot, '_history_poll_primed_channels', set()))}",
