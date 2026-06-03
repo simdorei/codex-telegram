@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 12:41:19 +09:00
+- Goal: make Discord queued ask runner failures visible to the user instead of log-only.
+- Key assumptions:
+  - Per-thread runner jobs can fail before producing normal ask output.
+  - Log-only failures make the Discord frontend look stuck or silent.
+- Changes:
+  - Added `report_thread_runner_job_failed()` to send a short generic failure notice to the job channel.
+  - Called it from `thread_runner_loop()` when a runner job raises.
+  - Added regression coverage for the short channel message and sanitized log marker.
+- Abuse cases checked:
+  - User-facing failure text does not include traceback, prompt, target path, or bridge output details.
+  - The detailed traceback remains in local logs only.
+  - The change does not alter queue ordering, authorization, target selection, or bridge execution.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 31 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need a live Discord queued ask failure after deployment to prove the report path in the real runner.
+
 ## 2026-06-03 12:38:15 +09:00
 - Goal: route Discord `Queue next` immediate-start behavior through the same runner queue as normal asks.
 - Key assumptions:

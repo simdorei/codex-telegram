@@ -534,6 +534,20 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.enqueue_thread_ask = original_enqueue_thread_ask
             bot.run_prompt_flow = original_run_prompt_flow
 
+    async def test_thread_runner_job_failure_reports_short_channel_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            channel = FakeTarget()
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.report_thread_runner_job_failed({"channel": channel}, "thread-1")
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            channel.messages,
+            [("Queued ask failed. Check codex_discord_bot.log.", None)],
+        )
+        self.assertIn("thread_runner_job_failure_reported target=thread-1", log_text)
+
     async def test_interactive_approval_prompt_with_view_is_truncated(self) -> None:
         channel = FakeTarget()
         await bot.send_interactive_prompt(

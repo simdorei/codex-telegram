@@ -2076,6 +2076,17 @@ async def enqueue_thread_ask(
     return queue.qsize()
 
 
+async def report_thread_runner_job_failed(job: object, target_thread_id: str | None) -> None:
+    channel = job.get("channel") if isinstance(job, dict) else None
+    if channel is None or not hasattr(channel, "send"):
+        return
+    try:
+        await channel.send("Queued ask failed. Check codex_discord_bot.log.")
+        log_line(f"thread_runner_job_failure_reported target={target_thread_id or '-'}")
+    except Exception:
+        log_line("thread_runner_job_failure_report_failed\n" + traceback.format_exc())
+
+
 async def thread_runner_loop(target_thread_id: str | None) -> None:
     key = normalize_runner_key(target_thread_id)
     while True:
@@ -2130,6 +2141,7 @@ async def thread_runner_loop(target_thread_id: str | None) -> None:
                 )
         except Exception:
             log_line("thread_runner_job_failed\n" + traceback.format_exc())
+            await report_thread_runner_job_failed(job, target_thread_id)
         finally:
             runner["active"] = False
             queue.task_done()
