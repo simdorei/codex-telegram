@@ -940,6 +940,12 @@ class CodexDiscordBot(discord.Client):
         try:
             if message.author.bot:
                 return
+            log_line(
+                f"message_received chat={getattr(message.channel, 'id', '-')} "
+                f"parent={getattr(message.channel, 'parent_id', '-')} "
+                f"user={message.author.id} "
+                f"content_len={format_log_text_len(message.content or '')}"
+            )
             if not self.enable_prefix_commands:
                 log_line("ignored_message reason=message_content_disabled")
                 return
@@ -957,6 +963,10 @@ class CodexDiscordBot(discord.Client):
                 return
             content = (message.content or "").strip()
             if not content:
+                log_line(
+                    f"ignored_message reason=empty_content chat={message.channel.id} "
+                    f"user={message.author.id}"
+                )
                 return
             target_thread_id = get_mirrored_codex_thread_id(message.channel.id)
             target_source = "mirror" if target_thread_id else "selected"
@@ -978,7 +988,7 @@ class CodexDiscordBot(discord.Client):
             if target_thread_id is None:
                 project_message = describe_mirrored_project_channel(message.channel.id)
                 if project_message:
-                    await message.channel.send(project_message)
+                    await send_chunks(message.channel, project_message)
                     return
             await handle_plain_ask(message, content, target_thread_id=target_thread_id)
         except Exception:
@@ -2893,7 +2903,7 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
         if target_thread_id is None:
             project_message = describe_mirrored_project_channel(message.channel.id)
             if project_message:
-                await message.channel.send(project_message)
+                await send_chunks(message.channel, project_message)
                 return
         await handle_plain_ask(message, arg, target_thread_id=target_thread_id)
         return

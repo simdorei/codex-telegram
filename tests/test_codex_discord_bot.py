@@ -46,8 +46,10 @@ class FakeInteractionMessage:
 
 
 class FakeTarget:
-    def __init__(self) -> None:
+    def __init__(self, channel_id: int = 222, parent_id: int | None = None) -> None:
         self.messages: list[tuple[str, object | None]] = []
+        self.id = channel_id
+        self.parent_id = parent_id
 
     async def send(self, content: str, view=None) -> None:
         self.messages.append((content, view))
@@ -65,9 +67,10 @@ class FakeInteraction:
 
 
 class FakeMessage:
-    def __init__(self) -> None:
-        self.channel = FakeTarget()
-        self.author = SimpleNamespace(id=242286902982606848)
+    def __init__(self, content: str = "", channel_id: int = 222) -> None:
+        self.channel = FakeTarget(channel_id=channel_id)
+        self.author = SimpleNamespace(id=242286902982606848, bot=False)
+        self.content = content
 
 
 class FakeBot:
@@ -243,6 +246,63 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(message) <= bot.DISCORD_MAX_LEN for message in interaction.followup.messages))
         self.assertIn("button_response_start command=ask title='Steering' exit=1", log_text)
         self.assertIn("button_response_sent command=ask title='Steering' exit=1", log_text)
+
+    async def test_on_message_logs_received_before_empty_content_ignore(self) -> None:
+        client = SimpleNamespace(
+            enable_prefix_commands=True,
+            is_allowed_message_channel=lambda channel: True,
+            is_allowed_user=lambda user_id: True,
+        )
+        message = FakeMessage(content="", channel_id=333)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.CodexDiscordBot.on_message(client, message)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(message.channel.messages, [])
+        self.assertIn("message_received chat=333", log_text)
+        self.assertIn("content_len=0", log_text)
+        self.assertIn("ignored_message reason=empty_content chat=333", log_text)
+
+    async def test_on_message_project_parent_response_is_chunked(self) -> None:
+        original_get_mirrored = bot.get_mirrored_codex_thread_id
+        original_describe_project = bot.describe_mirrored_project_channel
+        original_handle_plain_ask = bot.handle_plain_ask
+        original_is_thread_runner_busy = bot.is_thread_runner_busy
+        original_get_busy_state = bot.get_busy_state_for_thread
+        try:
+            bot.get_mirrored_codex_thread_id = lambda channel_id: None
+            bot.describe_mirrored_project_channel = lambda channel_id: "x" * 4100
+            bot.get_busy_state_for_thread = lambda target_thread_id: ("idle", None, "")
+
+            async def runner_idle(target_thread_id):
+                return False
+
+            async def fail_handle_plain_ask(message, prompt, *, target_thread_id=None):
+                raise AssertionError("project parent messages must not fall back to selected thread")
+
+            bot.is_thread_runner_busy = runner_idle
+            bot.handle_plain_ask = fail_handle_plain_ask
+            client = SimpleNamespace(
+                enable_prefix_commands=True,
+                is_allowed_message_channel=lambda channel: True,
+                is_allowed_user=lambda user_id: True,
+            )
+            message = FakeMessage(content="please hook", channel_id=333)
+
+            await bot.CodexDiscordBot.on_message(client, message)
+
+            sent = [content for content, _view in message.channel.messages]
+            self.assertGreater(len(sent), 1)
+            self.assertTrue(all(len(content) <= bot.DISCORD_MAX_LEN for content in sent))
+        finally:
+            bot.get_mirrored_codex_thread_id = original_get_mirrored
+            bot.describe_mirrored_project_channel = original_describe_project
+            bot.handle_plain_ask = original_handle_plain_ask
+            bot.is_thread_runner_busy = original_is_thread_runner_busy
+            bot.get_busy_state_for_thread = original_get_busy_state
 
     async def test_slash_error_handler_reports_before_initial_response(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

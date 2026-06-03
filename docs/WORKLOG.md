@@ -1069,3 +1069,26 @@
     - if a prior approval card or progress block is pasted back into chat, the bot may still treat it as a new ask
 - Next focused step:
   - add an input guard so pasted approval/progress cards are rejected or normalized instead of being queued as a fresh ask
+
+## 2026-06-03 12:54 +09:00 - Discord message hook observability
+- Goal: stabilize Discord Codex frontend handling when plain Discord messages appear not to hook into steering/ask.
+- Key assumptions:
+  - Recent runtime logs show the bot ready and slash commands synced, but no live message event after the latest restart.
+  - The next useful micro-step is to make early Discord message receipt/filtering observable without logging raw user prompts.
+- Changes:
+  - Added sanitized `message_received` logging before message-content/channel/user filtering.
+  - Added `empty_content` ignore logging so disabled/missing content can be distinguished from no Discord event.
+  - Switched project-parent plain-message and `!ask` guidance responses to `send_chunks` to avoid Discord message limit failures.
+- Abuse cases checked:
+  - Malicious prompt exfiltration through logs: blocked structurally by logging only content length, channel, parent, and user IDs.
+  - Oversized project-parent guidance causing Discord send failure: blocked by chunking through the existing Discord-safe splitter.
+  - Cross-thread/project-parent fallback steering the selected Codex thread: still blocked by returning project guidance instead of falling back to selected thread.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (35 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Discord runtime log volume increases by one sanitized line per non-bot message event.
+  - No route/schema/session behavior changed.
+- Unresolved:
+  - Needs a fresh live Discord message after deployment to confirm whether the event reaches `on_message`.
