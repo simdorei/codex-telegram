@@ -2501,12 +2501,21 @@ def build_help() -> str:
             "!ask <prompt>",
             "",
             "Plain messages in mirrored Discord threads are sent to that Codex thread.",
-            "Slash commands are also available after Discord finishes syncing them.",
+            "Slash commands: /help, /list, /use, /status, /doctor, /where, /context, /mirror_check.",
         ]
     )
 
 
 def register_commands(bot: CodexDiscordBot) -> None:
+    @bot.tree.command(name="help", description="Show Discord Codex commands.")
+    async def slash_help(interaction: discord.Interaction) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        for chunk in split_message(build_help()):
+            await interaction.followup.send(chunk)
+
     @bot.tree.command(name="list", description="Show recent Codex threads.")
     async def slash_list(interaction: discord.Interaction, limit: int = 10) -> None:
         if not check_interaction_allowed(bot, interaction):
@@ -2551,6 +2560,34 @@ def register_commands(bot: CodexDiscordBot) -> None:
         exit_code, output = await asyncio.to_thread(run_bridge_command, ["doctor"])
         prefix = "Doctor" if exit_code == 0 else f"Doctor failed (exit {exit_code})"
         for chunk in split_message(f"{prefix}\n\n{output or '(no output)'}"):
+            await interaction.followup.send(chunk)
+
+    @bot.tree.command(name="where", description="Show the Codex thread mapped to this Discord channel.")
+    async def slash_where(interaction: discord.Interaction) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        for chunk in split_message(build_where_message(interaction.channel_id)):
+            await interaction.followup.send(chunk)
+
+    @bot.tree.command(name="context", description="Show context usage for this Codex thread.")
+    async def slash_context(interaction: discord.Interaction, all_threads: bool = False) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        output = build_context_message(interaction.channel_id, all_threads=all_threads, limit=20)
+        for chunk in split_message(output):
+            await interaction.followup.send(chunk)
+
+    @bot.tree.command(name="mirror_check", description="Check Discord mirror mappings.")
+    async def slash_mirror_check(interaction: discord.Interaction) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        for chunk in split_message(build_mirror_check()):
             await interaction.followup.send(chunk)
 
 

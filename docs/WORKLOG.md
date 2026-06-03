@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 10:46:31 +09:00
+- Goal: align Discord slash-command frontend with advertised diagnostics.
+- Key assumptions:
+  - Discord help claimed slash commands were available, but only four slash commands were registered.
+  - Read-only diagnostics are safe to expose through slash commands when guarded by the same Discord authorization checks.
+- Changes:
+  - Added slash `/help`, `/where`, `/context`, and `/mirror_check`.
+  - Updated help text to list the exact registered slash commands instead of a vague availability note.
+- Abuse cases checked:
+  - New slash commands all call `check_interaction_allowed` before returning data.
+  - Added commands are read-only and do not create, archive, delete, ask, or steer Codex threads.
+  - Context/mirror data exposure remains bounded to the same data already available through authorized prefix commands.
+- Verification:
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, and `codex_desktop_bridge.py`.
+  - `git diff --check`
+  - Source smoke confirmed registered slash commands: `help`, `list`, `use`, `status`, `doctor`, `where`, `context`, `mirror_check`.
+  - Help smoke confirmed the exact slash command list renders.
+- Unresolved items:
+  - Need Discord slash sync/live UI confirmation after deployment.
+
 ## 2026-06-03 10:44:02 +09:00
 - Goal: reduce duplicate Discord button submissions in busy/interactive frontend flows.
 - Key assumptions:
