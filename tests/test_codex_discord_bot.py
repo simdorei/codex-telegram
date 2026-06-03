@@ -350,7 +350,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
     async def test_persistent_input_choice_handles_restart_stale_view(self) -> None:
         original_submit = bot.submit_input_reply
         submitted: list[tuple[str, str]] = []
-        custom_id = bot.format_input_choice_custom_id("thread-1", "first choice")
+        self.assertIsNone(bot.format_input_choice_custom_id("thread-1", "first choice"))
+        custom_id = bot.format_input_choice_custom_id("thread-1", "choice-1")
         self.assertIsNotNone(custom_id)
         try:
             def fake_submit(target_thread_id, value):
@@ -370,12 +371,12 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.submit_input_reply = original_submit
 
-        self.assertEqual(submitted, [("thread-1", "first choice")])
+        self.assertEqual(submitted, [("thread-1", "choice-1")])
         self.assertTrue(interaction.response.deferred)
         self.assertEqual(interaction.followup.messages, ["Input submitted\n\nanswered"])
-        self.assertIn("input_choice_persistent user=242286902982606848 target=thread-1 value_len=12", log_text)
-        self.assertIn("input_choice_persistent_done exit=0 target=thread-1 value_len=12", log_text)
-        self.assertNotIn("first choice", log_text)
+        self.assertIn("input_choice_persistent user=242286902982606848 target=thread-1 value_len=8", log_text)
+        self.assertIn("input_choice_persistent_done exit=0 target=thread-1 value_len=8", log_text)
+        self.assertNotIn("choice-1", log_text)
 
     async def test_unhandled_component_interaction_skips_already_handled_response(self) -> None:
         interaction = FakeInteraction(command_name="-", channel_id=222)

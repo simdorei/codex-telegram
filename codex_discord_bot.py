@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import hashlib
 import io
 import json
@@ -468,22 +467,15 @@ def parse_approval_custom_id(custom_id: str) -> tuple[str, str] | None:
     return target_thread_id, answer
 
 
-def encode_input_choice_value(value: str) -> str:
-    raw = str(value or "").encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def decode_input_choice_value(encoded: str) -> str | None:
-    try:
-        padding = "=" * (-len(encoded) % 4)
-        return base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8")
-    except Exception:
-        return None
+def is_safe_persistent_input_value(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,20}", str(value or "")))
 
 
 def format_input_choice_custom_id(target_thread_id: str, value: str) -> str | None:
-    encoded = encode_input_choice_value(value)
-    custom_id = f"{INPUT_CHOICE_CUSTOM_ID_PREFIX}:{target_thread_id}:{encoded}"
+    normalized_value = str(value or "").strip()
+    if not is_safe_persistent_input_value(normalized_value):
+        return None
+    custom_id = f"{INPUT_CHOICE_CUSTOM_ID_PREFIX}:{target_thread_id}:{normalized_value}"
     if len(custom_id) > 100:
         return None
     return custom_id
@@ -494,8 +486,8 @@ def parse_input_choice_custom_id(custom_id: str) -> tuple[str, str] | None:
     if len(parts) != 3 or parts[0] != INPUT_CHOICE_CUSTOM_ID_PREFIX:
         return None
     target_thread_id = parts[1].strip()
-    value = decode_input_choice_value(parts[2].strip())
-    if not target_thread_id or value is None:
+    value = parts[2].strip()
+    if not target_thread_id or not is_safe_persistent_input_value(value):
         return None
     return target_thread_id, value
 
