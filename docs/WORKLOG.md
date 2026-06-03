@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 12:48:38 +09:00
+- Goal: reduce Discord runtime log instability and prompt leakage from user-provided text.
+- Key assumptions:
+  - Incoming message and button prompt previews are useful for debugging only up to routing/length evidence.
+  - Logging raw user text can create mojibake, newline noise, and unnecessary prompt exposure.
+- Changes:
+  - Changed message, input reply, input choice, steering, and queue-next logs to record text/prompt/value lengths instead of raw content previews.
+  - Added regression assertions that steering and queue-next logs include `prompt_len` and do not include raw prompt text.
+- Abuse cases checked:
+  - User-provided prompt/input text is no longer echoed into these runtime logs.
+  - Routing evidence remains available through channel/user/target/source/state and length fields.
+  - The change does not alter Discord responses, queue behavior, authorization, or bridge execution.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 33 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need live Discord input after deployment to confirm new `text_len`/`prompt_len` markers in operational logs.
+
 ## 2026-06-03 12:44:42 +09:00
 - Goal: bound Discord unknown-prefix-command responses for malformed or oversized command names.
 - Key assumptions:

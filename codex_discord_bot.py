@@ -970,7 +970,7 @@ class CodexDiscordBot(discord.Client):
                 f"prefix={content.startswith('!')} runner_busy={runner_busy} "
                 f"codex_busy={codex_busy_state} "
                 f"target_source={target_source} target={target_thread_id or '-'} "
-                f"text={content[:160].replace(chr(10), ' ')}"
+                f"text_len={format_log_text_len(content)}"
             )
             if content.startswith("!"):
                 await handle_prefix_command(self, message, content[1:].strip())
@@ -2408,7 +2408,7 @@ async def submit_interactive_reply(
         exit_code, output = await asyncio.to_thread(submit_input_reply, target_thread_id, answer)
         log_line(
             f"input_reply_done exit={exit_code} target={target_thread_id} "
-            f"answer={answer[:40].replace(chr(10), ' ')} "
+            f"answer_len={format_log_text_len(answer)} "
             f"output_len={format_log_text_len(output)}"
         )
         title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
@@ -2499,11 +2499,14 @@ class InputChoiceButton(discord.ui.Button):
                 await interaction.message.edit(view=view)
             except Exception:
                 pass
-        log_line(f"input_choice_button user={interaction.user.id} value={self.value}")
+        log_line(
+            f"input_choice_button user={interaction.user.id} "
+            f"value_len={format_log_text_len(self.value)}"
+        )
         exit_code, output = await asyncio.to_thread(submit_input_reply, self.target_thread_id, self.value)
         log_line(
             f"input_choice_button_done exit={exit_code} target={self.target_thread_id} "
-            f"value={self.value}"
+            f"value_len={format_log_text_len(self.value)}"
         )
         title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
         await send_followup_chunks(
@@ -2585,7 +2588,7 @@ class BusyChoiceView(discord.ui.View):
             return
         log_line(
             f"steer_now user={interaction.user.id} target={self.target_thread_id or '-'} "
-            f"prompt={self.prompt[:160].replace(chr(10), ' ')}"
+            f"prompt_len={format_log_text_len(self.prompt)}"
         )
         exit_code, output = await asyncio.to_thread(
             run_steering_prompt,
@@ -2640,7 +2643,7 @@ class BusyChoiceView(discord.ui.View):
             log_line(
                 f"queue_next_immediate user={interaction.user.id} "
                 f"target={self.target_thread_id or '-'} "
-                f"prompt={self.prompt[:160].replace(chr(10), ' ')}"
+                f"prompt_len={format_log_text_len(self.prompt)}"
             )
             await interaction.followup.send("No active job now. Starting this message.")
             log_line(
@@ -2670,7 +2673,7 @@ class BusyChoiceView(discord.ui.View):
         )
         log_line(
             f"queue_next user={interaction.user.id} position={position} target={self.target_thread_id or '-'} "
-            f"prompt={self.prompt[:160].replace(chr(10), ' ')}"
+            f"prompt_len={format_log_text_len(self.prompt)}"
         )
         await interaction.followup.send(f"Queued at position {position}.")
         log_line(

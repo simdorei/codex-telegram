@@ -419,6 +419,8 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(followup_view.target_thread_id, "thread-1")
             self.assertNotIn("selected thread is still busy", content.lower())
             self.assertIn("busy_choice_sent reason=steer_busy_failure target=thread-1", log_text)
+            self.assertIn("prompt_len=12", log_text)
+            self.assertNotIn("prompt=please steer", log_text)
         finally:
             bot.run_steering_prompt = original_run_steering_prompt
             bot.build_context_warning = original_build_context_warning
@@ -533,6 +535,9 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 [(message.channel, "please queue", "thread-1", False, True, message)],
             )
             self.assertEqual(interaction.followup.messages, ["No active job now. Starting this message."])
+            self.assertIn("queue_next_immediate user=242286902982606848", log_text)
+            self.assertIn("prompt_len=12", log_text)
+            self.assertNotIn("prompt=please queue", log_text)
             self.assertIn("queue_next_immediate_enqueued user=242286902982606848", log_text)
         finally:
             bot.get_busy_state_for_thread = original_get_busy_state
