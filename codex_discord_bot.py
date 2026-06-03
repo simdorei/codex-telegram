@@ -2523,11 +2523,14 @@ class ApprovalView(discord.ui.View):
             await interaction.message.edit(view=self)
         except Exception:
             pass
-        log_line(f"approval_button user={interaction.user.id} answer={answer}")
+        log_line(
+            f"approval_button user={interaction.user.id} "
+            f"answer_len={format_log_text_len(answer)}"
+        )
         exit_code, output = await asyncio.to_thread(submit_approval_reply, self.target_thread_id, answer)
         log_line(
             f"approval_button_done exit={exit_code} target={self.target_thread_id} "
-            f"answer={answer}"
+            f"answer_len={format_log_text_len(answer)}"
         )
         title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
         await send_followup_chunks(

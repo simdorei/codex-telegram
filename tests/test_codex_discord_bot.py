@@ -745,6 +745,9 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Approval submitted", interaction.followup.messages[0])
             self.assertIn("button_response_start command=approval title='Approval' exit=0", log_text)
             self.assertIn("approval_button_sent exit=0 target=thread-1", log_text)
+            self.assertIn("approval_button user=242286902982606848 answer_len=1", log_text)
+            self.assertIn("approval_button_done exit=0 target=thread-1 answer_len=1", log_text)
+            self.assertNotIn("answer=1", log_text)
         finally:
             bot.submit_approval_reply = original_submit_approval_reply
 

@@ -1251,3 +1251,24 @@
   - No command schema, mirror DB schema, or session behavior changed.
 - Unresolved:
   - Still needs fresh live Discord approval/message/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
+- Goal: keep approval button diagnostics consistent with length-only answer logging.
+- Key assumptions:
+  - Approval button answers are currently fixed values, but future changes should not make raw answer logging normal again.
+- Changes:
+  - Replaced `answer=` logs in approval button handling with `answer_len=`.
+  - Extended the approval button regression test to reject raw `answer=`.
+- Abuse cases checked:
+  - Future sensitive approval values leaking into logs: blocked by length-only logging.
+  - Loss of operational diagnostics: mitigated by retaining user ID, target, exit code, and answer length.
+  - Behavior change in approval submission: unchanged; only logging changed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (45 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Future `approval_button` logs no longer show raw approval answer values.
+  - No command schema, mirror DB schema, or session behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord approval/message/button activity after deployment to prove end-to-end behavior.
