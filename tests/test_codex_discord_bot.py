@@ -451,17 +451,37 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_thread_flow_uses_resolved_cwd_and_mirrors(self) -> None:
         original_resolve_cwd = bot.resolve_discord_new_thread_cwd
+        original_resolve_project_channel = bot.resolve_discord_new_thread_project_channel_id
         original_run_bridge_command = bot.run_bridge_command
         original_mirror_single = bot.mirror_single_codex_thread
+        original_choose_thread = bot.bridge.choose_thread
         argv_seen: list[str] = []
+        mirror_calls: list[tuple[str, int | None]] = []
         try:
             bot.resolve_discord_new_thread_cwd = lambda channel_id: r"C:\taxlab"
+            bot.resolve_discord_new_thread_project_channel_id = lambda channel_id, project_key: 777
+            bot.bridge.choose_thread = lambda thread_id, ref: bot.bridge.ThreadInfo(
+                id=thread_id,
+                title="new",
+                cwd=r"C:\taxlab",
+                updated_at=1,
+                rollout_path="",
+                model="",
+                reasoning_effort="",
+                tokens_used=0,
+            )
 
             def fake_run_bridge_command(argv):
                 argv_seen.extend(argv)
                 return 0, "target_thread: thread-new\ncwd: C:\\taxlab"
 
-            async def fake_mirror_single_codex_thread(fake_bot, thread_id):
+            async def fake_mirror_single_codex_thread(
+                fake_bot,
+                thread_id,
+                *,
+                preferred_project_channel_id=None,
+            ):
+                mirror_calls.append((thread_id, preferred_project_channel_id))
                 return SimpleNamespace(id=999)
 
             bot.run_bridge_command = fake_run_bridge_command
@@ -478,12 +498,15 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(argv_seen, ["new", "--cwd", r"C:\taxlab", "start here"])
+            self.assertEqual(mirror_calls, [("thread-new", 777)])
             self.assertIn("target_thread: thread-new", output)
             self.assertIn("Mirrored Discord thread: <#999>", output)
         finally:
             bot.resolve_discord_new_thread_cwd = original_resolve_cwd
+            bot.resolve_discord_new_thread_project_channel_id = original_resolve_project_channel
             bot.run_bridge_command = original_run_bridge_command
             bot.mirror_single_codex_thread = original_mirror_single
+            bot.bridge.choose_thread = original_choose_thread
 
     async def test_new_thread_failure_does_not_mirror(self) -> None:
         original_resolve_cwd = bot.resolve_discord_new_thread_cwd
@@ -498,7 +521,12 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 argv_seen.extend(argv)
                 return 1, "ERROR: cannot create thread"
 
-            async def fake_mirror_single_codex_thread(fake_bot, thread_id):
+            async def fake_mirror_single_codex_thread(
+                fake_bot,
+                thread_id,
+                *,
+                preferred_project_channel_id=None,
+            ):
                 mirror_calls.append(thread_id)
                 return SimpleNamespace(id=999)
 
@@ -714,6 +742,56 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                 self.assertEqual(bot.resolve_discord_new_thread_cwd(333), str(project_path))
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+    def test_new_thread_project_channel_prefers_invoking_thread_parent(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                bot.init_mirror_db()
+                with sqlite3.connect(bot.MIRROR_DB_PATH) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO mirror_threads (
+                            codex_thread_id, project_key, thread_title,
+                            discord_channel_id, discord_thread_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("thread-1", r"c:\taxlab", "title", 111, 222, 1.0),
+                    )
+
+                self.assertEqual(
+                    bot.resolve_discord_new_thread_project_channel_id(222, r"c:\taxlab"),
+                    111,
+                )
+                self.assertIsNone(
+                    bot.resolve_discord_new_thread_project_channel_id(222, r"c:\other")
+                )
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+    def test_new_thread_project_channel_accepts_project_parent_channel(self) -> None:
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                bot.init_mirror_db()
+                with sqlite3.connect(bot.MIRROR_DB_PATH) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO mirror_projects (
+                            project_key, project_name, discord_channel_id, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (r"c:\taxlab", "taxlab", 111, 1.0),
+                    )
+
+                self.assertEqual(
+                    bot.resolve_discord_new_thread_project_channel_id(111, r"c:\taxlab"),
+                    111,
+                )
             finally:
                 bot.MIRROR_DB_PATH = old_db_path
 

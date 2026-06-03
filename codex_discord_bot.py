@@ -433,6 +433,37 @@ def resolve_discord_new_thread_cwd(discord_channel_id: int | None) -> str | None
     return None
 
 
+def resolve_discord_new_thread_project_channel_id(
+    discord_channel_id: int | None,
+    project_key: str | None,
+) -> int | None:
+    if not discord_channel_id or not project_key:
+        return None
+    init_mirror_db()
+    with sqlite3.connect(MIRROR_DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT discord_channel_id
+            FROM mirror_threads
+            WHERE discord_thread_id = ? AND project_key = ?
+            LIMIT 1
+            """,
+            (int(discord_channel_id), project_key),
+        ).fetchone()
+        if row:
+            return int(row[0])
+        row = conn.execute(
+            """
+            SELECT discord_channel_id
+            FROM mirror_projects
+            WHERE discord_channel_id = ? AND project_key = ?
+            LIMIT 1
+            """,
+            (int(discord_channel_id), project_key),
+        ).fetchone()
+    return int(row[0]) if row else None
+
+
 def is_mirrored_channel_id(discord_channel_id: int | None) -> bool:
     if not discord_channel_id:
         return False
@@ -1069,7 +1100,20 @@ async def run_discord_new_thread(
         )
         if new_thread_id:
             try:
-                discord_thread = await mirror_single_codex_thread(bot, new_thread_id)
+                preferred_project_channel_id = None
+                try:
+                    codex_thread = await asyncio.to_thread(bridge.choose_thread, new_thread_id, None)
+                    preferred_project_channel_id = resolve_discord_new_thread_project_channel_id(
+                        discord_channel_id,
+                        get_project_key(codex_thread),
+                    )
+                except Exception:
+                    log_line("new_thread_preferred_channel_resolve_failed\n" + traceback.format_exc())
+                discord_thread = await mirror_single_codex_thread(
+                    bot,
+                    new_thread_id,
+                    preferred_project_channel_id=preferred_project_channel_id,
+                )
                 log_line(
                     f"new_thread_mirrored codex_thread={new_thread_id} "
                     f"discord_thread={discord_thread.id}"
@@ -1482,13 +1526,45 @@ async def sync_codex_mirror(bot: CodexDiscordBot, *, limit: int = 30) -> str:
     )
 
 
-async def mirror_single_codex_thread(bot: CodexDiscordBot, thread_id: str) -> discord.Thread:
+async def mirror_single_codex_thread(
+    bot: CodexDiscordBot,
+    thread_id: str,
+    *,
+    preferred_project_channel_id: int | None = None,
+) -> discord.Thread:
     guild = await get_mirror_guild(bot)
     category = await get_or_create_mirror_category(guild)
     codex_thread = await asyncio.to_thread(bridge.choose_thread, thread_id, None)
     project_key = get_project_key(codex_thread)
     project_name = get_project_name(codex_thread)
-    project_channel = await get_or_create_project_channel(guild, category, project_key, project_name)
+    project_channel = None
+    if preferred_project_channel_id is not None:
+        candidate = guild.get_channel(int(preferred_project_channel_id))
+        if not isinstance(candidate, discord.TextChannel):
+            try:
+                fetched = await guild.fetch_channel(int(preferred_project_channel_id))
+                if isinstance(fetched, discord.TextChannel):
+                    candidate = fetched
+            except Exception:
+                candidate = None
+        if isinstance(candidate, discord.TextChannel):
+            project_channel = candidate
+            init_mirror_db()
+            with sqlite3.connect(MIRROR_DB_PATH) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO mirror_projects
+                        (project_key, project_name, discord_channel_id, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (project_key, project_name, int(project_channel.id), time.time()),
+                )
+            log_line(
+                f"single_thread_mirror_preferred_channel codex_thread={thread_id} "
+                f"project_channel={project_channel.id}"
+            )
+    if project_channel is None:
+        project_channel = await get_or_create_project_channel(guild, category, project_key, project_name)
     return await get_or_create_thread_channel(codex_thread, project_key, project_channel)
 
 

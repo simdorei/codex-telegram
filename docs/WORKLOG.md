@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 12:26:35 +09:00
+- Goal: make Discord `new` place the mirrored thread in the invoking mirror's project channel when that channel is known.
+- Key assumptions:
+  - Users expect `/new` or `!new` from a mirrored Discord thread/project channel to create the follow-up Discord thread in that same project area.
+  - Existing cwd routing already chooses the right Codex workspace; this change tightens Discord-side placement.
+- Changes:
+  - Added `resolve_discord_new_thread_project_channel_id()` to recover the invoking mirrored thread's parent project channel, or the invoking project parent channel, only when the new Codex thread project key matches.
+  - Passed that preferred project channel into single-thread mirror creation after a successful bridge `new`.
+  - Let `mirror_single_codex_thread()` reuse the preferred project channel when it is a valid text channel, falling back to the existing get-or-create project channel path otherwise.
+  - Added regression tests for preferred-channel resolution and for `run_discord_new_thread()` passing the preferred channel into mirroring.
+- Abuse cases checked:
+  - Cross-project placement is blocked by requiring the invoking mirror row's project key to match the new Codex thread project key.
+  - A stale or non-text preferred channel falls back to the existing project-channel lookup instead of creating a mirror in an arbitrary target.
+  - The change does not alter authorization, bridge argv construction, prompt logging, or failure-side mirror mutation behavior.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 24 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need live Discord `/new` or `!new` after deployment to prove `single_thread_mirror_preferred_channel`, `new_thread_cwd`, and `new_thread_mirrored` appear together.
+
 ## 2026-06-03 12:20:52 +09:00
 - Goal: make Discord slash `/new` dispatch behavior directly testable.
 - Key assumptions:
