@@ -156,6 +156,14 @@ def split_message(text: str, limit: int = DISCORD_MAX_LEN) -> list[str]:
     return chunks
 
 
+def fit_single_message(text: str, limit: int = DISCORD_MAX_LEN) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n[truncated for Discord]"
+    return text[: max(0, limit - len(suffix))].rstrip() + suffix
+
+
 def format_log_argv(argv: list[str]) -> str:
     return " ".join(str(part).replace("\n", " ")[:120] for part in argv)
 
@@ -991,7 +999,7 @@ async def send_interactive_prompt(
         lines = ["Waiting approval", f"thread: {target_ref or target_thread_id}", ""]
         if prompt:
             lines.extend([prompt, ""])
-        await channel.send("\n".join(lines).strip(), view=ApprovalView(target_thread_id))
+        await channel.send(fit_single_message("\n".join(lines)), view=ApprovalView(target_thread_id))
         return
 
     if state == INTERACTIVE_STATE_INPUT:
@@ -1000,12 +1008,12 @@ async def send_interactive_prompt(
             lines.extend([prompt, ""])
         if options:
             await channel.send(
-                "\n".join(lines).strip(),
+                fit_single_message("\n".join(lines)),
                 view=InputChoiceView(target_thread_id, options),
             )
         else:
             lines.append("Reply with plain text to answer this prompt.")
-            await channel.send("\n".join(lines).strip())
+            await send_chunks(channel, "\n".join(lines))
         return
 
 
@@ -2267,14 +2275,14 @@ def build_busy_choice_message(prompt: str, target_thread_id: str | None) -> str:
     warning = build_context_warning(target_thread_id)
     if warning:
         lines.extend([warning, ""])
-    lines.extend(
-        [
-            prompt[:1500],
-            "",
-            "Choose how to handle this message for this thread.",
-        ]
-    )
-    return "\n".join(lines)
+    footer = "\n\nChoose how to handle this message for this thread."
+    prefix = "\n".join(lines)
+    prompt_text = str(prompt or "")
+    prompt_budget = max(0, DISCORD_MAX_LEN - len(prefix) - len(footer))
+    if len(prompt_text) > prompt_budget:
+        suffix = "\n\n[prompt truncated for Discord]"
+        prompt_text = prompt_text[: max(0, prompt_budget - len(suffix))].rstrip() + suffix
+    return fit_single_message(prefix + prompt_text + footer)
 
 
 def log_busy_choice_sent(reason: str, target_thread_id: str | None, prompt: str) -> None:

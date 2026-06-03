@@ -1,5 +1,27 @@
 # WORKLOG
 
+## 2026-06-03 12:35:06 +09:00
+- Goal: keep Discord view-bearing prompt messages within Discord's single-message length limit.
+- Key assumptions:
+  - Messages with buttons/views cannot be split across chunks while preserving the view on every chunk.
+  - Long Codex approval/input prompts or busy-choice prompts could exceed Discord's message limit and prevent the UI from rendering.
+- Changes:
+  - Added `fit_single_message()` for Discord messages that must stay single-message because they carry a view.
+  - Applied it to approval and input option prompt messages with views.
+  - Changed plain input prompts without options to use normal chunked sends.
+  - Reworked busy-choice text so the footer stays visible while oversized prompt text is truncated first.
+  - Added regression tests for single-message truncation, view prompt truncation, and busy-choice prompt truncation.
+- Abuse cases checked:
+  - Truncation only affects displayed Discord text; target thread id, authorization, and button action state remain unchanged.
+  - Prompt truncation prevents Discord delivery failure without expanding prompt exposure.
+  - Plain input prompts without view now chunk safely instead of silently failing on long text.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 29 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need a live Discord approval/input/busy prompt after deployment to prove long prompt rendering behavior in Discord.
+
 ## 2026-06-03 12:30:57 +09:00
 - Goal: prevent Discord button followups from failing when bridge output exceeds Discord's message length limit.
 - Key assumptions:

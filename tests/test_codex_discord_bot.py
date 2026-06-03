@@ -163,6 +163,11 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(busy_view.claim())
         self.assertTrue(all(getattr(item, "disabled", False) for item in busy_view.children))
 
+    def test_fit_single_message_truncates_to_discord_limit(self) -> None:
+        fitted = bot.fit_single_message("x" * 4100)
+        self.assertLessEqual(len(fitted), bot.DISCORD_MAX_LEN)
+        self.assertTrue(fitted.endswith("[truncated for Discord]"))
+
     def test_help_readme_and_registered_slash_commands_match(self) -> None:
         expected_commands = {
             "help",
@@ -474,6 +479,35 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("approval_button_sent exit=0 target=thread-1", log_text)
         finally:
             bot.submit_approval_reply = original_submit_approval_reply
+
+    async def test_interactive_approval_prompt_with_view_is_truncated(self) -> None:
+        channel = FakeTarget()
+        await bot.send_interactive_prompt(
+            channel,
+            "thread-1",
+            "taxlab:1",
+            bot.INTERACTIVE_STATE_APPROVAL,
+            "x" * 4100,
+            [],
+        )
+
+        self.assertEqual(len(channel.messages), 1)
+        content, view = channel.messages[0]
+        self.assertLessEqual(len(content), bot.DISCORD_MAX_LEN)
+        self.assertTrue(content.endswith("[truncated for Discord]"))
+        self.assertIsInstance(view, bot.ApprovalView)
+
+    def test_busy_choice_message_is_single_discord_message(self) -> None:
+        original_build_context_warning = bot.build_context_warning
+        try:
+            bot.build_context_warning = lambda target_thread_id: "warning " + ("w" * 900)
+            content = bot.build_busy_choice_message("x" * 4100, "thread-1")
+
+            self.assertLessEqual(len(content), bot.DISCORD_MAX_LEN)
+            self.assertIn("[prompt truncated for Discord]", content)
+            self.assertTrue(content.endswith("Choose how to handle this message for this thread."))
+        finally:
+            bot.build_context_warning = original_build_context_warning
 
     async def test_archive_list_alias_routes_to_archived_list(self) -> None:
         original_run_bridge_and_send = bot.run_bridge_and_send
