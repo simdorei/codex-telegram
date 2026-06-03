@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 11:02:23 +09:00
+- Goal: make Discord interactive button delivery auditable without leaking response bodies.
+- Key assumptions:
+  - Approval/input/busy buttons need the same completion visibility as prefix and slash commands.
+  - Runtime logs should distinguish bridge completion from Discord response delivery.
+- Changes:
+  - Added completion and sent logs for approval buttons, input choice buttons, steering, queue-next, and ignore actions.
+  - Replaced existing bridge output snippets in steering/ask/interactive logs with `output_len`.
+  - Added a small output-length formatter for log consistency.
+- Abuse cases checked:
+  - Logs no longer include bridge output bodies from ask, steering, approval, or input reply paths.
+  - Button logs keep only user id, target id, exit code, queue position, and bounded answer/value identifiers.
+  - The patch adds no new Discord command surface and preserves existing authorization checks.
+- Verification:
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, and `codex_desktop_bridge.py`.
+  - `git diff --check`
+  - Search confirmed remaining output logs use `output_len` only.
+  - Formatter smoke confirmed argv newline stripping and output length behavior.
+- Unresolved items:
+  - Need real Discord button clicks after deployment to confirm live button completion logs.
+
 ## 2026-06-03 10:58:18 +09:00
 - Goal: harden Discord slash interaction diagnostics and mirrored-thread authorization.
 - Key assumptions:

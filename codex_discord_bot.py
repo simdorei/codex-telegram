@@ -151,6 +151,10 @@ def format_log_argv(argv: list[str]) -> str:
     return " ".join(str(part).replace("\n", " ")[:120] for part in argv)
 
 
+def format_log_text_len(text: str | None) -> int:
+    return len(str(text or ""))
+
+
 def run_bridge_command(argv: list[str]) -> tuple[int, str]:
     parser = bridge.build_parser()
     stdout_buffer = io.StringIO()
@@ -618,7 +622,7 @@ def run_steering_prompt(prompt: str, target_thread_id: str | None) -> tuple[int,
 
     log_line(
         f"steering_failed exit={exit_code} target={target_thread_id or '-'} "
-        f"output={(output or '')[:500].replace(chr(10), ' ')}"
+        f"output_len={format_log_text_len(output)}"
     )
     return exit_code, output
 
@@ -1924,7 +1928,7 @@ async def run_prompt_and_send(
     log_line(
         f"ask_stream_done exit={exit_code} target={target_thread_id or '-'} "
         f"sent_live={relay.sent_live} final={relay.saw_final} aborted={relay.saw_aborted} "
-        f"timeout={relay.saw_timeout} output={(output or '')[:500].replace(chr(10), ' ')}"
+        f"timeout={relay.saw_timeout} output_len={format_log_text_len(output)}"
     )
     if relay.sent_live:
         if exit_code == 0 and not relay.saw_aborted:
@@ -2068,7 +2072,7 @@ async def submit_interactive_reply(
         log_line(
             f"approval_reply_done exit={exit_code} target={target_thread_id} "
             f"answer={answer[:40].replace(chr(10), ' ')} "
-            f"output={(output or '')[:300].replace(chr(10), ' ')}"
+            f"output_len={format_log_text_len(output)}"
         )
         title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
         await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
@@ -2078,7 +2082,7 @@ async def submit_interactive_reply(
         log_line(
             f"input_reply_done exit={exit_code} target={target_thread_id} "
             f"answer={answer[:40].replace(chr(10), ' ')} "
-            f"output={(output or '')[:300].replace(chr(10), ' ')}"
+            f"output_len={format_log_text_len(output)}"
         )
         title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
         await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
@@ -2111,8 +2115,13 @@ class ApprovalView(discord.ui.View):
             pass
         log_line(f"approval_button user={interaction.user.id} answer={answer}")
         exit_code, output = await asyncio.to_thread(submit_approval_reply, self.target_thread_id, answer)
+        log_line(
+            f"approval_button_done exit={exit_code} target={self.target_thread_id} "
+            f"answer={answer}"
+        )
         title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
         await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
+        log_line(f"approval_button_sent exit={exit_code} target={self.target_thread_id}")
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2159,8 +2168,13 @@ class InputChoiceButton(discord.ui.Button):
                 pass
         log_line(f"input_choice_button user={interaction.user.id} value={self.value}")
         exit_code, output = await asyncio.to_thread(submit_input_reply, self.target_thread_id, self.value)
+        log_line(
+            f"input_choice_button_done exit={exit_code} target={self.target_thread_id} "
+            f"value={self.value}"
+        )
         title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
         await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
+        log_line(f"input_choice_button_sent exit={exit_code} target={self.target_thread_id}")
 
 
 class InputChoiceView(discord.ui.View):
@@ -2225,6 +2239,10 @@ class BusyChoiceView(discord.ui.View):
             pass
         if not self.allow_steer:
             await interaction.followup.send("This message targets a different Codex thread. Queue it instead.")
+            log_line(
+                f"steer_now_rejected user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'} reason=not_allowed"
+            )
             return
         log_line(
             f"steer_now user={interaction.user.id} target={self.target_thread_id or '-'} "
@@ -2237,10 +2255,11 @@ class BusyChoiceView(discord.ui.View):
         )
         log_line(
             f"steer_now_done exit={exit_code} target={self.target_thread_id or '-'} "
-            f"output={(output or '')[:500].replace(chr(10), ' ')}"
+            f"output_len={format_log_text_len(output)}"
         )
         title = "Steering sent" if exit_code == 0 else f"Steering failed (exit {exit_code})"
         await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
+        log_line(f"steer_now_sent exit={exit_code} target={self.target_thread_id or '-'}")
 
     @discord.ui.button(label="Queue next", style=discord.ButtonStyle.secondary)
     async def queue_next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2263,6 +2282,10 @@ class BusyChoiceView(discord.ui.View):
                 f"prompt={self.prompt[:160].replace(chr(10), ' ')}"
             )
             await interaction.followup.send("No active job now. Starting this message.")
+            log_line(
+                f"queue_next_immediate_sent user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'}"
+            )
             asyncio.create_task(
                 run_prompt_flow(
                     self.message.channel,
@@ -2283,6 +2306,10 @@ class BusyChoiceView(discord.ui.View):
             f"prompt={self.prompt[:160].replace(chr(10), ' ')}"
         )
         await interaction.followup.send(f"Queued at position {position}.")
+        log_line(
+            f"queue_next_sent user={interaction.user.id} position={position} "
+            f"target={self.target_thread_id or '-'}"
+        )
 
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.danger)
     async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2291,6 +2318,7 @@ class BusyChoiceView(discord.ui.View):
             return
         log_line(f"ignore_busy_prompt user={interaction.user.id}")
         await interaction.response.send_message("Ignored.")
+        log_line(f"ignore_busy_prompt_sent user={interaction.user.id}")
         try:
             await interaction.message.edit(view=self)
         except Exception:
