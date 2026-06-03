@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 12:02:33 +09:00
+- Goal: lock slash `/ask` anti-cross-targeting behavior for mirrored project parent channels.
+- Key assumptions:
+  - A project parent channel with multiple mirrored Codex threads must not silently send slash `/ask` to the selected global thread.
+  - The existing project-channel explanation should be returned instead.
+- Changes:
+  - Added a regression test that slash `/ask` with no direct mirrored thread and a project-parent warning does not call `handle_plain_ask()`.
+  - Asserted the `slash_ask_blocked` log is emitted and `slash_ask_dispatch` is not emitted.
+- Abuse cases checked:
+  - Test-only change exposes no new Discord command path.
+  - The covered behavior prevents accidental cross-thread prompt injection from project parent channels.
+  - The log assertion uses temporary logs and contains no prompt body.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 16 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - None for slash ask project-parent fallback protection.
+
 ## 2026-06-03 11:59:51 +09:00
 - Goal: prevent future Discord slash command drift between runtime, help text, and README.
 - Key assumptions:

@@ -434,6 +434,41 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.get_mirrored_codex_thread_id = original_get_mirrored
             bot.handle_plain_ask = original_handle_plain_ask
 
+    async def test_slash_ask_blocks_project_parent_fallback(self) -> None:
+        original_get_mirrored = bot.get_mirrored_codex_thread_id
+        original_describe_project = bot.describe_mirrored_project_channel
+        original_handle_plain_ask = bot.handle_plain_ask
+        try:
+            bot.get_mirrored_codex_thread_id = lambda channel_id: None
+            bot.describe_mirrored_project_channel = (
+                lambda channel_id: "`taxlab` project channel has multiple Codex threads."
+            )
+
+            async def fail_handle_plain_ask(message, prompt, *, target_thread_id=None):
+                raise AssertionError("project parent slash ask must not fall back to selected thread")
+
+            bot.handle_plain_ask = fail_handle_plain_ask
+            interaction = FakeInteraction(command_name="ask", channel_id=333)
+            interaction.channel = FakeTarget()
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.handle_slash_ask(interaction, "please run")
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(
+                interaction.followup.messages,
+                ["`taxlab` project channel has multiple Codex threads."],
+            )
+            self.assertIn("slash_ask_blocked command=ask channel=333", log_text)
+            self.assertIn("reason=project_parent", log_text)
+            self.assertNotIn("slash_ask_dispatch", log_text)
+        finally:
+            bot.get_mirrored_codex_thread_id = original_get_mirrored
+            bot.describe_mirrored_project_channel = original_describe_project
+            bot.handle_plain_ask = original_handle_plain_ask
+
     def test_new_thread_cwd_prefers_mirrored_thread_cwd(self) -> None:
         old_db_path = bot.MIRROR_DB_PATH
         original_choose_thread = bot.bridge.choose_thread
