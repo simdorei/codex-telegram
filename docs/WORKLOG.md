@@ -1744,3 +1744,20 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:06 +09:00 - Discord launcher lock gitignore
+- Goal: keep the runtime Discord launcher lock directory out of git status after adding `launcher.pid`.
+- Key assumptions:
+  - `.codex_discord_bot.lock/` is purely runtime state and should never be committed.
+- Changes:
+  - Added `.codex_discord_bot.lock/` to `.gitignore`.
+- Abuse cases checked:
+  - Runtime PID disclosure in commits: blocked by ignoring the lock directory.
+  - Accidental stale lock distribution: blocked because the runtime directory is not tracked.
+  - Behavior regression: no runtime code path changed.
+- Verification:
+  - `git status --short --branch` no longer reports `.codex_discord_bot.lock/`.
+- Side effects:
+  - Developers can keep a local Discord bot running without dirtying the worktree.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.

@@ -3,6 +3,7 @@
 codex_telegram_bot.log.bak
 codex_discord_bot.log.bak
 discord_mirror.sqlite
+.codex_discord_bot.lock/
 _ipc_probe_log.jsonl
 _ipc_probe_log.jsonl.bak
 __pycache__/
