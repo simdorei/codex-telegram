@@ -227,14 +227,17 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.run_ask_stream = fake_run_ask_stream
             bot.build_context_warning = lambda target_thread_id: ""
 
-            message = FakeMessage()
-            await bot.run_prompt_and_send(
-                message.channel,
-                "please steer",
-                ack_sent=True,
-                source_message=message,
-                target_thread_id="thread-1",
-            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                message = FakeMessage()
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.run_prompt_and_send(
+                        message.channel,
+                        "please steer",
+                        ack_sent=True,
+                        source_message=message,
+                        target_thread_id="thread-1",
+                    )
 
             self.assertEqual(len(message.channel.messages), 1)
             content, view = message.channel.messages[0]

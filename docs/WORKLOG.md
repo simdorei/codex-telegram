@@ -1,5 +1,21 @@
 # WORKLOG
 
+## 2026-06-03 11:35:35 +09:00
+- Goal: keep Discord busy-fallback regression tests isolated from the live bot log.
+- Key assumptions:
+  - Unit tests should not append synthetic busy-failure entries to `codex_discord_bot.log`.
+  - The production logging behavior should remain unchanged.
+- Changes:
+  - Wrapped the late busy failure regression test with `CODEX_DISCORD_LOG_PATH` pointing at a temporary file.
+- Abuse cases checked:
+  - Test-only change adds no externally reachable behavior.
+  - The existing busy fallback authorization and source-message checks remain unchanged.
+  - Temporary log path is confined to the test process and restored after the test.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 12 tests successfully.
+- Unresolved items:
+  - None for test isolation.
+
 ## 2026-06-03 11:33:55 +09:00
 - Goal: prevent raw Discord `Ask failed` busy errors when Codex becomes busy after the preflight check.
 - Key assumptions:
