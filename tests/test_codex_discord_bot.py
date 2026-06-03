@@ -808,6 +808,79 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.is_thread_runner_busy = original_is_thread_runner_busy
             bot.get_busy_state_for_thread = original_get_busy_state
 
+    async def test_history_poll_first_prime_processes_bootstrap_user_messages(self) -> None:
+        class FakeHistoryChannel(FakeTarget):
+            def __init__(self) -> None:
+                super().__init__(channel_id=333)
+                self.history_messages: list[FakeMessage] = []
+
+            def history(self, *, limit: int):
+                async def iterator():
+                    for message in self.history_messages[:limit]:
+                        yield message
+
+                return iterator()
+
+        original_get_mirrored = bot.get_mirrored_codex_thread_id
+        original_handle_plain_ask = bot.handle_plain_ask
+        original_is_thread_runner_busy = bot.is_thread_runner_busy
+        original_get_busy_state = bot.get_busy_state_for_thread
+        handled: list[tuple[str, str | None]] = []
+        channel = FakeHistoryChannel()
+        cutoff = datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc)
+        old_message = FakeMessage(content="old", channel_id=333, message_id=100)
+        old_message.created_at = cutoff - datetime.timedelta(seconds=1)
+        fresh_message = FakeMessage(content="bootstrap hook", channel_id=333, message_id=101)
+        fresh_message.created_at = cutoff + datetime.timedelta(seconds=1)
+        old_message.channel = channel
+        fresh_message.channel = channel
+        try:
+            bot.get_mirrored_codex_thread_id = lambda channel_id: "thread-1"
+            bot.get_busy_state_for_thread = lambda target_thread_id: ("idle", None, "")
+
+            async def runner_idle(target_thread_id):
+                return False
+
+            async def fake_handle_plain_ask(message, prompt, *, target_thread_id=None):
+                handled.append((prompt, target_thread_id))
+
+            bot.is_thread_runner_busy = runner_idle
+            bot.handle_plain_ask = fake_handle_plain_ask
+
+            async def process_message(message, *, source):
+                await bot.CodexDiscordBot.process_discord_message(client, message, source=source)
+
+            client = SimpleNamespace(
+                _processed_message_ids={},
+                _history_poll_primed_channels=set(),
+                _history_poll_bootstrap_after=cutoff,
+                enable_prefix_commands=True,
+                get_cached_channel_or_thread=lambda channel_id: (channel, "test_cache"),
+                fetch_channel=lambda channel_id: (_ for _ in ()).throw(AssertionError("fetch not expected")),
+                is_allowed_message_channel=lambda message_channel: True,
+                is_allowed_user=lambda user_id: True,
+                process_discord_message=process_message,
+            )
+            channel.history_messages = [fresh_message, old_message]
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.CodexDiscordBot.poll_history_channel(client, "allowed", 333)
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertEqual(handled, [("bootstrap hook", "thread-1")])
+            self.assertIn("history_poll_primed label=allowed channel=333", log_text)
+            self.assertIn("bootstrap_user_messages=1", log_text)
+            self.assertIn("history_poll_message channel=333", log_text)
+            self.assertIn("source=history_poll", log_text)
+            self.assertNotIn("old", log_text)
+        finally:
+            bot.get_mirrored_codex_thread_id = original_get_mirrored
+            bot.handle_plain_ask = original_handle_plain_ask
+            bot.is_thread_runner_busy = original_is_thread_runner_busy
+            bot.get_busy_state_for_thread = original_get_busy_state
+
     async def test_history_poll_loop_continues_after_cycle_error(self) -> None:
         original_get_targets = bot.get_startup_probe_targets
         original_sleep = bot.asyncio.sleep

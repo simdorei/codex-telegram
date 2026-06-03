@@ -805,6 +805,20 @@ def claim_discord_message(owner: object, message: object) -> bool:
     return True
 
 
+def is_history_bootstrap_user_message(owner: object, message: object) -> bool:
+    if getattr(getattr(message, "author", None), "bot", False):
+        return False
+    cutoff = getattr(owner, "_history_poll_bootstrap_after", None)
+    created_at = getattr(message, "created_at", None)
+    if not isinstance(cutoff, datetime) or not isinstance(created_at, datetime):
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    return created_at >= cutoff
+
+
 class LineStream(io.TextIOBase):
     def __init__(self, on_line):
         self.on_line = on_line
@@ -1201,6 +1215,7 @@ class CodexDiscordBot(discord.Client):
         self._history_poll_task: asyncio.Task[None] | None = None
         self._history_poll_primed_channels: set[int] = set()
         self._history_poll_last_at = "-"
+        self._history_poll_bootstrap_after = datetime.now(timezone.utc)
         self._processed_message_ids: dict[int, float] = {}
         self._slash_sync_last_at = "-"
         self._slash_sync_status = "-"
@@ -1354,20 +1369,31 @@ class CodexDiscordBot(discord.Client):
             return
         if not is_primed:
             self._history_poll_primed_channels.add(int(channel_id))
+            bootstrap_messages = [
+                message
+                for message in reversed(claimed_messages)
+                if is_history_bootstrap_user_message(self, message)
+            ]
             log_line(
                 f"history_poll_primed label={label} channel={channel_id} "
-                f"source={source} messages={len(claimed_messages)}"
+                f"source={source} messages={len(claimed_messages)} "
+                f"bootstrap_user_messages={len(bootstrap_messages)}"
             )
+            for message in bootstrap_messages:
+                await CodexDiscordBot.process_history_poll_message(self, message, channel_id)
             return
         for message in reversed(claimed_messages):
-            if getattr(getattr(message, "author", None), "bot", False):
-                continue
-            log_line(
-                f"history_poll_message channel={getattr(getattr(message, 'channel', None), 'id', channel_id)} "
-                f"user={getattr(getattr(message, 'author', None), 'id', '-')} "
-                f"content_len={format_log_text_len(getattr(message, 'content', '') or '')}"
-            )
-            await self.process_discord_message(message, source="history_poll")
+            await CodexDiscordBot.process_history_poll_message(self, message, channel_id)
+
+    async def process_history_poll_message(self, message: object, channel_id: int) -> None:
+        if getattr(getattr(message, "author", None), "bot", False):
+            return
+        log_line(
+            f"history_poll_message channel={getattr(getattr(message, 'channel', None), 'id', channel_id)} "
+            f"user={getattr(getattr(message, 'author', None), 'id', '-')} "
+            f"content_len={format_log_text_len(getattr(message, 'content', '') or '')}"
+        )
+        await self.process_discord_message(message, source="history_poll")
 
     async def on_ready(self) -> None:
         log_line(f"ready user={self.user} guilds={len(self.guilds)}")

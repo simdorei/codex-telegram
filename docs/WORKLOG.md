@@ -2002,3 +2002,28 @@
   - No Discord command schema, mirror DB schema, session behavior, ask routing, approval/input, or busy-choice behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 16:01 +09:00 - Discord history bootstrap delivery
+- Goal: avoid losing user messages posted during the bot startup/history-poll bootstrap window.
+- Key assumptions:
+  - Old history should still be primed without replaying prior conversations after restart.
+  - A non-bot message created after this bot process started is safe to process on the first history poll pass.
+- Changes:
+  - Added a bot startup cutoff timestamp for history polling.
+  - Let first-pass history priming process non-bot messages created at or after that cutoff.
+  - Factored history-poll message handling so bootstrap and normal polling use the same sanitized logging and routing path.
+  - Added a regression test for fresh bootstrap messages while proving older messages stay unprocessed.
+- Abuse cases checked:
+  - Old-message replay after restart: blocked by timestamp cutoff and first-pass filtering.
+  - Bot-message loops: blocked by non-bot filtering before bootstrap processing.
+  - Prompt leakage in logs: history-poll logs still record only content length and ids, not message body.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (70 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `history_poll_primed` logs now include `bootstrap_user_messages`.
+  - A user message sent during startup can now be delivered instead of only being marked processed.
+  - No Discord command schema, mirror DB schema, session behavior, slash handling, approval/input, or busy-choice behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
