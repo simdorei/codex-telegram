@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -131,6 +132,14 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(busy_view.claim())
         self.assertFalse(busy_view.claim())
         self.assertTrue(all(getattr(item, "disabled", False) for item in busy_view.children))
+
+    def test_help_and_registered_slash_commands_include_archived_list(self) -> None:
+        help_text = bot.build_help()
+        self.assertIn("/archived_list", help_text)
+
+        source = Path(bot.__file__).read_text(encoding="utf-8")
+        command_names = set(re.findall(r'@bot\.tree\.command\(name="([^"]+)"', source))
+        self.assertIn("archived_list", command_names)
 
     async def test_send_interaction_chunks_logs_and_sends(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

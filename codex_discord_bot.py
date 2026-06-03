@@ -2598,7 +2598,7 @@ def build_help() -> str:
             "!ask <prompt>",
             "",
             "Plain messages in mirrored Discord threads are sent to that Codex thread.",
-            "Slash commands: /help, /list, /use, /status, /doctor, /where, /context, /mirror_check.",
+            "Slash commands: /help, /list, /archived_list, /use, /status, /doctor, /where, /context, /mirror_check.",
         ]
     )
 
@@ -2622,6 +2622,18 @@ def register_commands(bot: CodexDiscordBot) -> None:
             interaction,
             ["list", "--limit", str(max(1, min(30, limit)))],
             "List",
+        )
+
+    @bot.tree.command(name="archived_list", description="Show archived Codex threads.")
+    async def slash_archived_list(interaction: discord.Interaction, limit: int = 10) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        await run_interaction_bridge_and_send(
+            interaction,
+            ["archived_list", "--limit", str(max(1, min(50, limit)))],
+            "Archived list",
         )
 
     @bot.tree.command(name="use", description="Select the active Codex thread.")

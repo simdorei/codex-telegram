@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 11:23:01 +09:00
+- Goal: align Discord slash commands with archived thread listing docs and prefix behavior.
+- Key assumptions:
+  - README already documents `/archived_list`, but the Discord adapter did not register that slash command.
+  - Archived thread listing is read-only and should be available from the Discord slash UI.
+- Changes:
+  - Added slash `/archived_list [limit]`.
+  - Updated help text's exact slash command list to include `/archived_list`.
+  - Added a regression test that help and registered slash command names include `archived_list`.
+- Abuse cases checked:
+  - Slash `/archived_list` uses the same interaction authorization gate as existing slash commands.
+  - The command is read-only and does not archive, delete, ask, or steer a thread.
+  - Limit is bounded to 1..50 before bridge execution.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 11 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord `/archived_list` input after deployment for live proof.
+
 ## 2026-06-03 11:19:57 +09:00
 - Goal: reduce Discord prefix command naming friction seen in live logs.
 - Key assumptions:
