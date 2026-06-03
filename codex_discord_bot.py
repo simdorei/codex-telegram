@@ -1404,6 +1404,29 @@ def format_context_usage_line(thread: bridge.ThreadInfo) -> str:
     )
 
 
+def build_context_warning(target_thread_id: str | None) -> str:
+    try:
+        resolved_thread_id, _target_ref = resolve_target_ref(target_thread_id)
+        if not resolved_thread_id:
+            return ""
+        thread = bridge.choose_thread(resolved_thread_id, None)
+        context_usage = bridge.get_thread_context_usage(thread)
+    except Exception as exc:
+        log_line(f"context_warning_unavailable target={target_thread_id or '-'} error={exc}")
+        return ""
+    if context_usage is None:
+        return ""
+    status = bridge.describe_thread_context_usage(context_usage)
+    archive_recommended = bridge.should_recommend_archive(thread, context_usage)
+    if status not in {"high", "critical"} and not archive_recommended:
+        return ""
+    return (
+        f"Context warning: {context_usage.usage_ratio * 100:.1f}% ({status}), "
+        f"archive_recommended={'yes' if archive_recommended else 'no'}. "
+        "Use `!context` to inspect, or start a fresh thread if replies slow down."
+    )
+
+
 def build_context_message(channel_id: int | None = None, *, all_threads: bool = False, limit: int = 10) -> str:
     if not all_threads:
         target_thread_id = get_mirrored_codex_thread_id(channel_id)
@@ -1858,10 +1881,45 @@ async def run_prompt_flow(
     queue = runner["queue"]
     if bool(runner.get("active")) or (isinstance(queue, asyncio.Queue) and queue.qsize() > 0):
         position = await enqueue_thread_ask(channel, prompt, target_thread_id, queued=True)
-        await channel.send(f"Queued in this Codex thread at position {position}.")
+        warning = build_context_warning(target_thread_id)
+        await channel.send(
+            "\n\n".join(
+                part
+                for part in [
+                    f"Queued in this Codex thread at position {position}.",
+                    warning,
+                ]
+                if part
+            )
+        )
         return
-    await channel.send("Ask received. Sending to Codex.")
+    warning = build_context_warning(target_thread_id)
+    await channel.send(
+        "\n\n".join(
+            part
+            for part in [
+                "Ask received. Sending to Codex.",
+                warning,
+            ]
+            if part
+        )
+    )
     await enqueue_thread_ask(channel, prompt, target_thread_id, queued=queued, ack_sent=True)
+
+
+def build_busy_choice_message(prompt: str, target_thread_id: str | None) -> str:
+    lines = ["This Codex thread is already working.", ""]
+    warning = build_context_warning(target_thread_id)
+    if warning:
+        lines.extend([warning, ""])
+    lines.extend(
+        [
+            prompt[:1500],
+            "",
+            "Choose how to handle this message for this thread.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 async def handle_plain_ask(
@@ -1910,15 +1968,7 @@ async def handle_plain_ask(
             allow_steer=True,
         )
         await message.channel.send(
-            "\n".join(
-                [
-                    "This Codex thread is already working.",
-                    "",
-                    prompt[:1500],
-                    "",
-                    "Choose how to handle this message for this thread.",
-                ]
-            ),
+            build_busy_choice_message(prompt, target_thread_id),
             view=view,
         )
         return
@@ -1932,15 +1982,7 @@ async def handle_plain_ask(
             allow_steer=allow_steer,
         )
         await message.channel.send(
-            "\n".join(
-                [
-                    "This Codex thread is already working.",
-                    "",
-                    prompt[:1500],
-                    "",
-                    "Choose how to handle this message for this thread.",
-                ]
-            ),
+            build_busy_choice_message(prompt, target_thread_id),
             view=view,
         )
         return

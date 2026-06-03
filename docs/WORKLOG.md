@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 10:30:00 +09:00
+- Goal: surface critical Codex context state directly in Discord ask/busy flows.
+- Key assumptions:
+  - The current mapped goal thread is over the critical context threshold and has `archive_recommended=yes`.
+  - Users should see context pressure before sending or steering more work into an already-large thread.
+- Changes:
+  - Added a reusable context warning builder for high/critical or archive-recommended threads.
+  - Added context warnings to Discord ask acknowledgements, queued ask acknowledgements, and busy-thread steering/queue prompts.
+  - Deduplicated busy-choice message construction.
+- Abuse cases checked:
+  - Warning display should not block legitimate asks or steering: patch only adds text to existing Discord responses.
+  - Warning should not expose more than existing `!context` data: it only shows ratio, status, and archive recommendation.
+  - Unavailable context data should not break message handling: failures are logged and warning text is omitted.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - Function smoke confirmed goal thread warning text renders as `critical` with `archive_recommended=yes`.
+  - Busy prompt smoke confirmed the warning appears before the prompt body.
+- Unresolved items:
+  - Live Discord message smoke is still needed to confirm the warning renders as intended in Discord.
+
 ## 2026-06-03 10:25:00 +09:00
 - Goal: make Discord message logs reflect the same busy-state evidence used by the frontend decision path.
 - Key assumptions:
