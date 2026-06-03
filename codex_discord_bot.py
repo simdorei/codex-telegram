@@ -2677,11 +2677,101 @@ def format_discord_id_list(values: set[int], *, limit: int = 8) -> str:
     return rendered
 
 
+def parse_log_line(line: str) -> tuple[str, str] | None:
+    match = re.match(r"^\[([^\]]+)\]\s+(.*)$", str(line or "").strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def get_log_field(body: str, key: str) -> str:
+    match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", body)
+    return match.group(1) if match else "-"
+
+
+def summarize_discord_hook_log_line(line: str) -> str | None:
+    parsed = parse_log_line(line)
+    if not parsed:
+        return None
+    timestamp, body = parsed
+    if body.startswith("socket_message_create_untracked "):
+        return (
+            f"{timestamp} raw_message_untracked "
+            f"channel={get_log_field(body, 'channel')} source={get_log_field(body, 'source')}"
+        )
+    if body.startswith("socket_message_create "):
+        return (
+            f"{timestamp} raw_message "
+            f"channel={get_log_field(body, 'channel')} source={get_log_field(body, 'source')} "
+            f"content_len={get_log_field(body, 'content_len')}"
+        )
+    if body.startswith("message_received "):
+        return (
+            f"{timestamp} message_received "
+            f"channel={get_log_field(body, 'chat')} content_len={get_log_field(body, 'content_len')}"
+        )
+    if body.startswith("ignored_message "):
+        return (
+            f"{timestamp} ignored_message "
+            f"reason={get_log_field(body, 'reason')} channel={get_log_field(body, 'chat')}"
+        )
+    if body.startswith("message "):
+        return (
+            f"{timestamp} message_routed "
+            f"channel={get_log_field(body, 'chat')} target={get_log_field(body, 'target')} "
+            f"prefix={get_log_field(body, 'prefix')} text_len={get_log_field(body, 'text_len')}"
+        )
+    if body.startswith("socket_interaction_create "):
+        return (
+            f"{timestamp} raw_interaction "
+            f"channel={get_log_field(body, 'channel')} type={get_log_field(body, 'type')} "
+            f"command={get_log_field(body, 'command')}"
+        )
+    if body.startswith("interaction_received "):
+        return (
+            f"{timestamp} interaction_received "
+            f"channel={get_log_field(body, 'channel')} type={get_log_field(body, 'type')} "
+            f"command={get_log_field(body, 'command')}"
+        )
+    if body.startswith("slash_"):
+        return (
+            f"{timestamp} slash_event "
+            f"channel={get_log_field(body, 'channel')} command={get_log_field(body, 'command')} "
+            f"exit={get_log_field(body, 'exit')}"
+        )
+    if body.startswith("component_interaction_"):
+        return (
+            f"{timestamp} component_event "
+            f"channel={get_log_field(body, 'channel')} custom_id={get_log_field(body, 'custom_id')}"
+        )
+    if body.startswith("busy_choice_"):
+        return (
+            f"{timestamp} busy_choice_event "
+            f"reason={get_log_field(body, 'reason')} target={get_log_field(body, 'target')}"
+        )
+    return None
+
+
+def get_recent_discord_hook_events(*, limit: int = 8, max_lines: int = 1000) -> list[str]:
+    log_path = get_log_path()
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    events: list[str] = []
+    for line in lines[-max_lines:]:
+        summary = summarize_discord_hook_log_line(line)
+        if summary:
+            events.append(summary)
+    return events[-limit:]
+
+
 def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -> str:
     target_thread_id = get_mirrored_codex_thread_id(channel_id)
     project = get_mirror_project_for_channel(channel_id)
     active_busy_choices, stale_busy_choices = get_busy_choice_counts()
     mirror_lines = build_mirror_check().splitlines()
+    recent_events = get_recent_discord_hook_events()
     lines = [
         "Discord adapter diagnostics",
         f"channel_id: {channel_id or '-'}",
@@ -2702,6 +2792,9 @@ def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -
         "Expected live log sequence:",
         "message: socket_message_create -> message_received",
         "slash/button: socket_interaction_create -> interaction_received",
+        "",
+        "Recent hook events:",
+        *(recent_events or ["-"]),
     ]
     return "\n".join(lines)
 

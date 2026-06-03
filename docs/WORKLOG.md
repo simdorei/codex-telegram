@@ -1526,6 +1526,31 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:33 +09:00 - Discord doctor hook timeline
+- Goal: make `/doctor` and `!doctor` show whether Discord message/slash/button hook events are reaching the adapter recently.
+- Key assumptions:
+  - When live input cannot be reproduced locally, the fastest diagnosis is distinguishing "no gateway event" from "raw event arrived but message/interaction handler did not continue".
+  - Doctor output must not expose prompt text from historical logs.
+- Changes:
+  - Added safe parsing for recent Discord hook log events.
+  - Added `Recent hook events` to Discord doctor diagnostics with sanitized message, interaction, slash, component, and busy-choice summaries.
+  - Added a regression test proving old `text=` prompt content is not copied into doctor output.
+- Abuse cases checked:
+  - Prompt leakage through diagnostics: summaries are reconstructed from whitelisted fields and omit raw text/prompt fields.
+  - Excessive output size: doctor includes only the last 8 recognized hook events from the last 1000 log lines.
+  - Unauthorized diagnostics access: command authorization paths are unchanged.
+  - Log parsing abuse: unknown log formats are ignored instead of echoed.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (61 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+  - Local `build_discord_doctor_message(...)` smoke showed recent hook events without prompt content.
+- Side effects:
+  - `/doctor` and `!doctor` now include a recent sanitized hook timeline.
+  - No command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

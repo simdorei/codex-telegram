@@ -454,7 +454,19 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                     allowed_user_ids=set(),
                     startup_channel_id=222,
                 )
-                output = bot.build_discord_doctor_message(fake_bot, 222)
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                log_path.write_text(
+                    "\n".join(
+                        [
+                            "[2026-06-03 14:00:00] socket_message_create channel=222 tracked=True source=client_channel_cache guild=1 author=2 bot=False content_len=12",
+                            "[2026-06-03 14:00:01] message chat=222 user=2 prefix=False runner_busy=False codex_busy=idle target_source=mirror target=thread-1 text=sensitive prompt",
+                            "[2026-06-03 14:00:02] busy_choice_sent reason=late_busy_failure target=thread-1 prompt_len=16",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    output = bot.build_discord_doctor_message(fake_bot, 222)
             finally:
                 bot.MIRROR_DB_PATH = old_db_path
 
@@ -466,6 +478,11 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("allowed_channels: 222", output)
         self.assertIn("Mirror check", output)
         self.assertIn("Expected live log sequence:", output)
+        self.assertIn("Recent hook events:", output)
+        self.assertIn("raw_message channel=222", output)
+        self.assertIn("message_routed channel=222", output)
+        self.assertIn("busy_choice_event reason=late_busy_failure", output)
+        self.assertNotIn("sensitive prompt", output)
 
     async def test_socket_message_create_logs_tracked_without_content(self) -> None:
         fake_client = SimpleNamespace(
