@@ -1673,6 +1673,31 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:58 +09:00 - Discord launcher stale lock recovery
+- Goal: ensure the scheduled-task watchdog can recover the Discord bot after a crash that leaves `.codex_discord_bot.lock` behind.
+- Key assumptions:
+  - The task repeats every 2 minutes with `MultipleInstancesPolicy=IgnoreNew`; while the task is Running, duplicate starts should still exit cleanly.
+  - If the task is not Running but the lock directory exists, that lock is stale and should not block recovery forever.
+- Changes:
+  - Updated `codex-discord-bot.cmd` so lock acquisition failure checks the `Codex Discord Bot` scheduled task state.
+  - If the task is Running, the launcher exits as an already-running duplicate without touching the lock.
+  - If the task is not Running, the launcher removes the stale lock and retries lock creation.
+  - Replaced unreliable process `CommandLine` detection, which is blank for the current Python process in this environment.
+- Abuse cases checked:
+  - Duplicate Discord bot processes: still blocked by the lock directory and `IgnoreNew` scheduled-task policy.
+  - Stale lock denial of service after crash: mitigated by removing the lock only when the scheduled task is not Running.
+  - Accidental live lock deletion: duplicate-start smoke confirmed a Running task leaves the lock in place and exits `0`.
+  - Prompt/session leakage: launcher logs only generic process state messages and no prompt/session data.
+- Verification:
+  - `cmd /c "codex-discord-bot.cmd --help"` while the bot was Running printed `Codex Discord bot is already running.`, exited `0`, and preserved `.codex_discord_bot.lock`.
+  - `py -3 -m unittest tests.test_codex_discord_bot` (63 tests)
+  - `git diff --check`
+- Side effects:
+  - Future scheduled-task starts can clear stale lock directories after a stopped/crashed task.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

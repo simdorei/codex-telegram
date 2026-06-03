@@ -11,17 +11,19 @@ if not exist "%SCRIPT%" (
 )
 
 mkdir "%LOCK_DIR%" >nul 2>nul
-if %errorlevel% neq 0 (
-  echo Codex Discord bot is already running.
-  exit /b 0
-)
-
-set "CODEX_DISCORD_SCRIPT=%SCRIPT%"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$script = $env:CODEX_DISCORD_SCRIPT; $running = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like ('*' + $script + '*') }; if ($running) { exit 0 } exit 1" >nul 2>nul
-if %errorlevel%==0 (
-  echo Codex Discord bot is already running.
+if errorlevel 1 (
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$task = Get-ScheduledTask -TaskName 'Codex Discord Bot' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 } exit 1" >nul 2>nul
+  if not errorlevel 1 (
+    echo Codex Discord bot is already running.
+    exit /b 0
+  )
+  echo Removing stale Codex Discord bot lock.
   rmdir "%LOCK_DIR%" >nul 2>nul
-  exit /b 0
+  mkdir "%LOCK_DIR%" >nul 2>nul
+  if errorlevel 1 (
+    echo ERROR: Could not create lock directory: "%LOCK_DIR%"
+    exit /b 1
+  )
 )
 
 if defined PYTHON_EXE if exist "%PYTHON_EXE%" goto run
