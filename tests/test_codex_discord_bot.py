@@ -429,6 +429,93 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_socket_message_create_logs_tracked_without_content(self) -> None:
+        fake_client = SimpleNamespace(
+            is_allowed_channel=lambda channel_id: channel_id == 222,
+        )
+        fake_client.format_socket_interaction_user = (
+            lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            payload = {
+                "t": "MESSAGE_CREATE",
+                "d": {
+                    "channel_id": "222",
+                    "guild_id": "111",
+                    "content": "sensitive prompt",
+                    "author": {"id": "999", "bot": False},
+                },
+            }
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.CodexDiscordBot.on_socket_response(fake_client, payload)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("socket_message_create channel=222 tracked=True", log_text)
+        self.assertIn("content_len=16", log_text)
+        self.assertNotIn("sensitive prompt", log_text)
+
+    async def test_socket_message_create_untracked_omits_author_and_content_len(self) -> None:
+        fake_client = SimpleNamespace(
+            is_allowed_channel=lambda channel_id: False,
+        )
+        fake_client.format_socket_interaction_user = (
+            lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
+        )
+        old_db_path = bot.MIRROR_DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            bot.MIRROR_DB_PATH = Path(temp_dir) / "mirror.sqlite"
+            try:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                payload = {
+                    "t": "MESSAGE_CREATE",
+                    "d": {
+                        "channel_id": "333",
+                        "guild_id": "111",
+                        "content": "sensitive prompt",
+                        "author": {"id": "999", "bot": False},
+                    },
+                }
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.CodexDiscordBot.on_socket_response(fake_client, payload)
+                log_text = log_path.read_text(encoding="utf-8")
+            finally:
+                bot.MIRROR_DB_PATH = old_db_path
+
+        self.assertIn("socket_message_create_untracked channel=333", log_text)
+        self.assertNotIn("author=999", log_text)
+        self.assertNotIn("content_len", log_text)
+        self.assertNotIn("sensitive prompt", log_text)
+
+    async def test_socket_interaction_create_logs_sanitized_command(self) -> None:
+        fake_client = SimpleNamespace(
+            is_allowed_channel=lambda channel_id: False,
+        )
+        fake_client.format_socket_interaction_user = (
+            lambda data: bot.CodexDiscordBot.format_socket_interaction_user(fake_client, data)
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            payload = {
+                "t": "INTERACTION_CREATE",
+                "d": {
+                    "channel_id": "222",
+                    "guild_id": "111",
+                    "type": 3,
+                    "member": {"user": {"id": "999"}},
+                    "data": {"custom_id": "codex_busy:abcdabcdabcdabcdabcdabcd:queue"},
+                },
+            }
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.CodexDiscordBot.on_socket_response(fake_client, payload)
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("socket_interaction_create channel=222", log_text)
+        self.assertIn("user=999", log_text)
+        self.assertIn("command=codex_busy:abcdabcdabcdabcdabcdabcd:queue", log_text)
+
     def test_help_readme_and_registered_slash_commands_match(self) -> None:
         expected_commands = {
             "help",

@@ -1331,6 +1331,32 @@
 - Unresolved:
   - Still needs fresh live Discord message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 13:51 +09:00 - Discord raw gateway event diagnostics
+- Goal: distinguish Discord gateway delivery problems from `on_message`/`on_interaction` dispatch or filtering problems.
+- Key assumptions:
+  - Startup probes proved channel/thread visibility, so the next useful evidence is whether raw `MESSAGE_CREATE` and `INTERACTION_CREATE` events arrive.
+  - Raw diagnostics must not log message text or arbitrary option values.
+- Changes:
+  - Added `on_socket_response` diagnostics for `MESSAGE_CREATE` and `INTERACTION_CREATE`.
+  - Tracked message events log channel, guild, author ID, bot flag, and `content_len` only.
+  - Untracked message events log only channel and guild, omitting author and content length.
+  - Interaction events log channel, guild, user ID, type, and sanitized command/custom ID.
+  - Added regression tests for tracked message content redaction, untracked message minimization, and sanitized interaction logging.
+- Abuse cases checked:
+  - Sensitive prompt leakage through raw gateway logs: blocked by length-only content logging for tracked messages and no content metadata for untracked messages.
+  - Log spam across unrelated channels: minimized by omitting author/content metadata for untracked messages; startup log rotation still applies.
+  - Malicious command/custom IDs injecting logs: mitigated by existing newline flattening and bounded command label formatting.
+  - Diagnostics changing bot behavior: handler only observes selected gateway event types and does not mutate dispatch state.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (54 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - Runtime logs now include raw gateway diagnostics for Discord message and interaction creation events.
+  - No command schema, mirror DB schema, session behavior, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord message/slash/button activity after deployment to prove whether gateway events arrive in the server.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

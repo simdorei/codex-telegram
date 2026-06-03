@@ -196,6 +196,19 @@ def get_interaction_custom_id(interaction: discord.Interaction) -> str:
     return format_discord_command_label(str(custom_id), limit=100)
 
 
+def format_raw_interaction_command(data: dict[str, object]) -> str:
+    interaction_data = data.get("data")
+    if not isinstance(interaction_data, dict):
+        return "-"
+    name = interaction_data.get("name")
+    if name:
+        return format_discord_command_label(str(name), limit=80)
+    custom_id = interaction_data.get("custom_id")
+    if custom_id:
+        return format_discord_command_label(str(custom_id), limit=100)
+    return "-"
+
+
 def run_bridge_command(argv: list[str]) -> tuple[int, str]:
     parser = bridge.build_parser()
     stdout_buffer = io.StringIO()
@@ -1184,6 +1197,58 @@ class CodexDiscordBot(discord.Client):
         )
         if getattr(interaction, "type", None) == discord.InteractionType.component:
             asyncio.create_task(report_unhandled_component_interaction(interaction))
+
+    async def on_socket_response(self, payload: dict[str, object]) -> None:
+        event_type = str(payload.get("t") or "")
+        data = payload.get("d")
+        if not isinstance(data, dict):
+            return
+        if event_type == "MESSAGE_CREATE":
+            channel_id_raw = data.get("channel_id")
+            try:
+                channel_id = int(str(channel_id_raw))
+            except (TypeError, ValueError):
+                channel_id = None
+            author = data.get("author")
+            author_id = "-"
+            author_bot = "-"
+            if isinstance(author, dict):
+                author_id = str(author.get("id") or "-")
+                author_bot = str(bool(author.get("bot", False)))
+            tracked = (
+                channel_id is not None
+                and (self.is_allowed_channel(channel_id) or is_mirrored_channel_id(channel_id))
+            )
+            if not tracked:
+                log_line(
+                    f"socket_message_create_untracked channel={channel_id or '-'} "
+                    f"guild={data.get('guild_id') or '-'}"
+                )
+                return
+            log_line(
+                f"socket_message_create channel={channel_id or '-'} tracked={tracked} "
+                f"guild={data.get('guild_id') or '-'} author={author_id} bot={author_bot} "
+                f"content_len={format_log_text_len(data.get('content'))}"
+            )
+            return
+        if event_type == "INTERACTION_CREATE":
+            channel_id = data.get("channel_id") or "-"
+            log_line(
+                f"socket_interaction_create channel={channel_id} guild={data.get('guild_id') or '-'} "
+                f"user={self.format_socket_interaction_user(data)} "
+                f"type={data.get('type') or '-'} command={format_raw_interaction_command(data)}"
+            )
+
+    def format_socket_interaction_user(self, data: dict[str, object]) -> str:
+        user = data.get("user")
+        if isinstance(user, dict) and user.get("id"):
+            return str(user.get("id"))
+        member = data.get("member")
+        if isinstance(member, dict):
+            member_user = member.get("user")
+            if isinstance(member_user, dict) and member_user.get("id"):
+                return str(member_user.get("id"))
+        return "-"
 
     async def on_message(self, message: discord.Message) -> None:
         try:
