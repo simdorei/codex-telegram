@@ -522,6 +522,9 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                     allowed_user_ids=set(),
                     startup_channel_id=222,
                     history_poll_seconds=15.0,
+                    _history_poll_task=SimpleNamespace(done=lambda: False),
+                    _history_poll_last_at="2026-06-03T06:23:10+00:00",
+                    _history_poll_primed_channels={111, 222},
                 )
                 log_path = Path(temp_dir) / "discord-smoke.log"
                 log_path.write_text(
@@ -550,6 +553,9 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("intent_message_content: True", output)
         self.assertIn("raw_debug_events: True", output)
         self.assertIn("history_poll_seconds: 15.0", output)
+        self.assertIn("history_poll_alive: True", output)
+        self.assertIn("history_poll_last_at: 2026-06-03T06:23:10+00:00", output)
+        self.assertIn("history_poll_primed_channels: 2", output)
         self.assertIn("allowed_channels: 222", output)
         self.assertIn("last_ready_at: 2026-06-03 13:59:57", output)
         self.assertIn("last_gateway_event_at: 2026-06-03 14:00:00", output)

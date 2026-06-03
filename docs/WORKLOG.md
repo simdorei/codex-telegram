@@ -1838,3 +1838,25 @@
   - No Discord command schema, mirror DB schema, session key behavior, slash commands, or UI button behavior changed.
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
+## 2026-06-03 15:25 +09:00 - Discord history poll doctor health
+- Goal: make `/doctor` show whether the history polling fallback is still alive after startup.
+- Key assumptions:
+  - Polling can continue silently when there are no new messages, so doctor needs in-memory health markers rather than more periodic logs.
+- Changes:
+  - Added `history_poll_alive`, `history_poll_last_at`, and `history_poll_primed_channels` to Discord adapter diagnostics.
+  - Updated the poll loop to refresh a last-cycle timestamp without adding log spam.
+  - Extended the doctor regression test for the new health fields.
+- Abuse cases checked:
+  - Prompt leakage: new fields expose only task state, timestamp, and channel count.
+  - Operational confusion from silent fallback failure: doctor now distinguishes a live polling task from a dead/missing one.
+  - Log spam/API pressure: no new periodic log lines or extra Discord API calls were added.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (65 tests)
+  - `py -3 -m py_compile codex_discord_bot.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+- Side effects:
+  - `/doctor` and `!doctor` output gains three history-poll health lines.
+  - No Discord command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
