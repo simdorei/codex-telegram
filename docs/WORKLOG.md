@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 10:58:18 +09:00
+- Goal: harden Discord slash interaction diagnostics and mirrored-thread authorization.
+- Key assumptions:
+  - Discord interactions can still carry a channel id even if the channel object is unavailable to the handler.
+  - Slash command delivery should be auditable like prefix command delivery.
+- Changes:
+  - Added slash response helpers that log command name, title, exit code, chunk count, and channel id.
+  - Routed slash bridge commands through a shared helper that logs bridge exit and sanitized argv.
+  - Allowed slash interactions directly by mirrored channel id before falling back to the channel object.
+- Abuse cases checked:
+  - Slash response logs do not include output bodies, prompts, tokens, or session content.
+  - Arg logging remains sanitized through the existing capped/newline-stripped formatter.
+  - Mirrored-channel authorization still requires the user allowlist check first and only broadens the channel object fallback.
+- Verification:
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, and `codex_desktop_bridge.py`.
+  - `git diff --check`
+  - Fake interaction smoke confirmed mirrored channel-id authorization with no channel object.
+  - Fake interaction smoke confirmed `slash_response_start` and `slash_response_sent` logs.
+- Unresolved items:
+  - Need a real Discord slash command after deployment to verify the live interaction logs.
+
 ## 2026-06-03 10:53:53 +09:00
 - Goal: make Discord prefix-command response delivery auditable.
 - Key assumptions:

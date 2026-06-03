@@ -959,6 +959,54 @@ async def run_bridge_and_send(
     return exit_code, output
 
 
+def get_interaction_command_name(interaction: discord.Interaction) -> str:
+    command = getattr(interaction, "command", None)
+    return str(getattr(command, "name", None) or "-")
+
+
+async def send_interaction_chunks(
+    interaction: discord.Interaction,
+    text: str,
+    *,
+    title: str,
+    exit_code: int | None = None,
+) -> None:
+    chunks = split_message(text)
+    command_name = get_interaction_command_name(interaction)
+    exit_part = "-" if exit_code is None else str(exit_code)
+    log_line(
+        f"slash_response_start command={command_name} title={title!r} "
+        f"exit={exit_part} chunks={len(chunks)} channel={interaction.channel_id}"
+    )
+    for chunk in chunks:
+        await interaction.followup.send(chunk)
+    log_line(
+        f"slash_response_sent command={command_name} title={title!r} "
+        f"exit={exit_part} chunks={len(chunks)}"
+    )
+
+
+async def run_interaction_bridge_and_send(
+    interaction: discord.Interaction,
+    argv: list[str],
+    title: str,
+    failure_title: str | None = None,
+) -> tuple[int, str]:
+    exit_code, output = await asyncio.to_thread(run_bridge_command, argv)
+    prefix = title if exit_code == 0 else f"{failure_title or title} failed (exit {exit_code})"
+    log_line(
+        f"slash_bridge_done command={get_interaction_command_name(interaction)} "
+        f"title={title!r} exit={exit_code} argv={format_log_argv(argv)}"
+    )
+    await send_interaction_chunks(
+        interaction,
+        f"{prefix}\n\n{output or '(no output)'}",
+        title=title,
+        exit_code=exit_code,
+    )
+    return exit_code, output
+
+
 async def get_mirror_guild(bot: CodexDiscordBot) -> discord.Guild:
     guild = bot.get_guild(bot.guild_id) if bot.guild_id else (bot.guilds[0] if bot.guilds else None)
     if guild is None:
@@ -2526,8 +2574,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        for chunk in split_message(build_help()):
-            await interaction.followup.send(chunk)
+        await send_interaction_chunks(interaction, build_help(), title="Help")
 
     @bot.tree.command(name="list", description="Show recent Codex threads.")
     async def slash_list(interaction: discord.Interaction, limit: int = 10) -> None:
@@ -2535,10 +2582,11 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        exit_code, output = await asyncio.to_thread(run_bridge_command, ["list", "--limit", str(max(1, min(30, limit)))])
-        prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
-        for chunk in split_message(f"{prefix}\n\n{output or '(no output)'}"):
-            await interaction.followup.send(chunk)
+        await run_interaction_bridge_and_send(
+            interaction,
+            ["list", "--limit", str(max(1, min(30, limit)))],
+            "List",
+        )
 
     @bot.tree.command(name="use", description="Select the active Codex thread.")
     async def slash_use(interaction: discord.Interaction, ref: str) -> None:
@@ -2546,10 +2594,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        exit_code, output = await asyncio.to_thread(run_bridge_command, ["use", ref])
-        prefix = "Use" if exit_code == 0 else f"Use failed (exit {exit_code})"
-        for chunk in split_message(f"{prefix}\n\n{output or '(no output)'}"):
-            await interaction.followup.send(chunk)
+        await run_interaction_bridge_and_send(interaction, ["use", ref], "Use")
 
     @bot.tree.command(name="status", description="Show selected Codex thread status.")
     async def slash_status(interaction: discord.Interaction, ref: str = "") -> None:
@@ -2559,10 +2604,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
         await interaction.response.defer(thinking=True)
         argv = ["status"]
         argv.extend(resolve_discord_thread_target_args(interaction.channel_id, ref or None))
-        exit_code, output = await asyncio.to_thread(run_bridge_command, argv)
-        prefix = "Status" if exit_code == 0 else f"Status failed (exit {exit_code})"
-        for chunk in split_message(f"{prefix}\n\n{output or '(no output)'}"):
-            await interaction.followup.send(chunk)
+        await run_interaction_bridge_and_send(interaction, argv, "Status")
 
     @bot.tree.command(name="doctor", description="Run Codex bridge diagnostics.")
     async def slash_doctor(interaction: discord.Interaction) -> None:
@@ -2570,10 +2612,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        exit_code, output = await asyncio.to_thread(run_bridge_command, ["doctor"])
-        prefix = "Doctor" if exit_code == 0 else f"Doctor failed (exit {exit_code})"
-        for chunk in split_message(f"{prefix}\n\n{output or '(no output)'}"):
-            await interaction.followup.send(chunk)
+        await run_interaction_bridge_and_send(interaction, ["doctor"], "Doctor")
 
     @bot.tree.command(name="where", description="Show the Codex thread mapped to this Discord channel.")
     async def slash_where(interaction: discord.Interaction) -> None:
@@ -2581,8 +2620,11 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        for chunk in split_message(build_where_message(interaction.channel_id)):
-            await interaction.followup.send(chunk)
+        await send_interaction_chunks(
+            interaction,
+            build_where_message(interaction.channel_id),
+            title="Where",
+        )
 
     @bot.tree.command(name="context", description="Show context usage for this Codex thread.")
     async def slash_context(interaction: discord.Interaction, all_threads: bool = False) -> None:
@@ -2591,8 +2633,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
             return
         await interaction.response.defer(thinking=True)
         output = build_context_message(interaction.channel_id, all_threads=all_threads, limit=20)
-        for chunk in split_message(output):
-            await interaction.followup.send(chunk)
+        await send_interaction_chunks(interaction, output, title="Context")
 
     @bot.tree.command(name="mirror_check", description="Check Discord mirror mappings.")
     async def slash_mirror_check(interaction: discord.Interaction) -> None:
@@ -2600,14 +2641,15 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        for chunk in split_message(build_mirror_check()):
-            await interaction.followup.send(chunk)
+        await send_interaction_chunks(interaction, build_mirror_check(), title="Mirror check")
 
 
 def check_interaction_allowed(bot: CodexDiscordBot, interaction: discord.Interaction) -> bool:
     if not bot.is_allowed_user(interaction.user.id):
         return False
     if bot.is_allowed_channel(interaction.channel_id):
+        return True
+    if is_mirrored_channel_id(interaction.channel_id):
         return True
     channel = interaction.channel
     if channel is not None and bot.is_allowed_message_channel(channel):
