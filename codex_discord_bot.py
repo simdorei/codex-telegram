@@ -92,6 +92,13 @@ def get_required_env(name: str) -> str:
     return value
 
 
+def get_log_path() -> Path:
+    value = os.environ.get("CODEX_DISCORD_LOG_PATH", "").strip()
+    if value:
+        return Path(value).expanduser()
+    return LOG_PATH
+
+
 def parse_bounded_int_arg(raw: str, *, default: int, minimum: int, maximum: int) -> int:
     if not raw:
         return default
@@ -118,13 +125,14 @@ def resolve_discord_thread_target_args(
 def log_line(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}\n"
+    log_path = get_log_path()
     try:
         bridge.rotate_single_backup_file(
-            LOG_PATH,
+            log_path,
             incoming_bytes=len(line.encode("utf-8")),
         )
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a", encoding="utf-8") as handle:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
             handle.write(line)
     except Exception:
         pass

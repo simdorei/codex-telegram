@@ -83,6 +83,7 @@ DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 DISCORD_ALLOWED_CHANNEL_IDS=
 DISCORD_STARTUP_CHANNEL_ID=
+CODEX_DISCORD_LOG_PATH=
 CODEX_HOME=
 CODEX_DESKTOP_EXE=
 PYTHON_EXE=
@@ -97,6 +98,7 @@ Important variables:
 - `DISCORD_GUILD_ID`: optional guild/server ID for faster slash-command sync
 - `DISCORD_ALLOWED_CHANNEL_IDS`: optional allowlist of Discord channel/thread IDs
 - `DISCORD_STARTUP_CHANNEL_ID`: optional channel ID for startup notifications
+- `CODEX_DISCORD_LOG_PATH`: optional Discord adapter log path override, useful for smoke tests or isolated diagnostics
 - `CODEX_HOME`: override default Codex state directory if needed
 - `CODEX_DESKTOP_EXE`: optional override for the Codex Desktop app executable. `/discover_codex` or `/restart_codex` auto-save it into `.env` when discovery succeeds.
 - `PYTHON_EXE`: force a specific Python interpreter

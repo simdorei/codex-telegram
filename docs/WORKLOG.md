@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 11:06:14 +09:00
+- Goal: keep Discord frontend smoke tests from polluting live runtime logs.
+- Key assumptions:
+  - Local smokes that call Discord adapter helpers should not create entries that look like live Discord interactions.
+  - Production should keep the existing default log path unless explicitly overridden.
+- Changes:
+  - Added optional `CODEX_DISCORD_LOG_PATH` support to `log_line()`.
+  - Added `CODEX_DISCORD_LOG_PATH` to `.env.example`.
+  - Documented the log path override in `README.md`.
+- Abuse cases checked:
+  - The default log path remains unchanged when the override is absent.
+  - Override affects only local file logging and exposes no new Discord command or network surface.
+  - Tests can now isolate smoke logs, reducing false live-evidence readings.
+- Verification:
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, and `codex_desktop_bridge.py`.
+  - `git diff --check`
+  - Smoke with `CODEX_DISCORD_LOG_PATH` confirmed logs were written to a temp file instead of `codex_discord_bot.log`.
+- Unresolved items:
+  - Need real Discord input after deployment for final frontend stability proof.
+
 ## 2026-06-03 11:02:23 +09:00
 - Goal: make Discord interactive button delivery auditable without leaking response bodies.
 - Key assumptions:
