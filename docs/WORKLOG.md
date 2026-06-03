@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 10:18:00 +09:00
+- Goal: apply the Discord user allowlist consistently to interactive buttons.
+- Key assumptions:
+  - Approval and input choice buttons are externally reachable Discord interaction handlers.
+  - Button callbacks should enforce the same `DISCORD_ALLOWED_USER_IDS` policy as prefix and slash commands.
+- Changes:
+  - Added a shared Discord user allowlist helper.
+  - Applied the allowlist to approval buttons and input choice buttons before submitting anything to Codex.
+  - Kept existing busy-message controls limited to the original message author.
+- Abuse cases checked:
+  - Unauthorized Discord user clicks `Approve` on a Codex approval prompt: blocked by the button interaction check when `DISCORD_ALLOWED_USER_IDS` is configured.
+  - Unauthorized Discord user clicks an input choice: blocked before the answer is sent to Codex.
+  - Allowlist drift between message/slash/button flows: reduced by reusing the same helper when no explicit bot instance allowlist is present.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - Function smoke for open allowlist, listed user allowed, unlisted user denied, and bot user-check denial.
+- Unresolved items:
+  - If `DISCORD_ALLOWED_USER_IDS` is left empty, all users in allowed/mirrored channels remain allowed by design.
+
 ## 2026-06-03 10:13:30 +09:00
 - Goal: make Discord steering and slash-command failures diagnosable after the busy-thread UI stabilization.
 - Key assumptions:

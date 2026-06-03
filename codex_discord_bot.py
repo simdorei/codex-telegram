@@ -78,6 +78,13 @@ def parse_int_set(raw: str) -> set[int]:
     return result
 
 
+def is_discord_user_allowed(user_id: int | None) -> bool:
+    allowed_user_ids = parse_int_set(os.environ.get("DISCORD_ALLOWED_USER_IDS", ""))
+    if not allowed_user_ids:
+        return True
+    return user_id in allowed_user_ids
+
+
 def get_required_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -792,9 +799,9 @@ class CodexDiscordBot(discord.Client):
         return getattr(category, "name", None) == "Codex"
 
     def is_allowed_user(self, user_id: int | None) -> bool:
-        if not self.allowed_user_ids:
-            return True
-        return user_id in self.allowed_user_ids
+        if self.allowed_user_ids:
+            return user_id in self.allowed_user_ids
+        return is_discord_user_allowed(user_id)
 
     async def setup_hook(self) -> None:
         log_line("setup_hook_start")
@@ -1950,6 +1957,13 @@ class ApprovalView(discord.ui.View):
         super().__init__(timeout=1800)
         self.target_thread_id = target_thread_id
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_discord_user_allowed(interaction.user.id):
+            return True
+        log_line(f"approval_button_denied user={interaction.user.id} target={self.target_thread_id}")
+        await interaction.response.send_message("This user is not allowed.", ephemeral=True)
+        return False
+
     async def _submit(self, interaction: discord.Interaction, answer: str) -> None:
         await interaction.response.defer(thinking=True)
         log_line(f"approval_button user={interaction.user.id} answer={answer}")
@@ -1991,6 +2005,10 @@ class InputChoiceButton(discord.ui.Button):
         self.value = value
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if not is_discord_user_allowed(interaction.user.id):
+            log_line(f"input_choice_button_denied user={interaction.user.id} target={self.target_thread_id}")
+            await interaction.response.send_message("This user is not allowed.", ephemeral=True)
+            return
         await interaction.response.defer(thinking=True)
         log_line(f"input_choice_button user={interaction.user.id} value={self.value}")
         exit_code, output = await asyncio.to_thread(submit_input_reply, self.target_thread_id, self.value)
