@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 12:30:57 +09:00
+- Goal: prevent Discord button followups from failing when bridge output exceeds Discord's message length limit.
+- Key assumptions:
+  - Slash command responses already use chunking, but approval/input/steering button followups sent a single message.
+  - A long bridge result from a button click can exceed Discord's message limit and make the frontend appear unresponsive.
+- Changes:
+  - Extracted `send_followup_chunks()` while preserving existing `slash_response_*` logs for slash commands.
+  - Routed approval, input-choice, and steering button result messages through chunked followup sends.
+  - Added regression tests for long button followup chunking and approval-button long output handling.
+- Abuse cases checked:
+  - Chunking only changes response delivery shape; authorization and one-shot button claim checks remain unchanged.
+  - Logs include titles, exit codes, chunk counts, and channel ids, not prompt text or bridge output content.
+  - Long output is bounded into Discord-sized chunks instead of bypassing existing output text or exposing a new command path.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 26 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need live Discord button output after deployment to prove `button_response_*` logs on a real interaction.
+
 ## 2026-06-03 12:26:35 +09:00
 - Goal: make Discord `new` place the mirrored thread in the invoking mirror's project channel when that channel is known.
 - Key assumptions:

@@ -1040,17 +1040,34 @@ async def send_interaction_chunks(
     title: str,
     exit_code: int | None = None,
 ) -> None:
+    await send_followup_chunks(
+        interaction,
+        text,
+        title=title,
+        exit_code=exit_code,
+        log_prefix="slash_response",
+    )
+
+
+async def send_followup_chunks(
+    interaction: discord.Interaction,
+    text: str,
+    *,
+    title: str,
+    exit_code: int | None = None,
+    log_prefix: str = "followup_response",
+) -> None:
     chunks = split_message(text)
     command_name = get_interaction_command_name(interaction)
     exit_part = "-" if exit_code is None else str(exit_code)
     log_line(
-        f"slash_response_start command={command_name} title={title!r} "
+        f"{log_prefix}_start command={command_name} title={title!r} "
         f"exit={exit_part} chunks={len(chunks)} channel={interaction.channel_id}"
     )
     for chunk in chunks:
         await interaction.followup.send(chunk)
     log_line(
-        f"slash_response_sent command={command_name} title={title!r} "
+        f"{log_prefix}_sent command={command_name} title={title!r} "
         f"exit={exit_part} chunks={len(chunks)}"
     )
 
@@ -2403,7 +2420,13 @@ class ApprovalView(discord.ui.View):
             f"answer={answer}"
         )
         title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
-        await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
+        await send_followup_chunks(
+            interaction,
+            f"{title}\n\n{output or '(no output)'}",
+            title="Approval",
+            exit_code=exit_code,
+            log_prefix="button_response",
+        )
         log_line(f"approval_button_sent exit={exit_code} target={self.target_thread_id}")
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
@@ -2456,7 +2479,13 @@ class InputChoiceButton(discord.ui.Button):
             f"value={self.value}"
         )
         title = "Input submitted" if exit_code == 0 else f"Input failed (exit {exit_code})"
-        await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
+        await send_followup_chunks(
+            interaction,
+            f"{title}\n\n{output or '(no output)'}",
+            title="Input",
+            exit_code=exit_code,
+            log_prefix="button_response",
+        )
         log_line(f"input_choice_button_sent exit={exit_code} target={self.target_thread_id}")
 
 
@@ -2557,7 +2586,13 @@ class BusyChoiceView(discord.ui.View):
             )
             return
         title = "Steering sent" if exit_code == 0 else f"Steering failed (exit {exit_code})"
-        await interaction.followup.send(f"{title}\n\n{output or '(no output)'}")
+        await send_followup_chunks(
+            interaction,
+            f"{title}\n\n{output or '(no output)'}",
+            title="Steering",
+            exit_code=exit_code,
+            log_prefix="button_response",
+        )
         log_line(f"steer_now_sent exit={exit_code} target={self.target_thread_id or '-'}")
 
     @discord.ui.button(label="Queue next", style=discord.ButtonStyle.secondary)

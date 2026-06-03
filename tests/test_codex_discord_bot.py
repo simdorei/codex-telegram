@@ -214,6 +214,25 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("slash_response_start command=where", log_text)
             self.assertIn("slash_response_sent command=where", log_text)
 
+    async def test_send_followup_chunks_splits_long_button_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "discord-smoke.log"
+            interaction = FakeInteraction(command_name="ask", channel_id=222)
+            with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                await bot.send_followup_chunks(
+                    interaction,
+                    "x" * 4100,
+                    title="Steering",
+                    exit_code=1,
+                    log_prefix="button_response",
+                )
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertGreater(len(interaction.followup.messages), 1)
+        self.assertTrue(all(len(message) <= bot.DISCORD_MAX_LEN for message in interaction.followup.messages))
+        self.assertIn("button_response_start command=ask title='Steering' exit=1", log_text)
+        self.assertIn("button_response_sent command=ask title='Steering' exit=1", log_text)
+
     async def test_slash_error_handler_reports_before_initial_response(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "discord-smoke.log"
@@ -429,6 +448,32 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.run_steering_prompt = original_run_steering_prompt
             bot.build_context_warning = original_build_context_warning
+
+    async def test_approval_button_chunks_long_output(self) -> None:
+        original_submit_approval_reply = bot.submit_approval_reply
+        try:
+            def fake_submit_approval_reply(target_thread_id, answer):
+                return 0, "approved\n" + ("x" * 4100)
+
+            bot.submit_approval_reply = fake_submit_approval_reply
+            interaction = FakeInteraction(command_name="approval", channel_id=222)
+            view = bot.ApprovalView("thread-1")
+            button = next(item for item in view.children if getattr(item, "label", "") == "Approve")
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await button.callback(interaction)
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertTrue(interaction.response.deferred)
+            self.assertGreater(len(interaction.followup.messages), 1)
+            self.assertTrue(all(len(message) <= bot.DISCORD_MAX_LEN for message in interaction.followup.messages))
+            self.assertIn("Approval submitted", interaction.followup.messages[0])
+            self.assertIn("button_response_start command=approval title='Approval' exit=0", log_text)
+            self.assertIn("approval_button_sent exit=0 target=thread-1", log_text)
+        finally:
+            bot.submit_approval_reply = original_submit_approval_reply
 
     async def test_archive_list_alias_routes_to_archived_list(self) -> None:
         original_run_bridge_and_send = bot.run_bridge_and_send
