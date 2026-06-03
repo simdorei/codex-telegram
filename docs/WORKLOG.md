@@ -1574,6 +1574,29 @@
 - Unresolved:
   - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
 
+## 2026-06-03 14:40 +09:00 - Discord doctor raw message bot flag
+- Goal: make doctor hook timelines distinguish bot-generated startup messages from real user messages.
+- Key assumptions:
+  - Recent `raw_message` events can look like successful input hooks unless the `bot` author flag is visible.
+  - For current debugging, seeing `bot=True` explains why raw gateway traffic exists while user message handling has not moved.
+- Changes:
+  - Added the sanitized `bot` flag to raw message summaries in Discord doctor recent hook events.
+  - Updated the doctor regression test to assert the bot flag is preserved without exposing prompt text.
+- Abuse cases checked:
+  - User identity leakage: the summary still omits author IDs.
+  - Prompt leakage: no raw content or prompt fields are copied.
+  - Output growth: one small boolean field was added within the existing event limit.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (61 tests)
+  - `py -3` temp `py_compile` for `codex_discord_bot.py` and `tests/test_codex_discord_bot.py`
+  - `git diff --check`
+  - Local doctor smoke showed current recent raw messages as `bot=True`.
+- Side effects:
+  - `/doctor` and `!doctor` recent raw message events now include `bot=True` or `bot=False`.
+  - No command schema, mirror DB schema, session behavior, ask routing, or UI button behavior changed.
+- Unresolved:
+  - Still needs fresh live Discord user message/slash/button activity after deployment to prove end-to-end behavior.
+
 ## 2026-06-03 13:22 +09:00 - Discord approval button log sanitization
 - Goal: keep approval button diagnostics consistent with length-only answer logging.
 - Key assumptions:

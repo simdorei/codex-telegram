@@ -2703,7 +2703,7 @@ def summarize_discord_hook_log_line(line: str) -> str | None:
         return (
             f"{timestamp} raw_message "
             f"channel={get_log_field(body, 'channel')} source={get_log_field(body, 'source')} "
-            f"content_len={get_log_field(body, 'content_len')}"
+            f"bot={get_log_field(body, 'bot')} content_len={get_log_field(body, 'content_len')}"
         )
     if body.startswith("message_received "):
         return (

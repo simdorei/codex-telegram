@@ -481,7 +481,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Mirror check", output)
         self.assertIn("Expected live log sequence:", output)
         self.assertIn("Recent hook events:", output)
-        self.assertIn("raw_message channel=222", output)
+        self.assertIn("raw_message channel=222 source=client_channel_cache bot=False", output)
         self.assertIn("message_routed channel=222", output)
         self.assertIn("busy_choice_event reason=late_busy_failure", output)
         self.assertIn("slash_ask_dispatch channel=222 command=ask", output)
