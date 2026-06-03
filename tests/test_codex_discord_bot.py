@@ -205,6 +205,48 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.build_context_warning = original_build_context_warning
             bot.is_thread_runner_busy = original_is_thread_runner_busy
 
+    async def test_ask_busy_failure_shows_busy_choice_view(self) -> None:
+        original_resolve_target_ref = bot.resolve_target_ref
+        original_run_ask_stream = bot.run_ask_stream
+        original_build_context_warning = bot.build_context_warning
+        try:
+            bot.resolve_target_ref = lambda target_thread_id: (target_thread_id, "taxlab:1")
+
+            def fake_run_ask_stream(prompt, relay, *, force_while_busy=False, wait=True, target_thread_id=None):
+                return (
+                    1,
+                    "\n".join(
+                        [
+                            "Ask failed (exit 1)",
+                            "",
+                            "ERROR: The selected thread is still busy. Wait, switch to another thread, or pass --force-while-busy.",
+                        ]
+                    ),
+                )
+
+            bot.run_ask_stream = fake_run_ask_stream
+            bot.build_context_warning = lambda target_thread_id: ""
+
+            message = FakeMessage()
+            await bot.run_prompt_and_send(
+                message.channel,
+                "please steer",
+                ack_sent=True,
+                source_message=message,
+                target_thread_id="thread-1",
+            )
+
+            self.assertEqual(len(message.channel.messages), 1)
+            content, view = message.channel.messages[0]
+            self.assertIn("This Codex thread is already working.", content)
+            self.assertIn("please steer", content)
+            self.assertIsInstance(view, bot.BusyChoiceView)
+            self.assertEqual(view.target_thread_id, "thread-1")
+        finally:
+            bot.resolve_target_ref = original_resolve_target_ref
+            bot.run_ask_stream = original_run_ask_stream
+            bot.build_context_warning = original_build_context_warning
+
     async def test_archive_list_alias_routes_to_archived_list(self) -> None:
         original_run_bridge_and_send = bot.run_bridge_and_send
         calls: list[tuple[list[str], str]] = []

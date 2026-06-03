@@ -1836,6 +1836,7 @@ async def enqueue_thread_ask(
     *,
     queued: bool = False,
     ack_sent: bool = False,
+    source_message: discord.Message | None = None,
 ) -> int:
     runner = await get_thread_runner(target_thread_id)
     queue = runner["queue"]
@@ -1848,6 +1849,7 @@ async def enqueue_thread_ask(
             "target_thread_id": target_thread_id,
             "queued": queued,
             "ack_sent": ack_sent,
+            "source_message": source_message,
         }
     )
     task = runner.get("task")
@@ -1905,6 +1907,7 @@ async def thread_runner_loop(target_thread_id: str | None) -> None:
                     prompt,
                     queued=queued,
                     ack_sent=ack_sent,
+                    source_message=job.get("source_message"),  # type: ignore[arg-type]
                     target_thread_id=job_target_thread_id,
                 )
         except Exception:
@@ -1920,6 +1923,7 @@ async def run_prompt_and_send(
     *,
     queued: bool = False,
     ack_sent: bool = False,
+    source_message: discord.Message | None = None,
     target_thread_id: str | None = None,
 ) -> None:
     label = "Queued ask started." if queued else "Ask started."
@@ -1938,6 +1942,33 @@ async def run_prompt_and_send(
         f"sent_live={relay.sent_live} final={relay.saw_final} aborted={relay.saw_aborted} "
         f"timeout={relay.saw_timeout} output_len={format_log_text_len(output)}"
     )
+    if is_selected_thread_busy_error(exit_code, output):
+        log_line(
+            f"ask_stream_busy_failure target={target_thread_id or '-'} "
+            f"source_message={'yes' if has_busy_choice_source(source_message) else 'no'}"
+        )
+        if has_busy_choice_source(source_message):
+            await channel.send(
+                build_busy_choice_message(prompt, target_thread_id),
+                view=BusyChoiceView(
+                    source_message,
+                    prompt,
+                    target_thread_id=target_thread_id,
+                    allow_steer=True,
+                ),
+            )
+            return
+        await send_chunks(
+            channel,
+            "\n".join(
+                [
+                    "This Codex thread is already working.",
+                    "",
+                    "Send the message again when the thread is idle, or use the mapped Discord thread so I can show steering controls.",
+                ]
+            ),
+        )
+        return
     if relay.sent_live:
         if exit_code == 0 and not relay.saw_aborted:
             await channel.send("Done.")
@@ -1948,17 +1979,43 @@ async def run_prompt_and_send(
     await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
 
 
+def is_selected_thread_busy_error(exit_code: int, output: str) -> bool:
+    if exit_code == 0:
+        return False
+    text = (output or "").lower()
+    return (
+        "selected thread is still busy" in text
+        or "target thread is still busy" in text
+        or "--force-while-busy" in text and "still busy" in text
+    )
+
+
+def has_busy_choice_source(source_message: object) -> bool:
+    return bool(
+        source_message is not None
+        and getattr(source_message, "author", None) is not None
+        and getattr(source_message, "channel", None) is not None
+    )
+
+
 async def run_prompt_flow(
     channel: discord.abc.Messageable,
     prompt: str,
     *,
     queued: bool = False,
+    source_message: discord.Message | None = None,
     target_thread_id: str | None = None,
 ) -> None:
     runner = await get_thread_runner(target_thread_id)
     queue = runner["queue"]
     if bool(runner.get("active")) or (isinstance(queue, asyncio.Queue) and queue.qsize() > 0):
-        position = await enqueue_thread_ask(channel, prompt, target_thread_id, queued=True)
+        position = await enqueue_thread_ask(
+            channel,
+            prompt,
+            target_thread_id,
+            queued=True,
+            source_message=source_message,
+        )
         warning = build_context_warning(target_thread_id)
         await channel.send(
             "\n\n".join(
@@ -1982,7 +2039,14 @@ async def run_prompt_flow(
             if part
         )
     )
-    await enqueue_thread_ask(channel, prompt, target_thread_id, queued=queued, ack_sent=True)
+    await enqueue_thread_ask(
+        channel,
+        prompt,
+        target_thread_id,
+        queued=queued,
+        ack_sent=True,
+        source_message=source_message,
+    )
 
 
 def build_busy_choice_message(prompt: str, target_thread_id: str | None) -> str:
@@ -2065,7 +2129,12 @@ async def handle_plain_ask(
         )
         return
 
-    await run_prompt_flow(message.channel, prompt, target_thread_id=target_thread_id)
+    await run_prompt_flow(
+        message.channel,
+        prompt,
+        source_message=message,
+        target_thread_id=target_thread_id,
+    )
 
 
 async def submit_interactive_reply(

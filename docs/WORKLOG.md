@@ -1,5 +1,26 @@
 # WORKLOG
 
+## 2026-06-03 11:33:55 +09:00
+- Goal: prevent raw Discord `Ask failed` busy errors when Codex becomes busy after the preflight check.
+- Key assumptions:
+  - A Discord message can pass the initial busy check but still hit Codex's `selected thread is still busy` error while the ask is dispatched.
+  - That late failure should render the same steering UI as the earlier busy preflight path whenever the original Discord message is available.
+- Changes:
+  - Carried the source Discord message through per-thread queued ask jobs.
+  - Added late busy-error classification in `run_prompt_and_send()`.
+  - Converted late busy ask failures into `BusyChoiceView` controls instead of echoing the bridge failure text.
+  - Added regression coverage for the late busy failure path.
+- Abuse cases checked:
+  - Busy controls still require the original message author through `BusyChoiceView.interaction_check()`.
+  - The fallback stores only the prompt/source message reference needed for queue ownership, not additional user secrets.
+  - Generic bridge failure output is no longer blindly echoed for this busy case, reducing accidental diagnostic leakage.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` now runs 12 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need real Discord plain-message input against a busy mapped thread after deployment for final live proof.
+
 ## 2026-06-03 11:28:39 +09:00
 - Goal: make read-only Discord status commands consistent between prefix and slash UI.
 - Key assumptions:
