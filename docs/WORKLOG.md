@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 10:53:53 +09:00
+- Goal: make Discord prefix-command response delivery auditable.
+- Key assumptions:
+  - Future live Discord checks need to distinguish bridge failures from Discord send failures.
+  - Central `run_bridge_and_send()` covers the main prefix command bridge path.
+- Changes:
+  - Added compact argv formatting for logs.
+  - Logged bridge command completion with title, exit code, chunk count, and sanitized argv.
+  - Logged successful Discord send completion for the same bridge command path.
+- Abuse cases checked:
+  - Logs do not include bridge output bodies, prompts, tokens, or session content.
+  - Arg logging is capped per argument and strips newlines to avoid log injection.
+  - The patch does not expose any new Discord command or bypass existing authorization.
+- Verification:
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, and `codex_desktop_bridge.py`.
+  - `git diff --check`
+  - Fake Discord target smoke called `run_bridge_and_send()` for `status --thread-id ...` and confirmed `bridge_command_done` plus `bridge_command_sent` logs.
+- Unresolved items:
+  - Need a real Discord prefix command after deployment to verify the same logs on live input.
+
 ## 2026-06-03 10:50:23 +09:00
 - Goal: make Discord slash sync verification visible in runtime logs.
 - Key assumptions:

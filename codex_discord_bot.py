@@ -147,6 +147,10 @@ def split_message(text: str, limit: int = DISCORD_MAX_LEN) -> list[str]:
     return chunks
 
 
+def format_log_argv(argv: list[str]) -> str:
+    return " ".join(str(part).replace("\n", " ")[:120] for part in argv)
+
+
 def run_bridge_command(argv: list[str]) -> tuple[int, str]:
     parser = bridge.build_parser()
     stdout_buffer = io.StringIO()
@@ -944,7 +948,14 @@ async def run_bridge_and_send(
 ) -> tuple[int, str]:
     exit_code, output = await asyncio.to_thread(run_bridge_command, argv)
     prefix = title if exit_code == 0 else f"{failure_title or title} failed (exit {exit_code})"
-    await send_chunks(target, f"{prefix}\n\n{output or '(no output)'}")
+    chunks = split_message(f"{prefix}\n\n{output or '(no output)'}")
+    log_line(
+        f"bridge_command_done title={title!r} exit={exit_code} "
+        f"chunks={len(chunks)} argv={format_log_argv(argv)}"
+    )
+    for chunk in chunks:
+        await target.send(chunk)
+    log_line(f"bridge_command_sent title={title!r} exit={exit_code} chunks={len(chunks)}")
     return exit_code, output
 
 
