@@ -1,5 +1,25 @@
 # WORKLOG
 
+## 2026-06-03 10:22:00 +09:00
+- Goal: reduce Discord `!new` follow-up friction by mirroring the newly created Codex thread immediately.
+- Key assumptions:
+  - `codex_desktop_bridge.py new` prints `target_thread: <thread_id>` or `selected_thread: <thread_id>` on success.
+  - A Discord `!new` user expects a usable mirrored Discord thread without manually running `!mirror sync`.
+- Changes:
+  - Added bridge-output key parsing for command results.
+  - Added single-thread mirror creation for the newly created Codex thread.
+  - Updated `!new` to append the new Discord thread mention on success, or a repair hint when mirroring fails.
+- Abuse cases checked:
+  - Failed `new` command should not create or repair mirror state: mirror update only runs on exit code `0`.
+  - Malformed bridge output should not guess a thread id: mirror update is skipped unless `target_thread` or `selected_thread` is present.
+  - Discord API/mirror failure should not hide successful Codex creation: the response includes the bridge output plus a `!mirror sync` repair hint.
+- Verification:
+  - `py -3 -m py_compile codex_discord_bot.py codex_telegram_bot.py codex_desktop_bridge.py`
+  - Function smoke for parsing `target_thread`, `selected_thread`, and missing keys.
+  - Local `build_mirror_check()` still reports `missing: 0`, `stale: 0`, `wrong_project: 0`.
+- Unresolved items:
+  - Live `!new` smoke is still needed to confirm Discord API thread creation and mention rendering after deployment.
+
 ## 2026-06-03 10:18:00 +09:00
 - Goal: apply the Discord user allowlist consistently to interactive buttons.
 - Key assumptions:
