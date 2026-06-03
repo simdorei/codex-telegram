@@ -393,6 +393,43 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.run_steering_prompt = original_run_steering_prompt
             bot.build_context_warning = original_build_context_warning
 
+    async def test_steer_now_waiting_input_failure_resends_busy_choice_view(self) -> None:
+        original_run_steering_prompt = bot.run_steering_prompt
+        original_build_context_warning = bot.build_context_warning
+        try:
+            def fake_run_steering_prompt(prompt, target_thread_id):
+                return (
+                    1,
+                    "ERROR: The selected thread is waiting on a follow-up choice or input in Codex Desktop. "
+                    "Open the thread in the app and respond there first.",
+                )
+
+            bot.run_steering_prompt = fake_run_steering_prompt
+            bot.build_context_warning = lambda target_thread_id: ""
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                message = FakeMessage()
+                view = bot.BusyChoiceView(message, "please steer", target_thread_id="thread-1")
+                button = next(item for item in view.children if getattr(item, "label", "") == "Steer now")
+                interaction = FakeInteraction()
+
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await button.callback(interaction)
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertTrue(interaction.response.deferred)
+            self.assertEqual(len(interaction.followup.messages), 1)
+            content, followup_view = interaction.followup.messages[0]
+            self.assertIn("This Codex thread is already working.", content)
+            self.assertIsInstance(followup_view, bot.BusyChoiceView)
+            self.assertEqual(followup_view.target_thread_id, "thread-1")
+            self.assertNotIn("waiting on a follow-up", content.lower())
+            self.assertIn("busy_choice_sent reason=steer_busy_failure target=thread-1", log_text)
+        finally:
+            bot.run_steering_prompt = original_run_steering_prompt
+            bot.build_context_warning = original_build_context_warning
+
     async def test_archive_list_alias_routes_to_archived_list(self) -> None:
         original_run_bridge_and_send = bot.run_bridge_and_send
         calls: list[tuple[list[str], str]] = []

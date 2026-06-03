@@ -2091,6 +2091,8 @@ def is_selected_thread_busy_error(exit_code: int, output: str) -> bool:
         "selected thread is still busy" in text
         or "target thread is still busy" in text
         or "--force-while-busy" in text and "still busy" in text
+        or "selected thread is waiting on a follow-up choice or input" in text
+        or "selected thread is waiting on an approval prompt" in text
     )
 
 

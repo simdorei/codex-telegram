@@ -1,5 +1,24 @@
 # WORKLOG
 
+## 2026-06-03 12:17:07 +09:00
+- Goal: keep Discord `Steer now` from falling back to raw failure when Codex is waiting for input.
+- Key assumptions:
+  - Live Discord logs showed the message hook and busy choice were working, but the `Steer now` click returned `steering_failed` instead of reopening the busy choice.
+  - Bridge failures for waiting-input/waiting-approval mean the target thread cannot accept steering yet and should be treated like a busy transport failure.
+- Changes:
+  - Extended Discord busy-error detection to include Codex Desktop follow-up/input and approval waiting messages.
+  - Added a regression test that verifies a waiting-input steering failure resends `BusyChoiceView` without exposing the raw bridge message.
+- Abuse cases checked:
+  - Raw bridge details for interactive waits are not exposed through the steering followup.
+  - Button ownership checks remain unchanged, so another Discord user cannot steer or queue someone else's prompt.
+  - The change does not bypass thread targeting, cwd resolution, slash authorization, or bridge execution guards.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` runs 21 tests successfully.
+  - `py_compile` via temporary pyc outputs for `codex_discord_bot.py`, `codex_telegram_bot.py`, `codex_desktop_bridge.py`, and `tests/test_codex_discord_bot.py`.
+  - `git diff --check`
+- Unresolved items:
+  - Need one more live Discord `Steer now` click after deployment to confirm the waiting-input path now resends the choice UI.
+
 ## 2026-06-03 12:12:44 +09:00
 - Goal: make live Discord slash `/new` execution auditable without logging prompt text.
 - Key assumptions:
