@@ -10,18 +10,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import io
 import json
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 import threading
 import time
 import traceback
-from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,15 +27,68 @@ import discord
 from discord import app_commands
 
 import codex_desktop_bridge as bridge
+import codex_discord_bridge_process as bridge_process
+import codex_discord_busy as discord_busy
+import codex_discord_commands as discord_commands
+import codex_discord_context as discord_context
+import codex_discord_diagnostics as discord_diagnostics
+import codex_discord_help as discord_help
+import codex_discord_interactive as discord_interactive
+import codex_discord_mirror_status as discord_mirror_status
+import codex_discord_projects as discord_projects
+import codex_discord_runner as discord_runner
+import codex_discord_runtime as discord_runtime
+import codex_discord_steering as discord_steering
+import codex_discord_store as discord_store
+import codex_discord_stream as discord_stream
+import codex_discord_thread_state as discord_thread_state
+from codex_discord_components import (
+    format_approval_custom_id,
+    format_busy_choice_custom_id,
+    format_input_choice_custom_id,
+    get_busy_choice_custom_ids_from_message,
+    get_component_children,
+    get_persistent_component_claim_key,
+    is_safe_persistent_input_value,
+    parse_approval_custom_id,
+    parse_busy_choice_custom_id,
+    parse_input_choice_custom_id,
+)
+from codex_discord_logging import (
+    get_discord_log_markers,
+    get_log_field,
+    get_log_path,
+    get_recent_discord_hook_events,
+    is_user_or_control_hook_summary,
+    log_line,
+    parse_log_line,
+    summarize_discord_hook_log_line,
+)
+from codex_discord_text import (
+    DISCORD_MAX_LEN,
+    build_ask_start_message,
+    env_flag,
+    extract_prompt_first_sentence,
+    fit_single_message,
+    format_discord_command_label,
+    format_log_argv,
+    format_log_text_len,
+    format_percent,
+    normalize_discord_name,
+    parse_bounded_float_env,
+    parse_bounded_int_arg,
+    parse_int_set,
+    split_message,
+    truncate_discord_title,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 LOG_PATH = SCRIPT_DIR / "codex_discord_bot.log"
 MIRROR_DB_PATH = SCRIPT_DIR / "discord_mirror.sqlite"
-DISCORD_MAX_LEN = 1900
-THREAD_RUNNERS_LOCK = asyncio.Lock()
-THREAD_RUNNERS: dict[str, dict[str, object]] = {}
+THREAD_RUNNERS_LOCK = discord_runner.THREAD_RUNNERS_LOCK
+THREAD_RUNNERS = discord_runner.THREAD_RUNNERS
 STEERING_HANDOFFS: dict[str, float] = {}
 ACTIVE_DISCORD_RELAY_GENERATIONS: dict[str, int] = {}
 UI_FALLBACK_LOCK = threading.Lock()
@@ -80,28 +130,8 @@ def load_local_env(path: Path) -> None:
             os.environ[key] = value
 
 
-def env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    return raw.lower() not in {"0", "false", "no", "off"}
-
-
 def discord_qa_commands_enabled() -> bool:
     return env_flag("DISCORD_ENABLE_QA_COMMANDS", default=False)
-
-
-def parse_int_set(raw: str) -> set[int]:
-    result: set[int] = set()
-    for part in str(raw or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            result.add(int(part))
-        except ValueError:
-            continue
-    return result
 
 
 def is_discord_user_allowed(user_id: int | None) -> bool:
@@ -116,33 +146,6 @@ def get_required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
-
-
-def get_log_path() -> Path:
-    value = os.environ.get("CODEX_DISCORD_LOG_PATH", "").strip()
-    if value:
-        return Path(value).expanduser()
-    return LOG_PATH
-
-
-def parse_bounded_int_arg(raw: str, *, default: int, minimum: int, maximum: int) -> int:
-    if not raw:
-        return default
-    try:
-        return max(minimum, min(maximum, int(raw)))
-    except ValueError:
-        return default
-
-
-def parse_bounded_float_env(name: str, *, default: float, minimum: float, maximum: float) -> float:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return max(minimum, min(maximum, value))
 
 
 def get_steering_delivery_confirm_timeout() -> float:
@@ -177,62 +180,6 @@ def resolve_discord_thread_target_args(
     return []
 
 
-def log_line(message: str) -> None:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}\n"
-    log_path = get_log_path()
-    try:
-        bridge.rotate_single_backup_file(
-            log_path,
-            incoming_bytes=len(line.encode("utf-8")),
-        )
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-    except Exception:
-        pass
-
-
-def split_message(text: str, limit: int = DISCORD_MAX_LEN) -> list[str]:
-    text = str(text or "").strip()
-    if not text:
-        return ["(no output)"]
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        split_at = remaining.rfind("\n", 0, limit)
-        if split_at <= 0:
-            split_at = limit
-        chunks.append(remaining[:split_at].strip())
-        remaining = remaining[split_at:].lstrip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-def fit_single_message(text: str, limit: int = DISCORD_MAX_LEN) -> str:
-    text = str(text or "").strip()
-    if len(text) <= limit:
-        return text
-    suffix = "\n\n[truncated for Discord]"
-    return text[: max(0, limit - len(suffix))].rstrip() + suffix
-
-
-def format_log_argv(argv: list[str]) -> str:
-    return " ".join(str(part).replace("\n", " ")[:120] for part in argv)
-
-
-def format_log_text_len(text: str | None) -> int:
-    return len(str(text or ""))
-
-
-def format_discord_command_label(command: str, *, limit: int = 80) -> str:
-    label = str(command or "").replace("\n", " ").replace("\r", " ").strip()
-    if len(label) <= limit:
-        return label
-    return label[: max(0, limit - 3)].rstrip() + "..."
-
-
 def format_interaction_type(interaction: discord.Interaction) -> str:
     interaction_type = getattr(interaction, "type", None)
     return str(getattr(interaction_type, "name", None) or interaction_type or "-")
@@ -261,160 +208,66 @@ def format_raw_interaction_command(data: dict[str, object]) -> str:
     return "-"
 
 
+def format_discord_user_id_for_log(user: object) -> str:
+    return str(getattr(user, "id", None) or "-")
+
+
 def run_bridge_command(argv: list[str]) -> tuple[int, str]:
-    parser = bridge.build_parser()
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
-    exit_code = 0
-    with STREAM_REDIRECT_LOCK, redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-        try:
-            args = parser.parse_args(argv)
-            result = args.func(args)
-            exit_code = int(result or 0)
-        except SystemExit as exc:
-            exit_code = exc.code if isinstance(exc.code, int) else 1
-        except Exception as exc:
-            exit_code = 1
-            print(f"ERROR: {exc}")
-    output = stdout_buffer.getvalue()
-    stderr = stderr_buffer.getvalue()
-    combined = (output + ("\n" + stderr if stderr else "")).strip()
-    return exit_code, combined
+    return bridge_process.run_bridge_command(
+        argv,
+        bridge_module=bridge,
+        stream_redirect_lock=STREAM_REDIRECT_LOCK,
+    )
 
 
 def parse_bridge_output_value(output: str, key: str) -> str | None:
-    prefix = f"{key}:"
-    for line in (output or "").splitlines():
-        if line.startswith(prefix):
-            value = line[len(prefix):].strip()
-            return value or None
-    return None
+    return bridge_process.parse_bridge_output_value(output, key)
 
 
 def resolve_selected_target() -> tuple[str | None, str]:
-    try:
-        thread = bridge.choose_thread(None, None)
-    except Exception:
-        return None, ""
-    return thread.id, bridge.get_thread_workspace_ref(thread)
+    return discord_thread_state.resolve_selected_target(bridge_module=bridge)
 
 
 def get_selected_interactive_state() -> tuple[str, str | None, str]:
-    target_thread_id, target_ref = resolve_selected_target()
-    if not target_thread_id:
-        return INTERACTIVE_STATE_NONE, None, target_ref
-    try:
-        thread = bridge.choose_thread(target_thread_id, None)
-        busy_state = bridge.get_thread_busy_state(thread, allow_resume=True)
-    except Exception:
-        return INTERACTIVE_STATE_NONE, target_thread_id, target_ref
-    if busy_state not in {INTERACTIVE_STATE_INPUT, INTERACTIVE_STATE_APPROVAL}:
-        return INTERACTIVE_STATE_NONE, target_thread_id, target_ref
-    return busy_state, target_thread_id, target_ref
+    return discord_thread_state.get_selected_interactive_state(
+        bridge_module=bridge,
+        resolve_selected_target_func=resolve_selected_target,
+        state_none=INTERACTIVE_STATE_NONE,
+        state_input=INTERACTIVE_STATE_INPUT,
+        state_approval=INTERACTIVE_STATE_APPROVAL,
+    )
 
 
 def parse_interactive_notice(text: str) -> tuple[str, str, list[tuple[str, str]]]:
-    lines = [line.rstrip() for line in (text or "").splitlines()]
-    if not lines:
-        return INTERACTIVE_STATE_NONE, "", []
-    first_line = lines[0].strip()
-    if first_line not in {INTERACTIVE_INPUT_TAG, INTERACTIVE_APPROVAL_TAG}:
-        return INTERACTIVE_STATE_NONE, "", []
+    return discord_interactive.parse_interactive_notice(
+        text,
+        state_none=INTERACTIVE_STATE_NONE,
+        state_input=INTERACTIVE_STATE_INPUT,
+        state_approval=INTERACTIVE_STATE_APPROVAL,
+        input_tag=INTERACTIVE_INPUT_TAG,
+        approval_tag=INTERACTIVE_APPROVAL_TAG,
+    )
 
-    prompt_lines: list[str] = []
-    options: list[tuple[str, str]] = []
-    for raw_line in lines[1:]:
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        match = re.match(r"^(\d+)[\.\)]\s+(.+)$", stripped)
-        if match:
-            options.append((match.group(1), match.group(2).strip()))
-            continue
-        prompt_lines.append(stripped)
 
-    state = INTERACTIVE_STATE_INPUT if first_line == INTERACTIVE_INPUT_TAG else INTERACTIVE_STATE_APPROVAL
-    return state, "\n".join(prompt_lines), options
+def normalize_interactive_text_reply(state: str, answer: str) -> str | None:
+    return discord_interactive.normalize_interactive_text_reply(
+        state,
+        answer,
+        state_input=INTERACTIVE_STATE_INPUT,
+        state_approval=INTERACTIVE_STATE_APPROVAL,
+    )
 
 
 def init_mirror_db() -> None:
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mirror_projects (
-                project_key TEXT PRIMARY KEY,
-                project_name TEXT NOT NULL,
-                discord_channel_id INTEGER NOT NULL,
-                updated_at REAL NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mirror_threads (
-                codex_thread_id TEXT PRIMARY KEY,
-                project_key TEXT NOT NULL,
-                thread_title TEXT NOT NULL,
-                discord_channel_id INTEGER NOT NULL,
-                discord_thread_id INTEGER NOT NULL,
-                updated_at REAL NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS busy_choices (
-                choice_id TEXT PRIMARY KEY,
-                owner_user_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL,
-                target_thread_id TEXT,
-                prompt TEXT NOT NULL,
-                allow_steer INTEGER NOT NULL,
-                created_at REAL NOT NULL,
-                expires_at REAL NOT NULL,
-                claimed_at REAL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS persistent_component_claims (
-                claim_key TEXT PRIMARY KEY,
-                created_at REAL NOT NULL,
-                expires_at REAL NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS discord_processed_messages (
-                message_id INTEGER PRIMARY KEY,
-                seen_at REAL NOT NULL
-            )
-            """
-        )
+    discord_store.init_mirror_db(MIRROR_DB_PATH)
 
 
 def cleanup_expired_busy_choices(now: float | None = None) -> int:
-    current = time.time() if now is None else now
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        result = conn.execute(
-            "DELETE FROM busy_choices WHERE expires_at <= ? OR claimed_at IS NOT NULL",
-            (current,),
-        )
-        return result.rowcount
+    return discord_store.cleanup_expired_busy_choices(MIRROR_DB_PATH, now=now)
 
 
 def cleanup_expired_persistent_component_claims(now: float | None = None) -> int:
-    current = time.time() if now is None else now
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        result = conn.execute(
-            "DELETE FROM persistent_component_claims WHERE expires_at <= ?",
-            (current,),
-        )
-        return result.rowcount
+    return discord_store.cleanup_expired_persistent_component_claims(MIRROR_DB_PATH, now=now)
 
 
 def create_busy_choice_record(
@@ -424,93 +277,22 @@ def create_busy_choice_record(
     *,
     allow_steer: bool,
 ) -> str:
-    cleanup_expired_busy_choices()
-    now = time.time()
-    choice_id = hashlib.sha256(
-        f"{now}:{os.urandom(16).hex()}:{getattr(message.author, 'id', '-')}".encode("utf-8")
-    ).hexdigest()[:24]
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO busy_choices (
-                choice_id, owner_user_id, channel_id, target_thread_id, prompt,
-                allow_steer, created_at, expires_at, claimed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (
-                choice_id,
-                int(getattr(message.author, "id")),
-                int(getattr(message.channel, "id")),
-                target_thread_id,
-                str(prompt or ""),
-                1 if allow_steer else 0,
-                now,
-                now + BUSY_CHOICE_TTL_SECONDS,
-            ),
-        )
-    return choice_id
+    return discord_store.create_busy_choice_record(
+        MIRROR_DB_PATH,
+        message,
+        prompt,
+        target_thread_id,
+        allow_steer=allow_steer,
+        ttl_seconds=BUSY_CHOICE_TTL_SECONDS,
+    )
 
 
 def get_busy_choice_record(choice_id: str) -> dict[str, object] | None:
-    init_mirror_db()
-    now = time.time()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        row = conn.execute(
-            """
-            SELECT owner_user_id, channel_id, target_thread_id, prompt, allow_steer, expires_at, claimed_at
-            FROM busy_choices
-            WHERE choice_id = ?
-            """,
-            (choice_id,),
-        ).fetchone()
-        if not row:
-            return None
-        if float(row[5]) <= now or row[6] is not None:
-            conn.execute("DELETE FROM busy_choices WHERE choice_id = ?", (choice_id,))
-            return None
-    return {
-        "choice_id": choice_id,
-        "owner_user_id": int(row[0]),
-        "channel_id": int(row[1]),
-        "target_thread_id": str(row[2] or "") or None,
-        "prompt": str(row[3] or ""),
-        "allow_steer": bool(row[4]),
-        "expires_at": float(row[5]),
-    }
+    return discord_store.get_busy_choice_record(MIRROR_DB_PATH, choice_id)
 
 
 def claim_busy_choice_record(choice_id: str) -> bool:
-    init_mirror_db()
-    now = time.time()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        result = conn.execute(
-            """
-            UPDATE busy_choices
-            SET claimed_at = ?
-            WHERE choice_id = ?
-              AND claimed_at IS NULL
-              AND expires_at > ?
-            """,
-            (now, choice_id, now),
-        )
-        return result.rowcount == 1
-
-
-def get_persistent_component_claim_key(interaction: discord.Interaction, custom_id: str) -> str | None:
-    parsed_approval = parse_approval_custom_id(custom_id)
-    parsed_input = parse_input_choice_custom_id(custom_id)
-    if parsed_approval:
-        kind = APPROVAL_CUSTOM_ID_PREFIX
-    elif parsed_input:
-        kind = INPUT_CHOICE_CUSTOM_ID_PREFIX
-    else:
-        return None
-    message_id = getattr(getattr(interaction, "message", None), "id", None)
-    if message_id is None:
-        return None
-    raw_key = f"{kind}:{int(message_id)}"
-    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    return discord_store.claim_busy_choice_record(MIRROR_DB_PATH, choice_id)
 
 
 def claim_persistent_component_interaction(
@@ -519,59 +301,12 @@ def claim_persistent_component_interaction(
     *,
     ttl_seconds: float = 86400.0,
 ) -> bool:
-    claim_key = get_persistent_component_claim_key(interaction, custom_id)
-    if claim_key is None:
-        return True
-    init_mirror_db()
-    now = time.time()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        conn.execute("DELETE FROM persistent_component_claims WHERE expires_at <= ?", (now,))
-        result = conn.execute(
-            """
-            INSERT OR IGNORE INTO persistent_component_claims (claim_key, created_at, expires_at)
-            VALUES (?, ?, ?)
-            """,
-            (claim_key, now, now + ttl_seconds),
-        )
-        return result.rowcount == 1
-
-
-def parse_busy_choice_custom_id(custom_id: str) -> tuple[str, str] | None:
-    parts = str(custom_id or "").split(":")
-    if len(parts) != 3 or parts[0] != BUSY_CHOICE_CUSTOM_ID_PREFIX:
-        return None
-    choice_id, action = parts[1], parts[2]
-    if not re.fullmatch(r"[0-9a-f]{24}", choice_id):
-        return None
-    if action not in {"steer", "queue", "ignore"}:
-        return None
-    return choice_id, action
-
-
-def format_busy_choice_custom_id(choice_id: str, action: str) -> str:
-    return f"{BUSY_CHOICE_CUSTOM_ID_PREFIX}:{choice_id}:{action}"
-
-
-def get_component_children(component: object) -> list[object]:
-    children = getattr(component, "children", None)
-    if children is None:
-        children = getattr(component, "components", None)
-    if children is None:
-        return []
-    try:
-        return list(children)
-    except TypeError:
-        return []
-
-
-def get_busy_choice_custom_ids_from_message(message: object) -> list[str]:
-    custom_ids: list[str] = []
-    for row in getattr(message, "components", None) or []:
-        for child in get_component_children(row):
-            custom_id = getattr(child, "custom_id", None)
-            if parse_busy_choice_custom_id(str(custom_id or "")):
-                custom_ids.append(str(custom_id))
-    return custom_ids
+    return discord_store.claim_persistent_component_interaction(
+        MIRROR_DB_PATH,
+        interaction,
+        custom_id,
+        ttl_seconds=ttl_seconds,
+    )
 
 
 def has_active_busy_choice_custom_id(custom_id: str) -> bool:
@@ -601,89 +336,18 @@ async def clear_stale_busy_choice_message_components(message: object) -> bool:
         return False
 
 
-def format_approval_custom_id(target_thread_id: str, answer: str) -> str:
-    return f"{APPROVAL_CUSTOM_ID_PREFIX}:{target_thread_id}:{answer}"
-
-
-def parse_approval_custom_id(custom_id: str) -> tuple[str, str] | None:
-    parts = str(custom_id or "").split(":", 2)
-    if len(parts) != 3 or parts[0] != APPROVAL_CUSTOM_ID_PREFIX:
-        return None
-    target_thread_id = parts[1].strip()
-    answer = parts[2].strip()
-    if not target_thread_id or answer not in {"1", "2", "3", "cancel"}:
-        return None
-    return target_thread_id, answer
-
-
-def is_safe_persistent_input_value(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,20}", str(value or "")))
-
-
-def format_input_choice_custom_id(target_thread_id: str, value: str) -> str | None:
-    normalized_value = str(value or "").strip()
-    if not is_safe_persistent_input_value(normalized_value):
-        return None
-    custom_id = f"{INPUT_CHOICE_CUSTOM_ID_PREFIX}:{target_thread_id}:{normalized_value}"
-    if len(custom_id) > 100:
-        return None
-    return custom_id
-
-
-def parse_input_choice_custom_id(custom_id: str) -> tuple[str, str] | None:
-    parts = str(custom_id or "").split(":", 2)
-    if len(parts) != 3 or parts[0] != INPUT_CHOICE_CUSTOM_ID_PREFIX:
-        return None
-    target_thread_id = parts[1].strip()
-    value = parts[2].strip()
-    if not target_thread_id or not is_safe_persistent_input_value(value):
-        return None
-    return target_thread_id, value
-
-
 def get_startup_probe_targets(
     allowed_channel_ids: set[int],
     startup_channel_id: int | None,
     *,
     limit: int = 30,
 ) -> list[tuple[str, int]]:
-    seen: set[int] = set()
-    targets: list[tuple[str, int]] = []
-
-    def add(label: str, channel_id: int | None) -> None:
-        if not channel_id:
-            return
-        normalized = int(channel_id)
-        if normalized in seen or len(targets) >= limit:
-            return
-        seen.add(normalized)
-        targets.append((label, normalized))
-
-    add("startup", startup_channel_id)
-    for channel_id in sorted(allowed_channel_ids):
-        add("allowed", channel_id)
-
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        for row in conn.execute(
-            """
-            SELECT discord_channel_id FROM mirror_projects
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall():
-            add("mirror_project", int(row[0]))
-        for row in conn.execute(
-            """
-            SELECT discord_thread_id FROM mirror_threads
-            ORDER BY updated_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall():
-            add("mirror_thread", int(row[0]))
-    return targets
+    return discord_store.get_startup_probe_targets(
+        MIRROR_DB_PATH,
+        allowed_channel_ids,
+        startup_channel_id,
+        limit=limit,
+    )
 
 
 async def cleanup_stale_busy_choice_components_in_channel(
@@ -703,272 +367,102 @@ async def cleanup_stale_busy_choice_components_in_channel(
     return cleared
 
 
-def normalize_discord_name(value: str, *, prefix: str = "", max_len: int = 90) -> str:
-    text = (value or "").strip().lower()
-    text = re.sub(r"[^0-9a-z가-힣_-]+", "-", text)
-    text = re.sub(r"-{2,}", "-", text).strip("-_")
-    if not text:
-        text = "untitled"
-    if prefix and not text.startswith(prefix):
-        text = prefix + text
-    return text[:max_len].strip("-_") or "untitled"
-
-
-def truncate_discord_title(value: str, fallback: str, *, max_len: int = 90) -> str:
-    text = " ".join((value or "").split()) or fallback
-    return text[:max_len].strip() or fallback
-
-
 def get_project_key(thread: bridge.ThreadInfo) -> str:
-    cwd = bridge.strip_windows_extended_prefix((thread.cwd or "").strip())
-    if cwd:
-        if is_codex_projectless_chat_cwd(cwd):
-            return CODEX_PROJECTLESS_CHAT_KEY
-        try:
-            return bridge.normalize_workspace_path(cwd)
-        except Exception:
-            return cwd.lower()
-    return f"projectless:{bridge.get_thread_workspace_name(thread)}"
+    return discord_projects.get_project_key(
+        thread,
+        bridge_module=bridge,
+        projectless_chat_key=CODEX_PROJECTLESS_CHAT_KEY,
+    )
 
 
 def get_project_name(thread: bridge.ThreadInfo) -> str:
-    cwd = bridge.strip_windows_extended_prefix((thread.cwd or "").strip())
-    if cwd and is_codex_projectless_chat_cwd(cwd):
-        return "채팅"
-    name = bridge.get_thread_workspace_name(thread)
-    return name if name and name != "-" else "projectless"
+    return discord_projects.get_project_name(thread, bridge_module=bridge)
 
 
 def get_saved_workspace_project_keys() -> set[str]:
-    data = bridge.load_json(bridge.GLOBAL_STATE_PATH)
-    saved: set[str] = set()
-    for key in ("project-order", "electron-saved-workspace-roots"):
-        roots = data.get(key) or []
-        if not isinstance(roots, list):
-            continue
-        for root in roots:
-            value = str(root or "").strip()
-            if value:
-                saved.add(bridge.normalize_workspace_path(value))
-    return saved
+    return discord_projects.get_saved_workspace_project_keys(bridge_module=bridge)
 
 
 def is_thread_mirrorable(
     thread: bridge.ThreadInfo,
     saved_project_keys: set[str] | None = None,
 ) -> bool:
-    project_key = get_project_key(thread)
-    if project_key == CODEX_PROJECTLESS_CHAT_KEY or project_key.startswith("projectless:"):
-        return True
-    saved_keys = saved_project_keys if saved_project_keys is not None else get_saved_workspace_project_keys()
-    if not saved_keys:
-        return True
-    return project_key in saved_keys
+    return discord_projects.is_thread_mirrorable(
+        thread,
+        saved_project_keys,
+        bridge_module=bridge,
+        projectless_chat_key=CODEX_PROJECTLESS_CHAT_KEY,
+    )
 
 
 def filter_mirrorable_threads(threads: list[bridge.ThreadInfo]) -> list[bridge.ThreadInfo]:
-    saved_project_keys = get_saved_workspace_project_keys()
-    return [thread for thread in threads if is_thread_mirrorable(thread, saved_project_keys)]
+    return discord_projects.filter_mirrorable_threads(
+        threads,
+        bridge_module=bridge,
+        projectless_chat_key=CODEX_PROJECTLESS_CHAT_KEY,
+    )
 
 
 def is_codex_projectless_chat_cwd(cwd: str) -> bool:
-    normalized = bridge.normalize_workspace_path(cwd)
-    parts = re.split(r"[\\/]+", normalized)
-    if len(parts) < 4:
-        return False
-    return (
-        len(parts) >= 5
-        and parts[-1].lower().startswith("new-chat")
-        and re.match(r"^\d{4}-\d{2}-\d{2}$", parts[-2] or "") is not None
-        and parts[-3].lower() == "codex"
-        and parts[-4].lower() == "documents"
-    )
+    return discord_projects.is_codex_projectless_chat_cwd(cwd, bridge_module=bridge)
 
 
 def get_mirrored_codex_thread_id(discord_channel_id: int | None) -> str | None:
-    if not discord_channel_id:
-        return None
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT codex_thread_id FROM mirror_threads WHERE discord_thread_id = ?",
-            (int(discord_channel_id),),
-        ).fetchone()
-        if row:
-            return str(row[0])
-        rows = conn.execute(
-            """
-            SELECT codex_thread_id
-            FROM mirror_threads
-            WHERE discord_channel_id = ?
-            ORDER BY updated_at DESC
-            LIMIT 2
-            """,
-            (int(discord_channel_id),),
-        ).fetchall()
-    if len(rows) == 1:
-        return str(rows[0][0])
-    return None
+    return discord_store.get_mirrored_codex_thread_id(MIRROR_DB_PATH, discord_channel_id)
 
 
 def describe_mirrored_project_channel(discord_channel_id: int | None) -> str:
-    if not discord_channel_id:
-        return ""
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        project = conn.execute(
-            "SELECT project_name FROM mirror_projects WHERE discord_channel_id = ?",
-            (int(discord_channel_id),),
-        ).fetchone()
-        if not project:
-            return ""
-        rows = conn.execute(
-            """
-            SELECT thread_title
-            FROM mirror_threads
-            WHERE discord_channel_id = ?
-            ORDER BY updated_at DESC
-            LIMIT 10
-            """,
-            (int(discord_channel_id),),
-        ).fetchall()
-    titles = [str(row[0] or "").strip() for row in rows if str(row[0] or "").strip()]
-    if len(titles) <= 1:
-        return ""
-    return "\n".join(
-        [
-            f"`{project[0]}` project channel has multiple Codex threads.",
-            "Send the message inside one of its Discord threads:",
-            *[f"- {title}" for title in titles],
-        ]
-    )
+    return discord_store.describe_mirrored_project_channel(MIRROR_DB_PATH, discord_channel_id)
 
 
 def get_mirror_project_for_channel(discord_channel_id: int | None) -> tuple[str, str] | None:
-    if not discord_channel_id:
-        return None
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT project_key, project_name FROM mirror_projects WHERE discord_channel_id = ?",
-            (int(discord_channel_id),),
-        ).fetchone()
-    if not row:
-        return None
-    return str(row[0] or ""), str(row[1] or "")
+    return discord_store.get_mirror_project_for_channel(MIRROR_DB_PATH, discord_channel_id)
 
 
 def get_thread_cwd(thread_id: str | None) -> str | None:
-    if not thread_id:
-        return None
-    try:
-        thread = bridge.choose_thread(thread_id, None)
-    except Exception:
-        return None
-    cwd = bridge.strip_windows_extended_prefix((thread.cwd or "").strip())
-    return cwd or None
+    return discord_projects.get_thread_cwd(thread_id, bridge_module=bridge)
 
 
 def find_projectless_new_chat_cwd() -> str | None:
-    codex_docs = Path.home() / "Documents" / "Codex"
-    if not codex_docs.exists():
-        return None
-    today_new_chat = codex_docs / datetime.now().strftime("%Y-%m-%d") / "new-chat"
-    if today_new_chat.is_dir():
-        return str(today_new_chat)
-    candidates = [path for path in codex_docs.glob("????-??-??/new-chat") if path.is_dir()]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return str(candidates[0])
+    return discord_projects.find_projectless_new_chat_cwd()
 
 
 def resolve_discord_new_thread_cwd(discord_channel_id: int | None) -> str | None:
-    target_thread_id = get_mirrored_codex_thread_id(discord_channel_id)
-    thread_cwd = get_thread_cwd(target_thread_id)
-    if thread_cwd:
-        return thread_cwd
-
-    project = get_mirror_project_for_channel(discord_channel_id)
-    if not project:
-        return None
-    project_key, _project_name = project
-    if project_key == CODEX_PROJECTLESS_CHAT_KEY:
-        return find_projectless_new_chat_cwd()
-    if project_key and not project_key.startswith("projectless:"):
-        project_path = Path(bridge.strip_windows_extended_prefix(project_key))
-        if project_path.is_dir():
-            return str(project_path)
-    return None
+    return discord_projects.resolve_discord_new_thread_cwd(
+        discord_channel_id,
+        bridge_module=bridge,
+        projectless_chat_key=CODEX_PROJECTLESS_CHAT_KEY,
+        get_mirrored_codex_thread_id_func=get_mirrored_codex_thread_id,
+        get_thread_cwd_func=get_thread_cwd,
+        get_mirror_project_for_channel_func=get_mirror_project_for_channel,
+        find_projectless_new_chat_cwd_func=find_projectless_new_chat_cwd,
+    )
 
 
 def project_keys_match(left: str | None, right: str | None) -> bool:
-    left_value = str(left or "").strip()
-    right_value = str(right or "").strip()
-    if not left_value or not right_value:
-        return False
-    if left_value == right_value:
-        return True
-    if left_value.startswith("projectless:") or right_value.startswith("projectless:"):
-        return False
-    if left_value == CODEX_PROJECTLESS_CHAT_KEY or right_value == CODEX_PROJECTLESS_CHAT_KEY:
-        return False
-    try:
-        return bridge.normalize_workspace_path(left_value) == bridge.normalize_workspace_path(right_value)
-    except Exception:
-        return left_value.lower() == right_value.lower()
+    return discord_projects.project_keys_match(
+        left,
+        right,
+        bridge_module=bridge,
+        projectless_chat_key=CODEX_PROJECTLESS_CHAT_KEY,
+    )
 
 
 def resolve_discord_new_thread_project_channel_id(
     discord_channel_id: int | None,
     project_key: str | None,
 ) -> int | None:
-    if not discord_channel_id or not project_key:
-        return None
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        thread_rows = conn.execute(
-            """
-            SELECT discord_channel_id, project_key
-            FROM mirror_threads
-            WHERE discord_thread_id = ?
-            ORDER BY updated_at DESC
-            """,
-            (int(discord_channel_id),),
-        ).fetchall()
-        for row in thread_rows:
-            if project_keys_match(str(row[1] or ""), project_key):
-                return int(row[0])
-        project_rows = conn.execute(
-            """
-            SELECT discord_channel_id, project_key
-            FROM mirror_projects
-            WHERE discord_channel_id = ?
-            ORDER BY updated_at DESC
-            """,
-            (int(discord_channel_id),),
-        ).fetchall()
-    for row in project_rows:
-        if project_keys_match(str(row[1] or ""), project_key):
-            return int(row[0])
-    return None
+    return discord_projects.resolve_discord_new_thread_project_channel_id(
+        discord_channel_id,
+        project_key,
+        db_path=MIRROR_DB_PATH,
+        init_mirror_db_func=init_mirror_db,
+        project_keys_match_func=project_keys_match,
+    )
 
 
 def is_mirrored_channel_id(discord_channel_id: int | None) -> bool:
-    if not discord_channel_id:
-        return False
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        row = conn.execute(
-            """
-            SELECT 1 FROM mirror_projects WHERE discord_channel_id = ?
-            UNION
-            SELECT 1 FROM mirror_threads WHERE discord_thread_id = ? OR discord_channel_id = ?
-            LIMIT 1
-            """,
-            (int(discord_channel_id), int(discord_channel_id), int(discord_channel_id)),
-        ).fetchone()
-    return bool(row)
+    return discord_store.is_mirrored_channel_id(MIRROR_DB_PATH, discord_channel_id)
 
 
 def get_discord_message_id(message: object) -> int | None:
@@ -982,28 +476,16 @@ def get_discord_message_id(message: object) -> int | None:
 
 
 def cleanup_processed_discord_messages(now: float | None = None) -> int:
-    current = time.time() if now is None else now
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        result = conn.execute(
-            "DELETE FROM discord_processed_messages WHERE seen_at < ?",
-            (current - PROCESSED_MESSAGE_RETENTION_SECONDS,),
-        )
-        return result.rowcount
+    return discord_store.cleanup_processed_discord_messages(
+        MIRROR_DB_PATH,
+        retention_seconds=PROCESSED_MESSAGE_RETENTION_SECONDS,
+        now=now,
+    )
 
 
 def claim_persistent_discord_message_id(message_id: int, now: float | None = None) -> bool:
-    current = time.time() if now is None else now
     try:
-        init_mirror_db()
-        with sqlite3.connect(MIRROR_DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO discord_processed_messages (message_id, seen_at) VALUES (?, ?)",
-                (int(message_id), current),
-            )
-        return True
-    except sqlite3.IntegrityError:
-        return False
+        return discord_store.claim_persistent_discord_message_id(MIRROR_DB_PATH, message_id, now=now)
     except Exception as exc:
         log_line(f"processed_message_persist_failed message={message_id} error_type={type(exc).__name__}")
         return True
@@ -1047,64 +529,25 @@ def is_history_bootstrap_user_message(owner: object, message: object) -> bool:
     return created_at >= cutoff
 
 
-class LineStream(io.TextIOBase):
-    def __init__(self, on_line):
-        self.on_line = on_line
-        self._buffer = ""
-        self._all: list[str] = []
-
-    def write(self, s: str) -> int:
-        if not s:
-            return 0
-        self._all.append(s)
-        self._buffer += s
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            self.on_line(line.rstrip("\r"))
-        return len(s)
-
-    def flush(self) -> None:
-        if self._buffer:
-            self.on_line(self._buffer.rstrip("\r"))
-            self._buffer = ""
-
-    def getvalue(self) -> str:
-        return "".join(self._all)
+LineStream = bridge_process.LineStream
 
 
 def get_bridge_script_path() -> Path:
-    return SCRIPT_DIR / "codex_desktop_bridge.py"
+    return bridge_process.get_bridge_script_path(SCRIPT_DIR)
+
+
+def build_bridge_subprocess_env() -> dict[str, str]:
+    return bridge_process.build_bridge_subprocess_env()
 
 
 def run_bridge_command_stream(argv: list[str], on_line) -> tuple[int, str]:
-    output_parts: list[str] = []
-    command = [sys.executable, str(get_bridge_script_path()), *argv]
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(SCRIPT_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        try:
-            if process.stdout is not None:
-                for raw_line in process.stdout:
-                    output_parts.append(raw_line)
-                    on_line(raw_line.rstrip("\r\n"))
-        finally:
-            if process.stdout is not None:
-                process.stdout.close()
-        exit_code = process.wait()
-        return int(exit_code or 0), "".join(output_parts).strip()
-    except Exception as exc:
-        output = f"ERROR: {exc}"
-        on_line(output)
-        return 1, output
+    return bridge_process.run_bridge_command_stream(
+        argv,
+        on_line,
+        script_path=get_bridge_script_path(),
+        cwd=SCRIPT_DIR,
+        env=build_bridge_subprocess_env(),
+    )
 
 
 def run_ask(
@@ -1209,19 +652,7 @@ def submit_input_reply(target_thread_id: str, answer: str) -> tuple[int, str]:
         return 1, f"ERROR: {exc}"
 
 
-@dataclass
-class SteeringPromptResult:
-    exit_code: int
-    output: str
-    target_thread_id: str | None = None
-    target_ref: str = ""
-    session_path: str | None = None
-    start_offset: int | None = None
-    delivery_pending: bool = False
-
-    def __iter__(self):
-        yield self.exit_code
-        yield self.output
+SteeringPromptResult = discord_steering.SteeringPromptResult
 
 
 def make_steering_prompt_result(
@@ -1233,131 +664,38 @@ def make_steering_prompt_result(
     recent_offsets: dict[str, tuple[bridge.ThreadInfo, Path, int]],
     delivery_pending: bool = False,
 ) -> SteeringPromptResult:
-    if target_thread is None:
-        return SteeringPromptResult(
-            exit_code,
-            output,
-            target_ref=target_ref,
-            delivery_pending=delivery_pending,
-        )
-    _thread, session_path, start_offset = recent_offsets.get(
-        target_thread.id,
-        (target_thread, Path(target_thread.rollout_path), 0),
-    )
-    return SteeringPromptResult(
+    return discord_steering.make_steering_prompt_result(
         exit_code,
         output,
-        target_thread_id=target_thread.id,
+        target_thread=target_thread,
         target_ref=target_ref,
-        session_path=str(session_path),
-        start_offset=start_offset,
+        recent_offsets=recent_offsets,
         delivery_pending=delivery_pending,
     )
 
 
 def is_ipc_delivery_confirmation_timeout(output: str) -> bool:
-    text = (output or "").lower()
-    return (
-        "prompt delivery could not be confirmed in any recent codex thread after ipc delivery"
-        in text
-        and "transport reported success" in text
-    )
+    return discord_steering.is_ipc_delivery_confirmation_timeout(output)
 
 
 def format_pending_ipc_delivery_output(output: str) -> str:
-    metadata_lines = [
-        line
-        for line in (output or "").splitlines()
-        if line.strip()
-        and not line.lstrip().upper().startswith("ERROR:")
-        and "Prompt delivery could not be confirmed" not in line
-        and "transport reported success" not in line
-    ]
-    return "\n".join(
-        part
-        for part in [
-            "[delivery_pending] Codex IPC accepted the steering request, but local session recording is delayed.",
-            "Discord will keep watching this thread for the next Codex reply.",
-            "\n".join(metadata_lines),
-        ]
-        if part
-    )
+    return discord_steering.format_pending_ipc_delivery_output(output)
 
 
 def run_steering_prompt(prompt: str, target_thread_id: str | None) -> SteeringPromptResult:
-    target_thread_id, _target_ref = resolve_target_ref(target_thread_id)
-    target_thread = bridge.choose_thread(target_thread_id, None) if target_thread_id else None
-    target_ref = bridge.get_thread_workspace_ref(target_thread) if target_thread else (_target_ref or "-")
-    recent_offsets = bridge.snapshot_recent_session_offsets(
-        limit=10,
-        include_threads=[target_thread] if target_thread else None,
-    )
-    exit_code, output = run_ask(
+    return discord_steering.run_steering_prompt(
         prompt,
-        force_while_busy=True,
-        wait=False,
-        target_thread_id=target_thread_id,
+        target_thread_id,
+        bridge_module=bridge,
+        resolve_target_ref_func=resolve_target_ref,
+        run_ask_func=run_ask,
+        get_steering_delivery_confirm_timeout_func=get_steering_delivery_confirm_timeout,
+        log_func=log_line,
+        format_log_text_len_func=format_log_text_len,
     )
-    if exit_code == 0:
-        return make_steering_prompt_result(
-            exit_code,
-            output,
-            target_thread=target_thread,
-            target_ref=target_ref,
-            recent_offsets=recent_offsets,
-        )
-
-    if is_ipc_delivery_confirmation_timeout(output) and target_thread is not None:
-        log_line(
-            f"steering_ipc_delivery_pending exit={exit_code} target={target_thread_id or '-'} "
-            "confirm_timeout=0.0 "
-            f"output_len={format_log_text_len(output)}"
-        )
-        return make_steering_prompt_result(
-            0,
-            format_pending_ipc_delivery_output(output),
-            target_thread=target_thread,
-            target_ref=target_ref,
-            recent_offsets=recent_offsets,
-            delivery_pending=True,
-        )
-
-    delivered_thread = bridge.wait_for_prompt_delivery(
-        recent_offsets,
-        prompt,
-        timeout_sec=get_steering_delivery_confirm_timeout(),
-    )
-    if delivered_thread is not None and (
-        target_thread_id is None or delivered_thread.id == target_thread_id
-    ):
-        log_line(
-            f"steering_nonzero_but_delivered exit={exit_code} target={target_thread_id or '-'} "
-            f"delivered={delivered_thread.id}"
-        )
-        return make_steering_prompt_result(
-            0,
-            "\n\n".join(
-                part
-                for part in [
-                    f"[delivery_verified] {bridge.get_thread_label(delivered_thread)}",
-                    "Original transport returned a nonzero exit, but the steering prompt was recorded in Codex.",
-                    output,
-                ]
-                if part
-            ),
-            target_thread=delivered_thread,
-            target_ref=bridge.get_thread_workspace_ref(delivered_thread),
-            recent_offsets=recent_offsets,
-        )
-
-    log_line(
-        f"steering_failed exit={exit_code} target={target_thread_id or '-'} "
-        f"output_len={format_log_text_len(output)}"
-    )
-    return SteeringPromptResult(exit_code, output, target_thread_id=target_thread_id, target_ref=target_ref)
 
 
-class DiscordAskRelay:
+class DiscordAskRelay(discord_stream.DiscordAskRelay):
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
@@ -1368,186 +706,23 @@ class DiscordAskRelay:
         suppress_after_steering_since: float | None = None,
         send_timeout_blocks: bool = True,
     ) -> None:
-        self.loop = loop
-        self.channel = channel
-        self.target_thread_id = target_thread_id
-        self.target_ref = target_ref
-        self.quiet_notice_delay_sec = quiet_notice_delay_sec
-        self.suppress_after_steering_since = suppress_after_steering_since
-        self.send_timeout_blocks = send_timeout_blocks
-        self.relay_generation = register_discord_relay(target_thread_id)
-        self.mode: str | None = None
-        self.block_lines: list[str] = []
-        self.sent_live = False
-        self.quiet_notice_sent = False
-        self.suppressed_after_steering = False
-        self.saw_final = False
-        self.saw_aborted = False
-        self.saw_timeout = False
-        self._send_futures = []
-        self._quiet_notice_future = None
-
-    def _send(self, text: str) -> None:
-        self._cancel_quiet_notice()
-        future = asyncio.run_coroutine_threadsafe(send_chunks(self.channel, text), self.loop)
-        self._send_futures.append(future)
-
-    async def _send_quiet_notice_after_delay(self) -> None:
-        await asyncio.sleep(max(0.0, self.quiet_notice_delay_sec))
-        if (
-            self.sent_live
-            or self.quiet_notice_sent
-            or self.saw_final
-            or self.saw_aborted
-            or self.saw_timeout
-        ):
-            return
-        await send_chunks(
-            self.channel,
-            "\n".join(
-                [
-                    "Codex is still working.",
-                    "",
-                    "High-context threads can stay quiet while Codex compacts context before the next visible reply.",
-                ]
-            ),
+        super().__init__(
+            loop,
+            channel,
+            target_thread_id,
+            target_ref,
+            quiet_notice_delay_sec=quiet_notice_delay_sec,
+            suppress_after_steering_since=suppress_after_steering_since,
+            send_timeout_blocks=send_timeout_blocks,
+            send_chunks_func=send_chunks,
+            parse_interactive_notice_func=parse_interactive_notice,
+            send_interactive_prompt_func=send_interactive_prompt,
+            register_discord_relay_func=register_discord_relay,
+            is_discord_relay_stale_func=is_discord_relay_stale,
+            had_steering_handoff_since_func=had_steering_handoff_since,
+            log_func=log_line,
+            format_log_text_len_func=format_log_text_len,
         )
-        self.quiet_notice_sent = True
-
-    def _schedule_quiet_notice(self) -> None:
-        if self.quiet_notice_delay_sec < 0:
-            return
-        current = self._quiet_notice_future
-        if current is not None and not current.done():
-            return
-        self._quiet_notice_future = asyncio.run_coroutine_threadsafe(
-            self._send_quiet_notice_after_delay(),
-            self.loop,
-        )
-
-    def _cancel_quiet_notice(self) -> None:
-        future = self._quiet_notice_future
-        if future is not None and not future.done():
-            future.cancel()
-
-    def _should_suppress_for_steering(self) -> bool:
-        if is_discord_relay_stale(self.target_thread_id, self.relay_generation):
-            return True
-        if self.suppress_after_steering_since is None:
-            return False
-        if self.mode not in {"commentary", "final"}:
-            return False
-        return had_steering_handoff_since(
-            self.target_thread_id,
-            self.suppress_after_steering_since,
-        )
-
-    def _send_interactive_notice_if_detected(self, text: str) -> bool:
-        state, prompt, options = parse_interactive_notice(text)
-        if not state or not self.target_thread_id:
-            return False
-        future = asyncio.run_coroutine_threadsafe(
-            send_interactive_prompt(
-                self.channel,
-                self.target_thread_id,
-                self.target_ref,
-                state,
-                prompt,
-                options,
-            ),
-            self.loop,
-        )
-        self._send_futures.append(future)
-        self.sent_live = True
-        return True
-
-    def _send_block(self) -> None:
-        text = "\n".join(self.block_lines).strip()
-        if not text:
-            self.block_lines = []
-            return
-        if self._should_suppress_for_steering():
-            self.suppressed_after_steering = True
-            log_line(
-                f"discord_relay_suppressed_after_steering target={self.target_thread_id or '-'} "
-                f"mode={self.mode or '-'} text_len={format_log_text_len(text)}"
-            )
-            self.block_lines = []
-            return
-        if self.mode == "commentary":
-            if not self._send_interactive_notice_if_detected(text):
-                self._send(f"In progress\n\n{text}")
-                self.sent_live = True
-        elif self.mode == "final":
-            if not self._send_interactive_notice_if_detected(text):
-                self._send(text)
-                self.sent_live = True
-                self.saw_final = True
-        elif self.mode == "timeout":
-            self.saw_timeout = True
-            if self.send_timeout_blocks:
-                self._send(f"Timed out\n\n{text}")
-                self.sent_live = True
-        self.block_lines = []
-
-    def feed_line(self, line: str) -> None:
-        if line.startswith("[commentary]"):
-            self._send_block()
-            self.mode = "commentary"
-            return
-        if line.startswith("[final_answer]"):
-            self._send_block()
-            self.mode = "final"
-            return
-        if line.startswith("[timeout]"):
-            self._send_block()
-            self.mode = "timeout"
-            self.saw_timeout = True
-            return
-        if line.startswith("[aborted]"):
-            self._send_block()
-            self.mode = None
-            self.saw_aborted = True
-            self._send("Aborted.")
-            self.sent_live = True
-            return
-        if line.startswith("[ready]"):
-            self._send_block()
-            self.mode = None
-            return
-        if line.startswith("[waiting_for_final_answer]") or line.startswith("Use Ctrl+C"):
-            if line.startswith("[waiting_for_final_answer]"):
-                self._schedule_quiet_notice()
-            return
-
-        if self.mode in {"commentary", "final", "timeout"}:
-            self.block_lines.append(line)
-            return
-
-        if line.startswith("target_thread:") or line.startswith("title:") or line.startswith("ui_name:") or line.startswith("cwd:"):
-            return
-        if line.startswith("ui_activation:") or line.startswith("sent_to_window:") or line.startswith("[delivery_verified]"):
-            return
-        if line.startswith("[background_watch_started]") or line.startswith("[background_watch_already_running]"):
-            return
-        if line.startswith("[wait_cancelled]"):
-            return
-
-    def finish(self) -> None:
-        self._cancel_quiet_notice()
-        self._send_block()
-        quiet_future = self._quiet_notice_future
-        if quiet_future is not None and quiet_future.done():
-            if not quiet_future.cancelled():
-                try:
-                    quiet_future.result(timeout=0)
-                except Exception:
-                    log_line("discord_relay_quiet_notice_failed\n" + traceback.format_exc())
-        for future in self._send_futures:
-            try:
-                future.result(timeout=30)
-            except Exception:
-                log_line("discord_relay_send_failed\n" + traceback.format_exc())
 
 
 def run_ask_stream(
@@ -1558,41 +733,17 @@ def run_ask_stream(
     wait: bool = True,
     target_thread_id: str | None = None,
 ) -> tuple[int, str]:
-    argv = [
-        "ask",
-        "--ipc",
-        "--ipc-recover-ui",
-        "--foreground",
-        "--stream",
-        "--include-commentary",
-        "--timeout",
-        "0",
-    ]
-    if target_thread_id:
-        argv.extend(["--thread-id", target_thread_id])
-    if force_while_busy:
-        argv.append("--force-while-busy")
-    if not wait:
-        argv.append("--no-wait")
-    argv.append(prompt)
-    exit_code, output = run_bridge_command_stream(argv, relay.feed_line)
-    if should_retry_ask_with_ui(exit_code, output):
-        relay.feed_line("[commentary]")
-        relay.feed_line("IPC attach failed for this Codex thread. Retrying through the Codex UI.")
-        relay.feed_line("[ready]")
-        ui_argv = build_ui_ask_argv(
-            prompt,
-            target_thread_id=target_thread_id,
-            force_while_busy=True,
-            wait=wait,
-        )
-        if "--stream" not in ui_argv:
-            ui_argv.insert(ui_argv.index("--timeout"), "--include-commentary")
-            ui_argv.insert(ui_argv.index("--include-commentary"), "--stream")
-        with UI_FALLBACK_LOCK:
-            exit_code, output = run_bridge_command_stream(ui_argv, relay.feed_line)
-    relay.finish()
-    return exit_code, output
+    return discord_stream.run_ask_stream(
+        prompt,
+        relay,
+        force_while_busy=force_while_busy,
+        wait=wait,
+        target_thread_id=target_thread_id,
+        run_bridge_command_stream_func=run_bridge_command_stream,
+        should_retry_ask_with_ui_func=should_retry_ask_with_ui,
+        build_ui_ask_argv_func=build_ui_ask_argv,
+        ui_fallback_lock=UI_FALLBACK_LOCK,
+    )
 
 
 def run_steering_watch_stream(
@@ -1601,51 +752,12 @@ def run_steering_watch_stream(
     *,
     timeout_sec: float = 0,
 ) -> tuple[int, str]:
-    if not steering_result.session_path or steering_result.start_offset is None:
-        relay.finish()
-        return 0, ""
-
-    relay.feed_line("[waiting_for_final_answer]")
-    relay.feed_line("Use Ctrl+C to stop waiting after the prompt is sent.")
-    output_lines = [
-        "[waiting_for_final_answer]",
-        "Use Ctrl+C to stop waiting after the prompt is sent.",
-    ]
-    try:
-        result = bridge.watch_for_final_answer(
-            session_path=Path(steering_result.session_path),
-            start_offset=steering_result.start_offset,
-            timeout_sec=timeout_sec,
-            include_commentary=True,
-            stream_live=False,
-        )
-
-        if result["final_answer"]:
-            final_lines = str(result["final_answer"]).splitlines()
-            for line in ["[final_answer]", *final_lines, "", "[ready]"]:
-                relay.feed_line(line)
-                output_lines.append(line)
-            relay.finish()
-            return 0, "\n".join(output_lines).strip()
-
-        if result["status"] == "aborted":
-            relay.feed_line("[aborted]")
-            output_lines.append("[aborted]")
-            relay.finish()
-            return 0, "\n".join(output_lines).strip()
-
-        relay.feed_line("[timeout]")
-        output_lines.append("[timeout]")
-        commentary = result.get("commentary") or []
-        if commentary:
-            for line in str(commentary[-1]).splitlines():
-                relay.feed_line(line)
-                output_lines.append(line)
-        relay.finish()
-        return 2, "\n".join(output_lines).strip()
-    except Exception:
-        relay.finish()
-        raise
+    return discord_stream.run_steering_watch_stream(
+        steering_result,
+        relay,
+        timeout_sec=timeout_sec,
+        watch_for_final_answer_func=bridge.watch_for_final_answer,
+    )
 
 
 async def stream_steering_prompt_result_to_channel(
@@ -1719,6 +831,126 @@ async def stream_steering_prompt_result_to_channel(
     title = "Steering finished" if exit_code == 0 else f"Steering watch failed (exit {exit_code})"
     await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
     return True
+
+
+def make_post_approval_watch_result(target_thread_id: str) -> SteeringPromptResult | None:
+    try:
+        thread = bridge.choose_thread(target_thread_id, None)
+        session_path = Path(thread.rollout_path)
+        if not session_path.exists():
+            log_line(
+                f"approval_followup_watch_unavailable target={target_thread_id} "
+                f"reason=session_missing path={session_path}"
+            )
+            return None
+        return SteeringPromptResult(
+            0,
+            "[approval_submitted]",
+            target_thread_id=thread.id,
+            target_ref=bridge.get_thread_workspace_ref(thread),
+            session_path=str(session_path),
+            start_offset=session_path.stat().st_size,
+        )
+    except Exception as exc:
+        log_line(
+            f"approval_followup_watch_unavailable target={target_thread_id} "
+            f"error_type={type(exc).__name__}"
+        )
+        return None
+
+
+async def stream_post_approval_result_to_channel(
+    channel: discord.abc.Messageable,
+    watch_result: SteeringPromptResult | None,
+    target_thread_id: str,
+) -> bool:
+    if watch_result is None:
+        return False
+    if not watch_result.session_path or watch_result.start_offset is None:
+        log_line(f"approval_followup_watch_unavailable target={target_thread_id} reason=no_session")
+        return False
+    relay = DiscordAskRelay(
+        asyncio.get_running_loop(),
+        channel,
+        watch_result.target_thread_id or target_thread_id,
+        watch_result.target_ref or target_thread_id,
+        send_timeout_blocks=False,
+    )
+    timeout_sec = get_steering_pending_watch_timeout()
+    async with channel_typing(channel, context="approval_followup_watch"):
+        exit_code, output = await asyncio.to_thread(
+            run_steering_watch_stream,
+            watch_result,
+            relay,
+            timeout_sec=timeout_sec,
+        )
+    log_line(
+        f"approval_followup_watch_done exit={exit_code} target={target_thread_id} "
+        f"sent_live={relay.sent_live} final={relay.saw_final} aborted={relay.saw_aborted} "
+        f"timeout={relay.saw_timeout} output_len={format_log_text_len(output)}"
+    )
+    if relay.sent_live:
+        if exit_code == 0 and not relay.saw_aborted:
+            if relay.saw_final:
+                return True
+            log_line(
+                f"approval_followup_watch_no_final_fallback target={target_thread_id} "
+                f"output_len={format_log_text_len(output)}"
+            )
+            await send_chunks(channel, f"Approval follow-up finished\n\n{output or '(no final answer captured)'}")
+        elif not relay.saw_aborted and not relay.saw_timeout:
+            await send_chunks(channel, f"Approval follow-up watch failed (exit {exit_code})\n\n{output or '(no output)'}")
+        return True
+    if exit_code != 0 and relay.saw_timeout:
+        log_line(
+            f"approval_followup_watch_timeout_suppressed target={target_thread_id} "
+            f"exit={exit_code} output_len={format_log_text_len(output)}"
+        )
+        return True
+    if exit_code != 0 and not output:
+        log_line(f"approval_followup_watch_empty_failure_suppressed target={target_thread_id} exit={exit_code}")
+        return True
+    if exit_code == 0 and not output:
+        log_line(f"approval_followup_watch_empty_success_suppressed target={target_thread_id}")
+        return True
+    title = "Approval follow-up finished" if exit_code == 0 else f"Approval follow-up watch failed (exit {exit_code})"
+    await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
+    return True
+
+
+async def resolve_approval_followup_channel(interaction: discord.Interaction) -> object | None:
+    channel = getattr(interaction, "channel", None)
+    if channel is not None and hasattr(channel, "send"):
+        return channel
+    message = getattr(interaction, "message", None)
+    message_channel = getattr(message, "channel", None)
+    if message_channel is not None and hasattr(message_channel, "send"):
+        return message_channel
+    channel_id = int(getattr(interaction, "channel_id", 0) or 0)
+    client = getattr(interaction, "client", None)
+    if channel_id and client is not None:
+        try:
+            fetched = await client.fetch_channel(channel_id)
+            if hasattr(fetched, "send"):
+                return fetched
+        except Exception as exc:
+            log_line(
+                f"approval_followup_channel_fetch_failed target_channel={channel_id} "
+                f"error_type={type(exc).__name__}"
+            )
+    return None
+
+
+async def stream_post_approval_result_for_interaction(
+    interaction: discord.Interaction,
+    watch_result: SteeringPromptResult | None,
+    target_thread_id: str,
+) -> bool:
+    channel = await resolve_approval_followup_channel(interaction)
+    if channel is None:
+        log_line(f"approval_followup_watch_channel_unavailable target={target_thread_id}")
+        return False
+    return await stream_post_approval_result_to_channel(channel, watch_result, target_thread_id)
 
 
 class LoggingCommandTree(app_commands.CommandTree):
@@ -1995,7 +1227,7 @@ class CodexDiscordBot(discord.Client):
         await self.process_discord_message(message, source="history_poll")
 
     async def on_ready(self) -> None:
-        log_line(f"ready user={self.user} guilds={len(self.guilds)}")
+        log_line(f"ready user_id={format_discord_user_id_for_log(self.user)} guilds={len(self.guilds)}")
         try:
             deleted_busy_choices = await asyncio.to_thread(cleanup_expired_busy_choices)
             if deleted_busy_choices:
@@ -2387,6 +1619,7 @@ async def handle_persistent_approval_interaction(
         f"approval_persistent user={user_id} target={target_thread_id} "
         f"answer_len={format_log_text_len(answer)}"
     )
+    watch_result = make_post_approval_watch_result(target_thread_id)
     exit_code, output = await asyncio.to_thread(approval_submitter, target_thread_id, answer)
     log_line(
         f"approval_persistent_done exit={exit_code} target={target_thread_id} "
@@ -2400,6 +1633,8 @@ async def handle_persistent_approval_interaction(
         exit_code=exit_code,
         log_prefix="button_response",
     )
+    if exit_code == 0:
+        await stream_post_approval_result_for_interaction(interaction, watch_result, target_thread_id)
     return True
 
 
@@ -3641,6 +2876,56 @@ async def sync_codex_mirror(bot: CodexDiscordBot, *, limit: int = 30) -> str:
     )
 
 
+def refresh_codex_bridge_session_state() -> dict[str, object]:
+    session_index_count = bridge.sync_session_index_with_state()
+    threads = bridge.load_recent_threads(limit=0)
+    selected_before = bridge.get_selected_thread_id()
+    selected_thread = next((thread for thread in threads if thread.id == selected_before), None)
+    if selected_thread is not None:
+        selected_action = "kept"
+    elif threads:
+        selected_thread = bridge.choose_thread(None, None)
+        bridge.set_selected_thread_id(selected_thread.id)
+        selected_action = "initialized" if not selected_before else "stale_replaced"
+    else:
+        if selected_before:
+            bridge.set_selected_thread_id(None)
+        selected_action = "cleared" if selected_before else "none"
+
+    selected_ref = ""
+    if selected_thread is not None:
+        try:
+            selected_ref = bridge.get_thread_workspace_ref(selected_thread, threads)
+        except Exception:
+            selected_ref = bridge.get_thread_workspace_name(selected_thread)
+    return {
+        "session_index_count": session_index_count,
+        "thread_count": len(threads),
+        "selected_before": selected_before or "-",
+        "selected_thread_id": selected_thread.id if selected_thread else "-",
+        "selected_ref": selected_ref or "-",
+        "selected_action": selected_action,
+    }
+
+
+async def refresh_discord_bridge_session(bot: CodexDiscordBot, *, limit: int = 30) -> str:
+    bounded_limit = max(1, min(100, int(limit)))
+    state = await asyncio.to_thread(refresh_codex_bridge_session_state)
+    mirror_output = await sync_codex_mirror(bot, limit=bounded_limit)
+    return "\n".join(
+        [
+            "Discord bridge sync complete.",
+            f"session_index_threads: {state['session_index_count']}",
+            f"codex_threads: {state['thread_count']}",
+            f"selected_action: {state['selected_action']}",
+            f"selected_thread: {state['selected_ref']} ({state['selected_thread_id']})",
+            f"selected_before: {state['selected_before']}",
+            "",
+            mirror_output,
+        ]
+    )
+
+
 async def mirror_single_codex_thread(
     bot: CodexDiscordBot,
     thread_id: str,
@@ -3684,340 +2969,75 @@ async def mirror_single_codex_thread(
 
 
 def build_mirror_list(limit: int = 30) -> str:
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT mt.thread_title, mt.codex_thread_id, mp.project_name, mt.discord_channel_id, mt.discord_thread_id
-            FROM mirror_threads mt
-            LEFT JOIN mirror_projects mp ON mp.project_key = mt.project_key
-            ORDER BY mt.updated_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    if not rows:
-        return "No mirrored threads yet. Run `!mirror sync`."
-    lines = ["Mirrored Codex threads"]
-    for title, codex_thread_id, project_name, channel_id, thread_id in rows:
-        context_suffix = ""
-        try:
-            thread = bridge.choose_thread(str(codex_thread_id), None)
-            context_usage = bridge.get_thread_context_usage(thread)
-            if context_usage is not None:
-                status = bridge.describe_thread_context_usage(context_usage)
-                archive_hint = " archive" if bridge.should_recommend_archive(thread, context_usage) else ""
-                context_suffix = f" ctx={context_usage.usage_ratio * 100:.1f}%/{status}{archive_hint}"
-        except Exception:
-            context_suffix = ""
-        lines.append(
-            f"- {project_name or '-'} / {title or codex_thread_id[:8]} "
-            f"=> <#{thread_id}> ({codex_thread_id[:8]}){context_suffix}"
-        )
-    return "\n".join(lines)
-
-
-def build_mirror_check() -> str:
-    init_mirror_db()
-    threads = filter_mirrorable_threads(bridge.load_recent_threads(limit=0))
-    expected: dict[str, tuple[str, str, str]] = {}
-    for thread in threads:
-        expected[thread.id] = (
-            get_project_key(thread),
-            get_project_name(thread),
-            bridge.get_thread_ui_name(thread.id, thread) or thread.title or thread.id[:8],
-        )
-
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT codex_thread_id, project_key, thread_title, discord_channel_id, discord_thread_id
-            FROM mirror_threads
-            ORDER BY updated_at DESC
-            """
-        ).fetchall()
-
-    missing = [item for item in expected if item not in {str(row[0]) for row in rows}]
-    stale = [str(row[0]) for row in rows if str(row[0]) not in expected]
-    wrong_project = [
-        (str(row[0]), str(row[1]), expected[str(row[0])][0])
-        for row in rows
-        if str(row[0]) in expected and str(row[1]) != expected[str(row[0])][0]
-    ]
-
-    lines = [
-        "Mirror check",
-        f"codex_threads: {len(expected)}",
-        f"mirrored_threads: {len(rows)}",
-        f"missing: {len(missing)}",
-        f"stale: {len(stale)}",
-        f"wrong_project: {len(wrong_project)}",
-    ]
-    if missing:
-        lines.append("")
-        lines.append("Missing:")
-        for thread_id in missing[:10]:
-            project_key, project_name, title = expected[thread_id]
-            lines.append(f"- {project_name} / {title} ({thread_id[:8]})")
-    if wrong_project:
-        lines.append("")
-        lines.append("Wrong project:")
-        for thread_id, current, expected_key in wrong_project[:10]:
-            lines.append(f"- {thread_id[:8]} current={current} expected={expected_key}")
-    if stale:
-        lines.append("")
-        lines.append("Stale:")
-        for thread_id in stale[:10]:
-            lines.append(f"- {thread_id[:8]}")
-    if missing or wrong_project:
-        lines.append("")
-        lines.append("Run `!mirror sync` to repair.")
-    return "\n".join(lines)
-
-
-def format_context_usage_line(thread: bridge.ThreadInfo) -> str:
-    context_usage = bridge.get_thread_context_usage(thread)
-    if context_usage is None:
-        return "context: -"
-    status = bridge.describe_thread_context_usage(context_usage)
-    archive_hint = "yes" if bridge.should_recommend_archive(thread, context_usage) else "no"
-    compaction_hint = f"compactions={context_usage.inferred_compactions}"
-    if context_usage.inferred_compactions:
-        compaction_hint += (
-            f" last={bridge.format_token_k(context_usage.last_compaction_before_input_tokens)}"
-            f"->{bridge.format_token_k(context_usage.last_compaction_after_input_tokens)}"
-        )
-    return (
-        f"context: {context_usage.usage_ratio * 100:.1f}% ({status}) "
-        f"last={bridge.format_token_k(context_usage.last_input_tokens)} "
-        f"peak={bridge.format_token_k(context_usage.peak_input_tokens)} "
-        f"window={bridge.format_token_k(context_usage.model_context_window)} "
-        f"{compaction_hint} "
-        f"archive_recommended={archive_hint}"
+    return discord_mirror_status.build_mirror_list(
+        limit,
+        db_path=MIRROR_DB_PATH,
+        init_mirror_db_func=init_mirror_db,
+        bridge_module=bridge,
     )
 
 
+def build_mirror_check() -> str:
+    return discord_mirror_status.build_mirror_check(
+        db_path=MIRROR_DB_PATH,
+        init_mirror_db_func=init_mirror_db,
+        bridge_module=bridge,
+        filter_mirrorable_threads_func=filter_mirrorable_threads,
+        get_project_key_func=get_project_key,
+        get_project_name_func=get_project_name,
+    )
+
+
+def format_context_usage_line(thread: bridge.ThreadInfo) -> str:
+    return discord_context.format_context_usage_line(thread, bridge_module=bridge)
+
+
 def build_context_warning(target_thread_id: str | None) -> str:
-    try:
-        resolved_thread_id, _target_ref = resolve_target_ref(target_thread_id)
-        if not resolved_thread_id:
-            return ""
-        thread = bridge.choose_thread(resolved_thread_id, None)
-        context_usage = bridge.get_thread_context_usage(thread)
-    except Exception as exc:
-        log_line(f"context_warning_unavailable target={target_thread_id or '-'} error={exc}")
-        return ""
-    if context_usage is None:
-        return ""
-    status = bridge.describe_thread_context_usage(context_usage)
-    archive_recommended = bridge.should_recommend_archive(thread, context_usage)
-    has_compaction_history = context_usage.inferred_compactions > 0
-    if status not in {"high", "critical"}:
-        return ""
-    compaction_note = ""
-    if has_compaction_history:
-        compaction_note = (
-            f" compactions={context_usage.inferred_compactions}"
-            f" last={bridge.format_token_k(context_usage.last_compaction_before_input_tokens)}"
-            f"->{bridge.format_token_k(context_usage.last_compaction_after_input_tokens)}."
-        )
-    return (
-        f"Context warning: {context_usage.usage_ratio * 100:.1f}% ({status}), "
-        f"archive_recommended={'yes' if archive_recommended else 'no'}."
-        f"{compaction_note} "
-        "Use `!context` to inspect, or `!new <prompt>` to continue in a fresh mirrored thread."
+    return discord_context.build_context_warning(
+        target_thread_id,
+        bridge_module=bridge,
+        resolve_target_ref_func=resolve_target_ref,
+        log_func=log_line,
     )
 
 
 def build_context_message(channel_id: int | None = None, *, all_threads: bool = False, limit: int = 10) -> str:
-    if not all_threads:
-        target_thread_id = get_mirrored_codex_thread_id(channel_id)
-        if not target_thread_id:
-            selected_thread_id, _target_ref = resolve_selected_target()
-            target_thread_id = selected_thread_id
-        if not target_thread_id:
-            return "No Codex thread target found."
-        try:
-            thread = bridge.choose_thread(target_thread_id, None)
-        except Exception as exc:
-            return f"Context unavailable.\n\nERROR: {exc}"
-        return "\n".join(
-            [
-                "Context status",
-                f"thread_ref: {bridge.get_thread_workspace_ref(thread)}",
-                f"title: {bridge.get_thread_ui_name(thread.id, thread) or thread.title or '-'}",
-                format_context_usage_line(thread),
-                f"tokens_used_total: {bridge.format_token_k(thread.tokens_used)}",
-            ]
-        )
-
-    threads = bridge.load_recent_threads(limit=max(1, min(50, limit)))
-    lines = ["Context status"]
-    for thread in threads:
-        title = bridge.get_thread_ui_name(thread.id, thread) or thread.title or thread.id[:8]
-        lines.append(
-            f"- {bridge.get_thread_workspace_ref(thread)} / {title}: "
-            f"{format_context_usage_line(thread)}; total={bridge.format_token_k(thread.tokens_used)}"
-        )
-    return "\n".join(lines)
+    return discord_context.build_context_message(
+        channel_id,
+        all_threads=all_threads,
+        limit=limit,
+        bridge_module=bridge,
+        get_mirrored_codex_thread_id_func=get_mirrored_codex_thread_id,
+        resolve_selected_target_func=resolve_selected_target,
+    )
 
 
 def parse_event_timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        moment = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc)
-
-
-def format_percent(value: object) -> str:
-    if isinstance(value, int | float):
-        return f"{float(value):.1f}%"
-    try:
-        return f"{float(str(value)):.1f}%"
-    except (TypeError, ValueError):
-        return "-"
+    return discord_context.parse_event_timestamp(value)
 
 
 def format_window_minutes(value: object) -> str:
-    minutes = bridge.coerce_nonnegative_int(value)
-    if minutes <= 0:
-        return "-"
-    if minutes % 1440 == 0:
-        return f"{minutes // 1440}d"
-    if minutes % 60 == 0:
-        return f"{minutes // 60}h"
-    return f"{minutes}m"
+    return discord_context.format_window_minutes(value, bridge_module=bridge)
 
 
 def format_rate_limit_reset(value: object) -> str:
-    reset_at = bridge.coerce_nonnegative_int(value)
-    if reset_at <= 0:
-        return "-"
-    return bridge.format_timestamp(reset_at)
+    return discord_context.format_rate_limit_reset(value, bridge_module=bridge)
 
 
 def format_rate_limit_line(label: str, value: object) -> str:
-    if not isinstance(value, dict):
-        return f"{label}: -"
-    return (
-        f"{label}: used={format_percent(value.get('used_percent'))} "
-        f"window={format_window_minutes(value.get('window_minutes'))} "
-        f"resets={format_rate_limit_reset(value.get('resets_at'))}"
+    return discord_context.format_rate_limit_line(
+        label,
+        value,
+        bridge_module=bridge,
+        format_percent_func=format_percent,
     )
 
 
 def build_weekly_usage_message(days: int = 7) -> str:
-    days = max(1, min(30, days))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    sessions_dir = bridge.CODEX_HOME / "sessions"
-    if not sessions_dir.exists():
-        return f"Local usage estimate unavailable: sessions directory not found at {sessions_dir}"
-
-    turns = 0
-    token_events = 0
-    total_tokens = 0
-    input_tokens = 0
-    output_tokens = 0
-    files_scanned = 0
-    recent_threads: set[str] = set()
-    latest_rate_limits: dict[str, object] | None = None
-    latest_rate_limits_at: datetime | None = None
-
-    for session_path in sessions_dir.rglob("*.jsonl"):
-        files_scanned += 1
-        try:
-            for event in bridge.iter_session_events(session_path):
-                moment = parse_event_timestamp(event.get("timestamp"))
-                if moment is None or moment < cutoff:
-                    continue
-                payload = event.get("payload") or {}
-                if not isinstance(payload, dict):
-                    continue
-                if event.get("type") == "session_meta":
-                    thread_id = str(payload.get("id") or "").strip()
-                    if thread_id:
-                        recent_threads.add(thread_id)
-                    continue
-                if event.get("type") != "event_msg":
-                    continue
-                event_type = payload.get("type")
-                if event_type == "task_started":
-                    turns += 1
-                    turn_id = str(payload.get("turn_id") or "").strip()
-                    if turn_id:
-                        recent_threads.add(turn_id)
-                    continue
-                if event_type != "token_count":
-                    continue
-                info = payload.get("info") or {}
-                if not isinstance(info, dict):
-                    continue
-                rate_limits = payload.get("rate_limits")
-                if isinstance(rate_limits, dict) and (
-                    latest_rate_limits_at is None or moment > latest_rate_limits_at
-                ):
-                    latest_rate_limits = rate_limits
-                    latest_rate_limits_at = moment
-                last_usage = info.get("last_token_usage") or {}
-                if not isinstance(last_usage, dict):
-                    continue
-                token_events += 1
-                event_input = bridge.coerce_nonnegative_int(last_usage.get("input_tokens"))
-                event_total = bridge.coerce_nonnegative_int(last_usage.get("total_tokens"))
-                input_tokens += event_input
-                total_tokens += event_total
-                output_tokens += max(0, event_total - event_input)
-        except Exception:
-            continue
-
-    lines = [f"Codex usage ({days}d local scan)"]
-    if latest_rate_limits:
-        seen_at = (
-            latest_rate_limits_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-            if latest_rate_limits_at
-            else "-"
-        )
-        lines.extend(
-            [
-                "Latest rate limits",
-                f"seen_at: {seen_at}",
-                f"plan: {latest_rate_limits.get('plan_type') or '-'}",
-                f"limit_id: {latest_rate_limits.get('limit_id') or '-'}",
-                format_rate_limit_line("primary", latest_rate_limits.get("primary")),
-                format_rate_limit_line("secondary", latest_rate_limits.get("secondary")),
-                f"credits: {latest_rate_limits.get('credits') or '-'}",
-                f"reached: {latest_rate_limits.get('rate_limit_reached_type') or '-'}",
-                "",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "Latest rate limits",
-                "not found in recent local token_count events",
-                "",
-            ]
-        )
-
-    lines.extend(
-        [
-            "Local token estimate",
-            f"turns: {turns}",
-            f"token_events: {token_events}",
-            f"total_tokens: {bridge.format_token_k(total_tokens)}",
-            f"input_tokens: {bridge.format_token_k(input_tokens)}",
-            f"output_tokens_est: {bridge.format_token_k(output_tokens)}",
-            f"recent_threads_seen: {len(recent_threads)}",
-            f"session_files_scanned: {files_scanned}",
-        ]
+    return discord_context.build_weekly_usage_message(
+        days,
+        bridge_module=bridge,
+        format_percent_func=format_percent,
     )
     return "\n".join(lines)
 
@@ -4047,371 +3067,51 @@ def build_where_message(channel_id: int | None) -> str:
 
 
 def get_busy_choice_counts(now: float | None = None) -> tuple[int, int]:
-    current = time.time() if now is None else now
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        active = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM busy_choices
-            WHERE expires_at > ? AND claimed_at IS NULL
-            """,
-            (current,),
-        ).fetchone()[0]
-        stale = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM busy_choices
-            WHERE expires_at <= ? OR claimed_at IS NOT NULL
-            """,
-            (current,),
-        ).fetchone()[0]
-    return int(active), int(stale)
+    return discord_store.get_busy_choice_counts(MIRROR_DB_PATH, now=now)
 
 
 def get_persistent_component_claim_counts(now: float | None = None) -> tuple[int, int]:
-    current = time.time() if now is None else now
-    init_mirror_db()
-    with sqlite3.connect(MIRROR_DB_PATH) as conn:
-        active = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM persistent_component_claims
-            WHERE expires_at > ?
-            """,
-            (current,),
-        ).fetchone()[0]
-        stale = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM persistent_component_claims
-            WHERE expires_at <= ?
-            """,
-            (current,),
-        ).fetchone()[0]
-    return int(active), int(stale)
+    return discord_store.get_persistent_component_claim_counts(MIRROR_DB_PATH, now=now)
 
 
 def format_discord_id_list(values: set[int], *, limit: int = 8) -> str:
-    if not values:
-        return "ALL"
-    sorted_values = sorted(values)
-    rendered = ",".join(str(value) for value in sorted_values[:limit])
-    if len(sorted_values) > limit:
-        rendered += f",+{len(sorted_values) - limit} more"
-    return rendered
-
-
-def parse_log_line(line: str) -> tuple[str, str] | None:
-    match = re.match(r"^\[([^\]]+)\]\s+(.*)$", str(line or "").strip())
-    if not match:
-        return None
-    return match.group(1), match.group(2)
-
-
-def get_log_field(body: str, key: str) -> str:
-    match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", body)
-    return match.group(1) if match else "-"
-
-
-def summarize_discord_hook_log_line(line: str) -> str | None:
-    parsed = parse_log_line(line)
-    if not parsed:
-        return None
-    timestamp, body = parsed
-    if body.startswith("socket_message_create_untracked "):
-        return (
-            f"{timestamp} raw_message_untracked "
-            f"channel={get_log_field(body, 'channel')} source={get_log_field(body, 'source')}"
-        )
-    if body.startswith("socket_message_create "):
-        return (
-            f"{timestamp} raw_message "
-            f"channel={get_log_field(body, 'channel')} source={get_log_field(body, 'source')} "
-            f"bot={get_log_field(body, 'bot')} content_len={get_log_field(body, 'content_len')}"
-        )
-    if body.startswith("message_received "):
-        return (
-            f"{timestamp} message_received "
-            f"channel={get_log_field(body, 'chat')} content_len={get_log_field(body, 'content_len')}"
-        )
-    if body.startswith("ignored_message "):
-        return (
-            f"{timestamp} ignored_message "
-            f"reason={get_log_field(body, 'reason')} channel={get_log_field(body, 'chat')}"
-        )
-    if body.startswith("history_poll_message "):
-        return (
-            f"{timestamp} history_poll_message "
-            f"channel={get_log_field(body, 'channel')} content_len={get_log_field(body, 'content_len')}"
-        )
-    if body.startswith("history_poll_primed "):
-        return (
-            f"{timestamp} history_poll_primed "
-            f"channel={get_log_field(body, 'channel')} messages={get_log_field(body, 'messages')}"
-        )
-    if body.startswith("message "):
-        return (
-            f"{timestamp} message_routed "
-            f"channel={get_log_field(body, 'chat')} target={get_log_field(body, 'target')} "
-            f"prefix={get_log_field(body, 'prefix')} text_len={get_log_field(body, 'text_len')}"
-        )
-    if body.startswith("socket_interaction_create "):
-        return (
-            f"{timestamp} raw_interaction "
-            f"channel={get_log_field(body, 'channel')} type={get_log_field(body, 'type')} "
-            f"command={get_log_field(body, 'command')}"
-        )
-    if body.startswith("interaction_received "):
-        return (
-            f"{timestamp} interaction_received "
-            f"channel={get_log_field(body, 'channel')} type={get_log_field(body, 'type')} "
-            f"command={get_log_field(body, 'command')}"
-        )
-    if body.startswith("slash_"):
-        slash_event = body.split(" ", 1)[0]
-        return (
-            f"{timestamp} {slash_event} "
-            f"channel={get_log_field(body, 'channel')} command={get_log_field(body, 'command')} "
-            f"exit={get_log_field(body, 'exit')} response={get_log_field(body, 'response')} "
-            f"reason={get_log_field(body, 'reason')}"
-        )
-    if body.startswith("component_interaction_"):
-        return (
-            f"{timestamp} component_event "
-            f"channel={get_log_field(body, 'channel')} custom_id={get_log_field(body, 'custom_id')}"
-        )
-    if body.startswith("busy_choice_"):
-        return (
-            f"{timestamp} busy_choice_event "
-            f"reason={get_log_field(body, 'reason')} target={get_log_field(body, 'target')}"
-        )
-    if body.startswith("approval_persistent"):
-        return (
-            f"{timestamp} approval_persistent "
-            f"target={get_log_field(body, 'target')} exit={get_log_field(body, 'exit')}"
-        )
-    if body.startswith("input_choice_persistent"):
-        return (
-            f"{timestamp} input_choice_persistent "
-            f"target={get_log_field(body, 'target')} exit={get_log_field(body, 'exit')}"
-        )
-    return None
-
-
-def is_user_or_control_hook_summary(summary: str) -> bool:
-    if " raw_message " in summary:
-        return " bot=False " in summary or " bot=- " in summary
-    if " raw_message_untracked " in summary:
-        return True
-    return any(
-        marker in summary
-        for marker in [
-            " message_received ",
-            " ignored_message ",
-            " history_poll_message ",
-            " message_routed ",
-            " raw_interaction ",
-            " interaction_received ",
-            " slash_",
-            " component_event ",
-            " busy_choice_event ",
-            " approval_persistent ",
-            " input_choice_persistent ",
-        ]
-    )
-
-
-def get_recent_discord_hook_events(
-    *,
-    limit: int = 8,
-    max_lines: int = 1000,
-    user_or_control_only: bool = False,
-) -> list[str]:
-    log_path = get_log_path()
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
-    events: list[str] = []
-    for line in lines[-max_lines:]:
-        summary = summarize_discord_hook_log_line(line)
-        if summary:
-            if user_or_control_only and not is_user_or_control_hook_summary(summary):
-                continue
-            events.append(summary)
-    return events[-limit:]
-
-
-def get_discord_log_markers(*, max_lines: int = 2000) -> dict[str, str]:
-    log_path = get_log_path()
-    markers = {
-        "last_ready_at": "-",
-        "last_gateway_event_at": "-",
-        "last_raw_interaction_at": "-",
-        "last_interaction_at": "-",
-        "last_component_at": "-",
-        "last_user_or_control_hook_at": "-",
-        "last_button_qa_at": "-",
-        "last_button_qa_result": "-",
-        "last_steering_button_at": "-",
-        "last_steering_button_exit": "-",
-        "last_steering_button_elapsed_sec": "-",
-    }
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return markers
-    for line in lines[-max_lines:]:
-        parsed = parse_log_line(line)
-        if not parsed:
-            continue
-        timestamp, body = parsed
-        if body.startswith("ready "):
-            markers["last_ready_at"] = timestamp
-        if body.startswith(("socket_message_create ", "socket_message_create_untracked ", "socket_interaction_create ")):
-            markers["last_gateway_event_at"] = timestamp
-        if body.startswith("socket_interaction_create "):
-            markers["last_raw_interaction_at"] = timestamp
-        if body.startswith("interaction_received "):
-            markers["last_interaction_at"] = timestamp
-            if " type=component " in f" {body} ":
-                markers["last_component_at"] = timestamp
-        if body.startswith((
-            "component_interaction_",
-            "busy_choice_persistent_",
-            "approval_persistent",
-            "input_choice_persistent",
-        )):
-            markers["last_component_at"] = timestamp
-        if body.startswith("button_qa_done "):
-            markers["last_button_qa_at"] = timestamp
-            markers["last_button_qa_result"] = get_log_field(body, "result")
-        if body.startswith(("steer_now_done ", "busy_choice_persistent_steer_done ")):
-            markers["last_steering_button_at"] = timestamp
-            markers["last_steering_button_exit"] = get_log_field(body, "exit")
-            markers["last_steering_button_elapsed_sec"] = get_log_field(body, "elapsed_sec")
-        summary = summarize_discord_hook_log_line(line)
-        if summary and is_user_or_control_hook_summary(summary):
-            markers["last_user_or_control_hook_at"] = timestamp
-    return markers
+    return discord_diagnostics.format_discord_id_list(values, limit=limit)
 
 
 def build_discord_doctor_message(bot: CodexDiscordBot, channel_id: int | None) -> str:
-    target_thread_id = get_mirrored_codex_thread_id(channel_id)
-    project = get_mirror_project_for_channel(channel_id)
-    active_busy_choices, stale_busy_choices = get_busy_choice_counts()
-    active_component_claims, stale_component_claims = get_persistent_component_claim_counts()
-    mirror_lines = build_mirror_check().splitlines()
-    log_markers = get_discord_log_markers()
-    history_poll_task = getattr(bot, "_history_poll_task", None)
-    history_poll_alive = bool(history_poll_task and not history_poll_task.done())
-    recent_events = get_recent_discord_hook_events()
-    recent_user_events = get_recent_discord_hook_events(user_or_control_only=True)
-    lines = [
-        "Discord adapter diagnostics",
-        f"channel_id: {channel_id or '-'}",
-        f"mapped_thread_id: {target_thread_id or '-'}",
-        f"project_channel: {project[1] if project else '-'}",
-        f"message_content_enabled: {bool(getattr(bot, 'enable_prefix_commands', False))}",
-        f"intent_message_content: {bool(getattr(getattr(bot, 'intents', None), 'message_content', False))}",
-        f"raw_debug_events: {bool(getattr(bot, '_enable_debug_events', False))}",
-        f"qa_commands_enabled: {discord_qa_commands_enabled()}",
-        f"history_poll_seconds: {getattr(bot, 'history_poll_seconds', '-')}",
-        f"history_poll_bootstrap_lookback_seconds: {getattr(bot, 'history_poll_bootstrap_lookback_seconds', '-')}",
-        f"history_poll_bootstrap_after: {getattr(bot, '_history_poll_bootstrap_after', '-')}",
-        f"history_poll_alive: {history_poll_alive}",
-        f"history_poll_last_at: {getattr(bot, '_history_poll_last_at', '-')}",
-        f"history_poll_primed_channels: {len(getattr(bot, '_history_poll_primed_channels', set()))}",
-        f"slash_sync_status: {getattr(bot, '_slash_sync_status', '-')}",
-        f"slash_sync_last_at: {getattr(bot, '_slash_sync_last_at', '-')}",
-        f"slash_sync_commands: {getattr(bot, '_slash_sync_commands', '-')}",
-        f"allowed_channels: {format_discord_id_list(getattr(bot, 'allowed_channel_ids', set()))}",
-        f"allowed_users: {format_discord_id_list(getattr(bot, 'allowed_user_ids', set()))}",
-        f"startup_channel_id: {getattr(bot, 'startup_channel_id', None) or '-'}",
-        f"empty_content_notice_channels: {len(EMPTY_CONTENT_NOTICE_LAST_SENT)}",
-        f"busy_choices_active: {active_busy_choices}",
-        f"busy_choices_stale: {stale_busy_choices}",
-        f"persistent_component_claims_active: {active_component_claims}",
-        f"persistent_component_claims_stale: {stale_component_claims}",
-        f"last_ready_at: {log_markers['last_ready_at']}",
-        f"last_gateway_event_at: {log_markers['last_gateway_event_at']}",
-        f"last_raw_interaction_at: {log_markers['last_raw_interaction_at']}",
-        f"last_interaction_at: {log_markers['last_interaction_at']}",
-        f"last_component_at: {log_markers['last_component_at']}",
-        f"last_user_or_control_hook_at: {log_markers['last_user_or_control_hook_at']}",
-        f"last_button_qa_at: {log_markers['last_button_qa_at']}",
-        f"last_button_qa_result: {log_markers['last_button_qa_result']}",
-        f"last_steering_button_at: {log_markers['last_steering_button_at']}",
-        f"last_steering_button_exit: {log_markers['last_steering_button_exit']}",
-        f"last_steering_button_elapsed_sec: {log_markers['last_steering_button_elapsed_sec']}",
-        "",
-        *mirror_lines,
-        "",
-        "Expected live log sequence:",
-        "message: socket_message_create -> message_received",
-        "slash/button: socket_interaction_create -> interaction_received",
-        "",
-        "Recent user/control hook events:",
-        *(recent_user_events or ["-"]),
-        "",
-        "Recent hook events:",
-        *(recent_events or ["-"]),
-    ]
-    return "\n".join(lines)
+    return discord_diagnostics.build_discord_doctor_message(
+        bot,
+        channel_id,
+        empty_content_notice_count=len(EMPTY_CONTENT_NOTICE_LAST_SENT),
+        get_mirrored_codex_thread_id_func=get_mirrored_codex_thread_id,
+        get_mirror_project_for_channel_func=get_mirror_project_for_channel,
+        get_busy_choice_counts_func=get_busy_choice_counts,
+        get_persistent_component_claim_counts_func=get_persistent_component_claim_counts,
+        build_mirror_check_func=build_mirror_check,
+        get_discord_log_markers_func=get_discord_log_markers,
+        get_recent_discord_hook_events_func=get_recent_discord_hook_events,
+        discord_qa_commands_enabled_func=discord_qa_commands_enabled,
+    )
 
 
 def format_discord_message_type(message: object) -> str:
-    message_type = getattr(message, "type", "-")
-    return str(getattr(message_type, "name", message_type) or "-")
+    return discord_diagnostics.format_discord_message_type(message)
 
 
 def format_discord_message_created_at(message: object) -> str:
-    created_at = getattr(message, "created_at", None)
-    if hasattr(created_at, "isoformat"):
-        return str(created_at.isoformat())
-    return "-"
+    return discord_diagnostics.format_discord_message_created_at(message)
 
 
 async def build_discord_channel_history_lines(channel: object | None, *, limit: int = 5) -> list[str]:
-    lines = ["Recent channel history:"]
-    if channel is None or not hasattr(channel, "history"):
-        return [*lines, "history_unavailable: no_channel"]
-    try:
-        messages = []
-        async for message in channel.history(limit=limit):  # type: ignore[attr-defined]
-            author = getattr(message, "author", None)
-            messages.append(
-                f"{format_discord_message_created_at(message)} "
-                f"bot={bool(getattr(author, 'bot', False))} "
-                f"content_len={format_log_text_len(getattr(message, 'content', '') or '')} "
-                f"type={format_discord_message_type(message)}"
-            )
-    except Exception as exc:
-        return [*lines, f"history_error: {type(exc).__name__}"]
-    return [*lines, *(messages or ["-"])]
+    return await discord_diagnostics.build_discord_channel_history_lines(
+        channel,
+        limit=limit,
+        format_log_text_len_func=format_log_text_len,
+    )
 
 
 async def resolve_discord_history_channel(bot: object, channel_id: int) -> tuple[object | None, str]:
-    getter = getattr(bot, "get_cached_channel_or_thread", None)
-    if callable(getter):
-        channel, source = getter(channel_id)
-    else:
-        channel = None
-        source = "-"
-        get_channel = getattr(bot, "get_channel", None)
-        if callable(get_channel):
-            channel = get_channel(channel_id)
-            source = "client_channel_cache" if channel is not None else "-"
-    if channel is None:
-        fetch_channel = getattr(bot, "fetch_channel", None)
-        if callable(fetch_channel):
-            try:
-                channel = await fetch_channel(channel_id)
-                source = "fetch"
-            except Exception as exc:
-                return None, f"fetch_error:{type(exc).__name__}"
-    return channel, source
+    return await discord_diagnostics.resolve_discord_history_channel(bot, channel_id)
 
 
 async def build_discord_tracked_target_user_history_lines(
@@ -4420,41 +3120,13 @@ async def build_discord_tracked_target_user_history_lines(
     per_target_limit: int = 5,
     target_limit: int = 50,
 ) -> list[str]:
-    lines = ["Recent tracked target user history:"]
-    targets = get_startup_probe_targets(
-        getattr(bot, "allowed_channel_ids", set()),
-        getattr(bot, "startup_channel_id", None),
-        limit=target_limit,
+    return await discord_diagnostics.build_discord_tracked_target_user_history_lines(
+        bot,
+        get_startup_probe_targets_func=get_startup_probe_targets,
+        format_log_text_len_func=format_log_text_len,
+        per_target_limit=per_target_limit,
+        target_limit=target_limit,
     )
-    if not targets:
-        return [*lines, "-"]
-    for label, channel_id in targets:
-        channel, source = await resolve_discord_history_channel(bot, channel_id)
-        prefix = f"{label} channel={channel_id} source={source}"
-        if channel is None or not hasattr(channel, "history"):
-            lines.append(f"{prefix} latest_user=-")
-            continue
-        latest_user_message = None
-        try:
-            async for message in channel.history(limit=per_target_limit):  # type: ignore[attr-defined]
-                if getattr(getattr(message, "author", None), "bot", False):
-                    continue
-                latest_user_message = message
-                break
-        except Exception as exc:
-            lines.append(f"{prefix} latest_user=history_error:{type(exc).__name__}")
-            continue
-        if latest_user_message is None:
-            lines.append(f"{prefix} latest_user=-")
-            continue
-        author = getattr(latest_user_message, "author", None)
-        lines.append(
-            f"{prefix} latest_user_at={format_discord_message_created_at(latest_user_message)} "
-            f"user={getattr(author, 'id', '-')} "
-            f"content_len={format_log_text_len(getattr(latest_user_message, 'content', '') or '')} "
-            f"type={format_discord_message_type(latest_user_message)}"
-        )
-    return lines
 
 
 async def build_discord_doctor_message_with_history(
@@ -4462,119 +3134,98 @@ async def build_discord_doctor_message_with_history(
     channel_id: int | None,
     channel: object | None,
 ) -> str:
-    history_lines = await build_discord_channel_history_lines(channel)
-    tracked_history_lines = await build_discord_tracked_target_user_history_lines(bot)
-    return (
-        build_discord_doctor_message(bot, channel_id)
-        + "\n\n"
-        + "\n".join(history_lines)
-        + "\n\n"
-        + "\n".join(tracked_history_lines)
+    return await discord_diagnostics.build_discord_doctor_message_with_history(
+        bot,
+        channel_id,
+        channel,
+        build_discord_doctor_message_func=build_discord_doctor_message,
+        build_discord_channel_history_lines_func=build_discord_channel_history_lines,
+        build_discord_tracked_target_user_history_lines_func=build_discord_tracked_target_user_history_lines,
     )
 
 
 
 async def build_runners_message() -> str:
-    async with THREAD_RUNNERS_LOCK:
-        items = list(THREAD_RUNNERS.items())
-    if not items:
-        return "No active Discord runner queues."
-    lines = ["Discord runner queues"]
-    for key, runner in items:
-        queue = runner.get("queue")
-        queue_size = queue.qsize() if isinstance(queue, asyncio.Queue) else 0
-        target_thread_id = str(runner.get("target_thread_id") or "").strip() or None
-        _thread_id, target_ref = resolve_target_ref(target_thread_id)
-        lines.append(
-            f"- {target_ref}: active={bool(runner.get('active'))} queued={queue_size} key={key[:8]}"
-        )
-    return "\n".join(lines)
+    return await discord_runtime.build_runners_message(
+        THREAD_RUNNERS,
+        THREAD_RUNNERS_LOCK,
+        resolve_target_ref_func=resolve_target_ref,
+    )
 
 
 def resolve_target_ref(target_thread_id: str | None) -> tuple[str | None, str]:
-    if not target_thread_id:
-        return resolve_selected_target()
-    try:
-        thread = bridge.choose_thread(target_thread_id, None)
-        return thread.id, bridge.get_thread_workspace_ref(thread)
-    except Exception:
-        return target_thread_id, target_thread_id[:8]
+    return discord_thread_state.resolve_target_ref(
+        target_thread_id,
+        bridge_module=bridge,
+        resolve_selected_target_func=resolve_selected_target,
+    )
 
 
 def get_interactive_state_for_thread(target_thread_id: str | None) -> tuple[str, str | None, str]:
-    if not target_thread_id:
-        return get_selected_interactive_state()
-    target_thread_id, target_ref = resolve_target_ref(target_thread_id)
-    if not target_thread_id:
-        return INTERACTIVE_STATE_NONE, None, target_ref
-    try:
-        thread = bridge.choose_thread(target_thread_id, None)
-        busy_state = bridge.get_thread_busy_state(thread, allow_resume=True)
-    except Exception:
-        return INTERACTIVE_STATE_NONE, target_thread_id, target_ref
-    if busy_state not in {INTERACTIVE_STATE_INPUT, INTERACTIVE_STATE_APPROVAL}:
-        return INTERACTIVE_STATE_NONE, target_thread_id, target_ref
-    return busy_state, target_thread_id, target_ref
+    return discord_thread_state.get_interactive_state_for_thread(
+        target_thread_id,
+        bridge_module=bridge,
+        resolve_target_ref_func=resolve_target_ref,
+        get_selected_interactive_state_func=get_selected_interactive_state,
+        state_none=INTERACTIVE_STATE_NONE,
+        state_input=INTERACTIVE_STATE_INPUT,
+        state_approval=INTERACTIVE_STATE_APPROVAL,
+    )
 
 
 def get_busy_state_for_thread(target_thread_id: str | None) -> tuple[str, str | None, str]:
-    target_thread_id, target_ref = resolve_target_ref(target_thread_id)
-    if not target_thread_id:
-        return "idle", None, target_ref
-    try:
-        thread = bridge.choose_thread(target_thread_id, None)
-        busy_state = bridge.get_thread_busy_state(thread, allow_resume=True)
-    except Exception as exc:
-        log_line(f"busy_state_check_failed target={target_thread_id} error={exc}")
-        return "idle", target_thread_id, target_ref
-    return busy_state or "idle", target_thread_id, target_ref
+    return discord_thread_state.get_busy_state_for_thread(
+        target_thread_id,
+        bridge_module=bridge,
+        resolve_target_ref_func=resolve_target_ref,
+        log_func=log_line,
+    )
 
 
 def normalize_runner_key(target_thread_id: str | None) -> str:
-    return target_thread_id or "__selected__"
+    return discord_runtime.normalize_runner_key(target_thread_id)
 
 
 def mark_steering_handoff(target_thread_id: str | None) -> float:
-    handoff_at = time.monotonic()
-    STEERING_HANDOFFS[normalize_runner_key(target_thread_id)] = handoff_at
-    return handoff_at
+    return discord_runtime.mark_steering_handoff(STEERING_HANDOFFS, target_thread_id)
 
 
 def had_steering_handoff_since(target_thread_id: str | None, started_at: float) -> bool:
-    return STEERING_HANDOFFS.get(normalize_runner_key(target_thread_id), 0.0) >= started_at
+    return discord_runtime.had_steering_handoff_since(
+        STEERING_HANDOFFS,
+        target_thread_id,
+        started_at,
+    )
 
 
 def register_discord_relay(target_thread_id: str | None) -> int:
-    key = normalize_runner_key(target_thread_id)
-    generation = ACTIVE_DISCORD_RELAY_GENERATIONS.get(key, 0) + 1
-    ACTIVE_DISCORD_RELAY_GENERATIONS[key] = generation
-    return generation
+    return discord_runtime.register_discord_relay(
+        ACTIVE_DISCORD_RELAY_GENERATIONS,
+        target_thread_id,
+    )
 
 
 def is_discord_relay_stale(target_thread_id: str | None, generation: int) -> bool:
-    return ACTIVE_DISCORD_RELAY_GENERATIONS.get(normalize_runner_key(target_thread_id), 0) > generation
+    return discord_runtime.is_discord_relay_stale(
+        ACTIVE_DISCORD_RELAY_GENERATIONS,
+        target_thread_id,
+        generation,
+    )
 
 
 async def get_thread_runner(target_thread_id: str | None) -> dict[str, object]:
-    key = normalize_runner_key(target_thread_id)
-    async with THREAD_RUNNERS_LOCK:
-        runner = THREAD_RUNNERS.get(key)
-        if runner is None:
-            runner = {
-                "queue": asyncio.Queue(),
-                "task": None,
-                "active": False,
-                "target_thread_id": target_thread_id,
-            }
-            THREAD_RUNNERS[key] = runner
-        return runner
+    return await discord_runner.get_thread_runner(
+        target_thread_id,
+        runners=THREAD_RUNNERS,
+        runners_lock=THREAD_RUNNERS_LOCK,
+        normalize_runner_key_func=normalize_runner_key,
+    )
 
 
 async def is_thread_runner_busy(target_thread_id: str | None) -> bool:
-    runner = await get_thread_runner(target_thread_id)
-    queue = runner["queue"]
-    return bool(runner.get("active")) or (
-        isinstance(queue, asyncio.Queue) and queue.qsize() > 0
+    return await discord_runner.is_thread_runner_busy(
+        target_thread_id,
+        get_thread_runner_func=get_thread_runner,
     )
 
 
@@ -4584,22 +3235,12 @@ async def wait_for_codex_thread_idle(
     timeout_sec: float = 3600.0,
     poll_sec: float = 5.0,
 ) -> tuple[str, str | None, str]:
-    deadline = time.monotonic() + timeout_sec
-    last_state = "idle"
-    last_thread_id: str | None = None
-    last_ref = ""
-    while time.monotonic() < deadline:
-        state, resolved_thread_id, target_ref = await asyncio.to_thread(
-            get_busy_state_for_thread,
-            target_thread_id,
-        )
-        last_state = state
-        last_thread_id = resolved_thread_id
-        last_ref = target_ref
-        if state == "idle":
-            return state, resolved_thread_id, target_ref
-        await asyncio.sleep(poll_sec)
-    return last_state, last_thread_id, last_ref
+    return await discord_runner.wait_for_codex_thread_idle(
+        target_thread_id,
+        get_busy_state_func=get_busy_state_for_thread,
+        timeout_sec=timeout_sec,
+        poll_sec=poll_sec,
+    )
 
 
 async def enqueue_thread_ask(
@@ -4611,95 +3252,39 @@ async def enqueue_thread_ask(
     ack_sent: bool = False,
     source_message: discord.Message | None = None,
 ) -> int:
-    runner = await get_thread_runner(target_thread_id)
-    queue = runner["queue"]
-    if not isinstance(queue, asyncio.Queue):
-        raise RuntimeError("Thread runner queue is invalid.")
-    await queue.put(
-        {
-            "channel": channel,
-            "prompt": prompt,
-            "target_thread_id": target_thread_id,
-            "queued": queued,
-            "ack_sent": ack_sent,
-            "source_message": source_message,
-        }
+    return await discord_runner.enqueue_thread_ask(
+        channel,
+        prompt,
+        target_thread_id,
+        queued=queued,
+        ack_sent=ack_sent,
+        source_message=source_message,
+        get_thread_runner_func=get_thread_runner,
+        thread_runner_loop_func=thread_runner_loop,
     )
-    task = runner.get("task")
-    if not isinstance(task, asyncio.Task) or task.done():
-        runner["task"] = asyncio.create_task(thread_runner_loop(target_thread_id))
-    return queue.qsize()
 
 
 async def report_thread_runner_job_failed(job: object, target_thread_id: str | None) -> None:
-    channel = job.get("channel") if isinstance(job, dict) else None
-    if channel is None or not hasattr(channel, "send"):
-        return
-    try:
-        await channel.send("Queued ask failed. Check codex_discord_bot.log.")
-        log_line(f"thread_runner_job_failure_reported target={target_thread_id or '-'}")
-    except Exception:
-        log_line("thread_runner_job_failure_report_failed\n" + traceback.format_exc())
+    await discord_runner.report_thread_runner_job_failed(
+        job,
+        target_thread_id,
+        log_func=log_line,
+    )
 
 
 async def thread_runner_loop(target_thread_id: str | None) -> None:
-    key = normalize_runner_key(target_thread_id)
-    while True:
-        runner = await get_thread_runner(target_thread_id)
-        queue = runner["queue"]
-        if not isinstance(queue, asyncio.Queue):
-            return
-        try:
-            job = await asyncio.wait_for(queue.get(), timeout=5)
-        except asyncio.TimeoutError:
-            async with THREAD_RUNNERS_LOCK:
-                current = THREAD_RUNNERS.get(key)
-                if current is runner and not bool(current.get("active")) and queue.empty():
-                    THREAD_RUNNERS.pop(key, None)
-                    return
-            continue
-
-        runner["active"] = True
-        try:
-            channel = job.get("channel")
-            prompt = str(job.get("prompt") or "").strip()
-            job_target_thread_id = str(job.get("target_thread_id") or "").strip() or None
-            if prompt and isinstance(channel, discord.abc.Messageable):
-                queued = bool(job.get("queued"))
-                ack_sent = bool(job.get("ack_sent"))
-                if queued:
-                    busy_state, _busy_thread_id, busy_ref = await asyncio.to_thread(
-                        get_busy_state_for_thread,
-                        job_target_thread_id,
-                    )
-                    if busy_state != "idle":
-                        await channel.send(
-                            f"Queued ask waiting for `{busy_ref or job_target_thread_id or 'selected'}` "
-                            f"to become idle. Current state: {busy_state}."
-                        )
-                        busy_state, _busy_thread_id, busy_ref = await wait_for_codex_thread_idle(
-                            job_target_thread_id,
-                        )
-                        if busy_state != "idle":
-                            await channel.send(
-                                f"Queued ask is still blocked for `{busy_ref or job_target_thread_id or 'selected'}`. "
-                                f"Current state: {busy_state}."
-                            )
-                            continue
-                await run_prompt_and_send(
-                    channel,
-                    prompt,
-                    queued=queued,
-                    ack_sent=ack_sent,
-                    source_message=job.get("source_message"),  # type: ignore[arg-type]
-                    target_thread_id=job_target_thread_id,
-                )
-        except Exception:
-            log_line("thread_runner_job_failed\n" + traceback.format_exc())
-            await report_thread_runner_job_failed(job, target_thread_id)
-        finally:
-            runner["active"] = False
-            queue.task_done()
+    await discord_runner.thread_runner_loop(
+        target_thread_id,
+        runners=THREAD_RUNNERS,
+        runners_lock=THREAD_RUNNERS_LOCK,
+        normalize_runner_key_func=normalize_runner_key,
+        get_thread_runner_func=get_thread_runner,
+        get_busy_state_func=get_busy_state_for_thread,
+        wait_for_idle_func=wait_for_codex_thread_idle,
+        run_prompt_and_send_func=run_prompt_and_send,
+        report_job_failed_func=report_thread_runner_job_failed,
+        log_func=log_line,
+    )
 
 
 async def run_prompt_and_send(
@@ -4711,9 +3296,8 @@ async def run_prompt_and_send(
     source_message: discord.Message | None = None,
     target_thread_id: str | None = None,
 ) -> None:
-    label = "Queued ask started." if queued else "Ask started."
     if not ack_sent:
-        await channel.send(label)
+        await channel.send(build_ask_start_message(prompt, queued=queued))
     started_at = time.monotonic()
     target_thread_id, target_ref = resolve_target_ref(target_thread_id)
     relay = DiscordAskRelay(
@@ -4791,24 +3375,11 @@ async def run_prompt_and_send(
 
 
 def is_selected_thread_busy_error(exit_code: int, output: str) -> bool:
-    if exit_code == 0:
-        return False
-    text = (output or "").lower()
-    return (
-        "selected thread is still busy" in text
-        or "target thread is still busy" in text
-        or "--force-while-busy" in text and "still busy" in text
-        or "selected thread is waiting on a follow-up choice or input" in text
-        or "selected thread is waiting on an approval prompt" in text
-    )
+    return discord_busy.is_selected_thread_busy_error(exit_code, output)
 
 
 def has_busy_choice_source(source_message: object) -> bool:
-    return bool(
-        source_message is not None
-        and getattr(source_message, "author", None) is not None
-        and getattr(source_message, "channel", None) is not None
-    )
+    return discord_busy.has_busy_choice_source(source_message)
 
 
 async def run_prompt_flow(
@@ -4845,6 +3416,7 @@ async def run_prompt_flow(
     warning = build_context_warning(target_thread_id)
     if warning:
         await send_chunks(channel, warning)
+    await channel.send(build_ask_start_message(prompt, queued=queued))
     await enqueue_thread_ask(
         channel,
         prompt,
@@ -4856,15 +3428,12 @@ async def run_prompt_flow(
 
 
 def build_busy_choice_message(prompt: str, target_thread_id: str | None) -> str:
-    lines = ["This Codex thread is already working.", ""]
-    footer = "\n\nChoose how to handle this message for this thread."
-    prefix = "\n".join(lines)
-    prompt_text = str(prompt or "")
-    prompt_budget = max(0, DISCORD_MAX_LEN - len(prefix) - len(footer))
-    if len(prompt_text) > prompt_budget:
-        suffix = "\n\n[prompt truncated for Discord]"
-        prompt_text = prompt_text[: max(0, prompt_budget - len(suffix))].rstrip() + suffix
-    return fit_single_message(prefix + prompt_text + footer)
+    return discord_busy.build_busy_choice_message(
+        prompt,
+        target_thread_id,
+        discord_max_len=DISCORD_MAX_LEN,
+        fit_single_message_func=fit_single_message,
+    )
 
 
 def make_busy_choice_payload(
@@ -4874,14 +3443,13 @@ def make_busy_choice_payload(
     target_thread_id: str | None,
     allow_steer: bool,
 ) -> tuple[str, BusyChoiceView]:
-    return (
-        build_busy_choice_message(prompt, target_thread_id),
-        make_busy_choice_view(
-            source_message,  # type: ignore[arg-type]
-            prompt,
-            target_thread_id=target_thread_id,
-            allow_steer=allow_steer,
-        ),
+    return discord_busy.make_busy_choice_payload(
+        source_message,
+        prompt,
+        target_thread_id=target_thread_id,
+        allow_steer=allow_steer,
+        build_busy_choice_message_func=build_busy_choice_message,
+        make_busy_choice_view_func=make_busy_choice_view,
     )
 
 
@@ -4935,10 +3503,12 @@ async def send_busy_choice_message(
 
 
 def log_busy_choice_sent(reason: str, target_thread_id: str | None, prompt: str) -> None:
-    safe_reason = reason.replace("\n", " ")[:80]
-    log_line(
-        f"busy_choice_sent reason={safe_reason} target={target_thread_id or '-'} "
-        f"prompt_len={format_log_text_len(prompt)}"
+    discord_busy.log_busy_choice_sent(
+        reason,
+        target_thread_id,
+        prompt,
+        log_func=log_line,
+        format_log_text_len_func=format_log_text_len,
     )
 
 
@@ -4972,12 +3542,24 @@ async def handle_plain_ask(
 ) -> None:
     interactive_state, resolved_thread_id, target_ref = get_interactive_state_for_thread(target_thread_id)
     if interactive_state and resolved_thread_id:
+        normalized_reply = normalize_interactive_text_reply(interactive_state, prompt)
+        if normalized_reply is None:
+            prompt_text = "Pending approval" if interactive_state == INTERACTIVE_STATE_APPROVAL else "Pending input"
+            await send_interactive_prompt(
+                message.channel,
+                resolved_thread_id,
+                target_ref,
+                interactive_state,
+                prompt_text,
+                [],
+            )
+            return
         await submit_interactive_reply(
             message.channel,
             resolved_thread_id,
             target_ref,
             interactive_state,
-            prompt,
+            normalized_reply,
         )
         return
 
@@ -5041,6 +3623,7 @@ async def submit_interactive_reply(
     answer: str,
 ) -> None:
     if state == INTERACTIVE_STATE_APPROVAL:
+        watch_result = make_post_approval_watch_result(target_thread_id)
         exit_code, output = await asyncio.to_thread(submit_approval_reply, target_thread_id, answer)
         log_line(
             f"approval_reply_done exit={exit_code} target={target_thread_id} "
@@ -5049,6 +3632,8 @@ async def submit_interactive_reply(
         )
         title = "Approval submitted" if exit_code == 0 else f"Approval failed (exit {exit_code})"
         await send_chunks(channel, f"{title}\n\n{output or '(no output)'}")
+        if exit_code == 0:
+            await stream_post_approval_result_to_channel(channel, watch_result, target_thread_id)
         return
     if state == INTERACTIVE_STATE_INPUT:
         exit_code, output = await asyncio.to_thread(submit_input_reply, target_thread_id, answer)
@@ -5105,6 +3690,7 @@ class ApprovalView(discord.ui.View):
             f"approval_button user={interaction.user.id} "
             f"answer_len={format_log_text_len(answer)}"
         )
+        watch_result = make_post_approval_watch_result(self.target_thread_id)
         exit_code, output = await asyncio.to_thread(submit_approval_reply, self.target_thread_id, answer)
         log_line(
             f"approval_button_done exit={exit_code} target={self.target_thread_id} "
@@ -5119,6 +3705,12 @@ class ApprovalView(discord.ui.View):
             log_prefix="button_response",
         )
         log_line(f"approval_button_sent exit={exit_code} target={self.target_thread_id}")
+        if exit_code == 0:
+            await stream_post_approval_result_for_interaction(
+                interaction,
+                watch_result,
+                self.target_thread_id,
+            )
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -5440,44 +4032,27 @@ class BusyChoiceView(discord.ui.View):
 
 
 async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, command_line: str) -> None:
-    if not command_line:
+    parsed = discord_commands.split_prefix_command(command_line)
+    if parsed is None:
         await send_chunks(message.channel, build_help())
         return
-    command, _, arg = command_line.partition(" ")
-    command = command.lower().strip()
-    arg = arg.strip()
+    command = parsed.command
+    arg = parsed.arg
 
     if command in {"help", "start"}:
         await send_chunks(message.channel, build_help())
         return
-    if command == "list":
-        limit = str(parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30))
-        await run_bridge_and_send(message.channel, ["list", "--limit", limit], "List")
-        return
-    if command in {"archived_list", "archive_list"}:
-        limit = str(parse_bounded_int_arg(arg, default=10, minimum=1, maximum=50))
-        await run_bridge_and_send(message.channel, ["archived_list", "--limit", limit], "Archived list")
-        return
-    if command == "use":
-        if not arg:
-            await message.channel.send("Usage: !use <ref>")
+    bridge_action = discord_commands.build_prefix_bridge_action(
+        command,
+        arg,
+        message.channel.id,
+        resolve_target_args_func=resolve_discord_thread_target_args,
+    )
+    if bridge_action is not None:
+        if bridge_action.usage:
+            await message.channel.send(bridge_action.usage)
             return
-        await run_bridge_and_send(message.channel, ["use", arg], "Use")
-        return
-    if command in {"open", "open_abort"}:
-        if not arg:
-            await message.channel.send(f"Usage: !{command} <ref>")
-            return
-        argv = ["open"]
-        if command == "open_abort":
-            argv.append("--abort")
-        argv.append(arg)
-        await run_bridge_and_send(message.channel, argv, "Open")
-        return
-    if command == "status":
-        argv = ["status"]
-        argv.extend(resolve_discord_thread_target_args(message.channel.id, arg or None))
-        await run_bridge_and_send(message.channel, argv, "Status")
+        await run_bridge_and_send(message.channel, bridge_action.argv or [], bridge_action.title)
         return
     if command == "doctor":
         await send_chunks(
@@ -5485,12 +4060,6 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
             await build_discord_doctor_message_with_history(bot, message.channel.id, message.channel),
         )
         await run_bridge_and_send(message.channel, ["doctor"], "Doctor")
-        return
-    if command == "discover_codex":
-        await run_bridge_and_send(message.channel, ["discover_codex"], "Codex path")
-        return
-    if command == "restart_codex":
-        await run_bridge_and_send(message.channel, ["restart_codex"], "Codex restart")
         return
     if command == "steer":
         if not discord_qa_commands_enabled():
@@ -5556,17 +4125,29 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
             await send_chunks(message.channel, build_context_message(message.channel.id))
         return
     if command in {"usage", "quota", "limit"}:
-        days = 7
-        if arg:
-            try:
-                days = max(1, min(30, int(arg)))
-            except ValueError:
-                await message.channel.send("Usage: !usage [days]")
-                return
+        usage_action = discord_commands.parse_usage_days(arg)
+        if usage_action.usage:
+            await message.channel.send(usage_action.usage)
+            return
+        days = int(usage_action.limit or 7)
         await send_chunks(message.channel, build_weekly_usage_message(days=days))
         return
     if command in {"runners", "queues"}:
         await send_chunks(message.channel, await build_runners_message())
+        return
+    if command in {"bridge_sync", "resync", "sync"} or command == "bridge":
+        bridge_sync_action = discord_commands.parse_bridge_sync_limit(command, arg)
+        if bridge_sync_action.usage:
+            await message.channel.send(bridge_sync_action.usage)
+            return
+        limit = int(bridge_sync_action.limit or 30)
+        await message.channel.send("Discord bridge sync started.")
+        try:
+            output = await refresh_discord_bridge_session(bot, limit=limit)
+            await send_chunks(message.channel, output)
+        except Exception as exc:
+            log_line("bridge_sync_failed\n" + traceback.format_exc())
+            await send_chunks(message.channel, f"Discord bridge sync failed\n\nERROR: {exc}")
         return
     if command in {"approval", "approve"}:
         target_thread_id = get_mirrored_codex_thread_id(message.channel.id)
@@ -5596,11 +4177,6 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
             [],
         )
         return
-    if command == "archive":
-        argv = ["archive"]
-        argv.extend(resolve_discord_thread_target_args(message.channel.id, arg or None))
-        await run_bridge_and_send(message.channel, argv, "Archive")
-        return
     if command == "delete_archive":
         if not arg:
             await message.channel.send("Usage: !delete_archive <ref>")
@@ -5612,51 +4188,26 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
             f"{prefix}\n\n{output or '(no output)'}\n\nTo actually delete it, run `!confirm_delete_archive <thread_id>`.",
         )
         return
-    if command == "confirm_delete_archive":
-        if not arg:
-            await message.channel.send("Usage: !confirm_delete_archive <ref>")
-            return
-        await run_bridge_and_send(
-            message.channel,
-            ["delete_archive", "--confirm", arg],
-            "Delete archive",
-        )
-        return
     if command == "mirror":
-        subcommand, _, subarg = arg.partition(" ")
-        subcommand = (subcommand or "sync").lower().strip()
-        subarg = subarg.strip()
-        if subcommand == "sync":
-            limit = 30
-            if subarg:
-                try:
-                    limit = max(1, min(100, int(subarg)))
-                except ValueError:
-                    await message.channel.send("Usage: !mirror sync [limit]")
-                    return
+        mirror_action = discord_commands.parse_mirror_action(arg)
+        if mirror_action.usage:
+            await message.channel.send(mirror_action.usage)
+            return
+        if mirror_action.subcommand == "sync":
             await message.channel.send("Mirror sync started.")
             try:
-                output = await sync_codex_mirror(bot, limit=limit)
+                output = await sync_codex_mirror(bot, limit=int(mirror_action.limit or 30))
                 await send_chunks(message.channel, output)
             except Exception as exc:
                 log_line("mirror_sync_failed\n" + traceback.format_exc())
                 await send_chunks(message.channel, f"Mirror sync failed\n\nERROR: {exc}")
             return
-        if subcommand == "list":
-            limit = 30
-            if subarg:
-                try:
-                    limit = max(1, min(100, int(subarg)))
-                except ValueError:
-                    await message.channel.send("Usage: !mirror list [limit]")
-                    return
-            await send_chunks(message.channel, build_mirror_list(limit=limit))
+        if mirror_action.subcommand == "list":
+            await send_chunks(message.channel, build_mirror_list(limit=int(mirror_action.limit or 30)))
             return
-        if subcommand in {"check", "doctor"}:
+        if mirror_action.subcommand == "check":
             await send_chunks(message.channel, build_mirror_check())
             return
-        await message.channel.send("Usage: !mirror sync [limit] | !mirror list [limit] | !mirror check")
-        return
     if command == "qa":
         if not discord_qa_commands_enabled():
             await message.channel.send("Discord QA commands are disabled. Set DISCORD_ENABLE_QA_COMMANDS=1 to enable them.")
@@ -5697,57 +4248,7 @@ async def handle_prefix_command(bot: CodexDiscordBot, message: discord.Message, 
 
 
 def build_help() -> str:
-    slash_commands = [
-        "/help",
-        "/list",
-        "/archived_list",
-        "/use",
-        "/status",
-        "/doctor",
-        "/where",
-        "/context",
-        "/usage",
-        "/runners",
-        "/mirror_check",
-        "/new",
-        "/ask",
-        "/ask_ipc",
-    ]
-    lines = [
-        "Codex Discord commands",
-        "!help",
-        "!list [limit]",
-        "!archived_list [limit]  (alias: !archive_list)",
-        "!use <ref>",
-        "!open <ref>",
-        "!open_abort <ref>",
-        "!status [ref]",
-        "!doctor",
-        "!discover_codex",
-        "!restart_codex",
-        "!chatid",
-        "!where",
-        "!context [all]",
-        "!usage [days]",
-        "!runners",
-        "!mirror sync [limit]",
-        "!mirror list [limit]",
-        "!mirror check",
-        "!approval",
-        "!archive [ref]",
-        "!delete_archive <ref>",
-        "!confirm_delete_archive <ref>",
-        "!new <prompt>  (create a new Codex thread with the first prompt)",
-        "!ask <prompt>",
-        "",
-        "Plain messages in mirrored Discord threads are sent to that Codex thread.",
-    ]
-    if discord_qa_commands_enabled():
-        lines.insert(lines.index("!approval"), "!qa buttons")
-        lines.insert(lines.index("!qa buttons") + 1, "!steer <prompt>  (QA-only text path for Steer now)")
-        slash_commands.insert(slash_commands.index("/new"), "/qa_buttons")
-    lines.append(f"Slash commands: {', '.join(slash_commands)}.")
-    return "\n".join(lines)
+    return discord_help.build_help(qa_commands_enabled=discord_qa_commands_enabled())
 
 
 def register_commands(bot: CodexDiscordBot) -> None:
@@ -5767,7 +4268,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
         await interaction.response.defer(thinking=True)
         await run_interaction_bridge_and_send(
             interaction,
-            ["list", "--limit", str(max(1, min(30, limit)))],
+            discord_commands.build_list_argv(limit, default=10, maximum=30),
             "List",
         )
 
@@ -5779,7 +4280,7 @@ def register_commands(bot: CodexDiscordBot) -> None:
         await interaction.response.defer(thinking=True)
         await run_interaction_bridge_and_send(
             interaction,
-            ["archived_list", "--limit", str(max(1, min(50, limit)))],
+            discord_commands.build_archived_list_argv(limit, default=10, maximum=50),
             "Archived list",
         )
 
@@ -5797,8 +4298,11 @@ def register_commands(bot: CodexDiscordBot) -> None:
             await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        argv = ["status"]
-        argv.extend(resolve_discord_thread_target_args(interaction.channel_id, ref or None))
+        argv = discord_commands.build_status_argv(
+            interaction.channel_id,
+            ref or None,
+            resolve_target_args_func=resolve_discord_thread_target_args,
+        )
         await run_interaction_bridge_and_send(interaction, argv, "Status")
 
     @bot.tree.command(name="doctor", description="Run Codex bridge diagnostics.")
@@ -5883,6 +4387,20 @@ def register_commands(bot: CodexDiscordBot) -> None:
             return
         await interaction.response.defer(thinking=True)
         await send_interaction_chunks(interaction, build_mirror_check(), title="Mirror check")
+
+    @bot.tree.command(name="bridge_sync", description="Refresh Codex bridge state and Discord mirror.")
+    async def slash_bridge_sync(interaction: discord.Interaction, limit: int = 30) -> None:
+        if not check_interaction_allowed(bot, interaction):
+            await interaction.response.send_message("This channel/user is not allowed.", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        bounded_limit = max(1, min(100, int(limit)))
+        try:
+            output = await refresh_discord_bridge_session(bot, limit=bounded_limit)
+        except Exception as exc:
+            log_line("slash_bridge_sync_failed\n" + traceback.format_exc())
+            output = f"Discord bridge sync failed\n\nERROR: {exc}"
+        await send_interaction_chunks(interaction, output, title="Bridge sync")
 
     if discord_qa_commands_enabled():
         @bot.tree.command(name="qa_buttons", description="Run Discord button QA smoke.")

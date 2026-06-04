@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 try:
     import winreg
@@ -521,8 +521,7 @@ def collapse_list_text(value: str, limit: int = 70) -> str:
 
 
 def make_console_safe_text(value: str) -> str:
-    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    return value.encode(encoding, errors="replace").decode(encoding)
+    return "" if value is None else str(value)
 
 
 def format_title_preview(value: str, limit: int = 120) -> str:
@@ -3225,6 +3224,24 @@ def wait_for_prompt_delivery(
     return None
 
 
+def emit_watch_stream_block(
+    marker: str,
+    text: str,
+    *,
+    stream_label: str = "",
+    stream_callback: Callable[[str], None] | None = None,
+) -> None:
+    prefix = f"{stream_label} " if stream_label else ""
+    lines = [f"{prefix}{marker}", *str(text or "").splitlines(), ""]
+    if stream_callback is not None:
+        for line in lines:
+            stream_callback(line)
+        return
+    with PRINT_LOCK:
+        for line in lines:
+            print(line)
+
+
 def watch_for_final_answer(
     session_path: Path,
     start_offset: int,
@@ -3232,6 +3249,7 @@ def watch_for_final_answer(
     include_commentary: bool,
     stream_live: bool = False,
     stream_label: str = "",
+    stream_callback: Callable[[str], None] | None = None,
 ) -> dict:
     deadline = time.time() + timeout_sec if timeout_sec > 0 else None
     cursor = start_offset
@@ -3259,11 +3277,12 @@ def watch_for_final_answer(
                         commentary.append(message)
                         if stream_live:
                             did_stream_live = True
-                            with PRINT_LOCK:
-                                prefix = f"{stream_label} " if stream_label else ""
-                                print(f"{prefix}[commentary]")
-                                print(message)
-                                print("")
+                            emit_watch_stream_block(
+                                "[commentary]",
+                                message,
+                                stream_label=stream_label,
+                                stream_callback=stream_callback,
+                            )
                 continue
 
             if event.get("type") == "event_msg" and payload.get("type") in {"turn_aborted", "task_aborted", "task_cancelled"}:
@@ -3285,11 +3304,12 @@ def watch_for_final_answer(
                     commentary.append(notice)
                     if stream_live:
                         did_stream_live = True
-                        with PRINT_LOCK:
-                            prefix = f"{stream_label} " if stream_label else ""
-                            print(f"{prefix}[commentary]")
-                            print(notice)
-                            print("")
+                        emit_watch_stream_block(
+                            "[commentary]",
+                            notice,
+                            stream_label=stream_label,
+                            stream_callback=stream_callback,
+                        )
                 continue
 
             if payload.get("type") == "function_call_output":
@@ -3301,11 +3321,12 @@ def watch_for_final_answer(
                         commentary.append(notice)
                         if stream_live:
                             did_stream_live = True
-                            with PRINT_LOCK:
-                                prefix = f"{stream_label} " if stream_label else ""
-                                print(f"{prefix}[commentary]")
-                                print(notice)
-                                print("")
+                            emit_watch_stream_block(
+                                "[commentary]",
+                                notice,
+                                stream_label=stream_label,
+                                stream_callback=stream_callback,
+                            )
                 continue
 
             if payload.get("type") != "message":
@@ -3324,11 +3345,12 @@ def watch_for_final_answer(
                 if stream_live:
                     did_stream_live = True
                     did_stream_final_live = True
-                    with PRINT_LOCK:
-                        prefix = f"{stream_label} " if stream_label else ""
-                        print(f"{prefix}[final_answer]")
-                        print(final_answer)
-                        print("")
+                    emit_watch_stream_block(
+                        "[final_answer]",
+                        final_answer,
+                        stream_label=stream_label,
+                        stream_callback=stream_callback,
+                    )
                 return {
                     "status": "final",
                     "commentary": commentary,
@@ -3342,11 +3364,12 @@ def watch_for_final_answer(
                     commentary.append(text)
                     if stream_live:
                         did_stream_live = True
-                        with PRINT_LOCK:
-                            prefix = f"{stream_label} " if stream_label else ""
-                            print(f"{prefix}[commentary]")
-                            print(text)
-                            print("")
+                        emit_watch_stream_block(
+                            "[commentary]",
+                            text,
+                            stream_label=stream_label,
+                            stream_callback=stream_callback,
+                        )
 
         time.sleep(0.35)
 
@@ -5931,7 +5954,7 @@ def build_parser() -> argparse.ArgumentParser:
     new_parser.add_argument(
         "--create-timeout",
         type=float,
-        default=8.0,
+        default=30.0,
         help="How long to wait for the newly created thread to appear in local state after sending a prompt.",
     )
     new_parser.set_defaults(func=command_new)

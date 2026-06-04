@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import codex_discord_bot as bot
+import codex_discord_commands as commands
 import codex_desktop_bridge as bridge
 
 
@@ -331,6 +332,33 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outputs["a"], (0, "a:start\na:end", ["a:start", "a:end"]))
         self.assertEqual(outputs["b"], (0, "b:start\nb:end", ["b:start", "b:end"]))
+
+    def test_bridge_stream_forces_utf8_child_output(self) -> None:
+        original_get_bridge_script_path = bot.get_bridge_script_path
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "bridge_utf8_child.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "from __future__ import annotations",
+                        "import os",
+                        "print(os.environ.get('PYTHONIOENCODING', '-'))",
+                        "print(os.environ.get('PYTHONUTF8', '-'))",
+                        "print('\\ud55c\\uae00 approval\\ud14c\\uc2a4\\ud2b8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            lines: list[str] = []
+            try:
+                bot.get_bridge_script_path = lambda: script_path
+                exit_code, output = bot.run_bridge_command_stream([], lines.append)
+            finally:
+                bot.get_bridge_script_path = original_get_bridge_script_path
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(lines, ["utf-8", "1", "\ud55c\uae00 approval\ud14c\uc2a4\ud2b8"])
+        self.assertEqual(output, "\n".join(lines))
 
     def test_choice_views_claim_once_and_disable_buttons(self) -> None:
         approval_view = bot.ApprovalView("thread-1")
@@ -1650,6 +1678,7 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             "usage",
             "runners",
             "mirror_check",
+            "bridge_sync",
             "new",
             "ask",
             "ask_ipc",
@@ -2224,6 +2253,61 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.build_context_warning = original_build_context_warning
             bot.is_thread_runner_busy = original_is_thread_runner_busy
 
+    async def test_pending_approval_plain_text_refreshes_buttons_without_submitting(self) -> None:
+        original_get_interactive_state = bot.get_interactive_state_for_thread
+        original_submit_interactive_reply = bot.submit_interactive_reply
+        submitted: list[str] = []
+        try:
+            bot.get_interactive_state_for_thread = lambda target_thread_id: (
+                bot.INTERACTIVE_STATE_APPROVAL,
+                "thread-1",
+                "project:1",
+            )
+
+            async def fake_submit(*args):
+                submitted.append(str(args[-1]))
+
+            bot.submit_interactive_reply = fake_submit
+            message = FakeMessage()
+
+            await bot.handle_plain_ask(message, "new steering request", target_thread_id="thread-1")
+
+            self.assertEqual(submitted, [])
+            self.assertEqual(len(message.channel.messages), 1)
+            content, view = message.channel.messages[0]
+            self.assertIn("Waiting approval", content)
+            self.assertIn("Pending approval", content)
+            self.assertIsInstance(view, bot.ApprovalView)
+            self.assertEqual(view.target_thread_id, "thread-1")
+        finally:
+            bot.get_interactive_state_for_thread = original_get_interactive_state
+            bot.submit_interactive_reply = original_submit_interactive_reply
+
+    async def test_pending_approval_plain_numeric_reply_still_submits(self) -> None:
+        original_get_interactive_state = bot.get_interactive_state_for_thread
+        original_submit_interactive_reply = bot.submit_interactive_reply
+        submitted: list[str] = []
+        try:
+            bot.get_interactive_state_for_thread = lambda target_thread_id: (
+                bot.INTERACTIVE_STATE_APPROVAL,
+                "thread-1",
+                "project:1",
+            )
+
+            async def fake_submit(channel, target_thread_id, target_ref, state, answer):
+                submitted.append(answer)
+
+            bot.submit_interactive_reply = fake_submit
+            message = FakeMessage()
+
+            await bot.handle_plain_ask(message, "approve", target_thread_id="thread-1")
+
+            self.assertEqual(submitted, ["1"])
+            self.assertEqual(message.channel.messages, [])
+        finally:
+            bot.get_interactive_state_for_thread = original_get_interactive_state
+            bot.submit_interactive_reply = original_submit_interactive_reply
+
     async def test_prefix_steer_sends_prompt_without_button_click(self) -> None:
         original_get_mirrored = bot.get_mirrored_codex_thread_id
         original_run_steering = bot.run_steering_prompt
@@ -2281,6 +2365,71 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             message.channel.messages,
             [("Discord QA steering is disabled. Set DISCORD_ENABLE_QA_COMMANDS=1 to enable it.", None)],
         )
+
+    async def test_prefix_bridge_sync_runs_refresh(self) -> None:
+        original_refresh = bot.refresh_discord_bridge_session
+        calls: list[tuple[object, int]] = []
+        try:
+            async def fake_refresh(fake_bot, *, limit=30):
+                calls.append((fake_bot, limit))
+                return "Discord bridge sync complete.\nselected_action: kept"
+
+            bot.refresh_discord_bridge_session = fake_refresh
+            message = FakeMessage()
+            fake_bot = SimpleNamespace()
+
+            await bot.handle_prefix_command(fake_bot, message, "bridge sync 17")
+
+            self.assertEqual(calls, [(fake_bot, 17)])
+            self.assertEqual(
+                message.channel.messages,
+                [
+                    ("Discord bridge sync started.", None),
+                    ("Discord bridge sync complete.\nselected_action: kept", None),
+                ],
+            )
+        finally:
+            bot.refresh_discord_bridge_session = original_refresh
+
+    def test_refresh_codex_bridge_session_state_replaces_stale_selected_thread(self) -> None:
+        original_sync_session_index = bridge.sync_session_index_with_state
+        original_load_recent_threads = bridge.load_recent_threads
+        original_get_selected_thread_id = bridge.get_selected_thread_id
+        original_choose_thread = bridge.choose_thread
+        original_set_selected_thread_id = bridge.set_selected_thread_id
+        original_get_thread_workspace_ref = bridge.get_thread_workspace_ref
+        selected_updates: list[str | None] = []
+        try:
+            thread = bridge.ThreadInfo(
+                id="thread-1",
+                title="title",
+                cwd="C:\\repo",
+                updated_at=1,
+                rollout_path="session.jsonl",
+                model="gpt",
+                reasoning_effort="high",
+                tokens_used=1,
+            )
+            bridge.sync_session_index_with_state = lambda: 1
+            bridge.load_recent_threads = lambda limit=0: [thread]
+            bridge.get_selected_thread_id = lambda: "stale-thread"
+            bridge.choose_thread = lambda thread_id=None, cwd=None: thread
+            bridge.set_selected_thread_id = lambda thread_id: selected_updates.append(thread_id)
+            bridge.get_thread_workspace_ref = lambda selected, threads=None: "repo"
+
+            state = bot.refresh_codex_bridge_session_state()
+
+            self.assertEqual(state["selected_action"], "stale_replaced")
+            self.assertEqual(state["selected_thread_id"], "thread-1")
+            self.assertEqual(state["selected_ref"], "repo")
+            self.assertEqual(selected_updates, ["thread-1"])
+        finally:
+            bridge.sync_session_index_with_state = original_sync_session_index
+            bridge.load_recent_threads = original_load_recent_threads
+            bridge.get_selected_thread_id = original_get_selected_thread_id
+            bridge.choose_thread = original_choose_thread
+            bridge.set_selected_thread_id = original_set_selected_thread_id
+            bridge.get_thread_workspace_ref = original_get_thread_workspace_ref
 
     async def test_ask_busy_failure_shows_busy_choice_view(self) -> None:
         original_resolve_target_ref = bot.resolve_target_ref
@@ -2396,6 +2545,47 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(message.channel.messages, [])
             self.assertIn("ask_stream_suppressed_after_steering target=thread-1", log_text)
+        finally:
+            bot.STEERING_HANDOFFS.clear()
+            bot.STEERING_HANDOFFS.update(old_handoffs)
+            bot.resolve_target_ref = original_resolve_target_ref
+            bot.run_ask_stream = original_run_ask_stream
+
+    async def test_ask_stream_commentary_is_not_suppressed_after_steering_handoff(self) -> None:
+        original_resolve_target_ref = bot.resolve_target_ref
+        original_run_ask_stream = bot.run_ask_stream
+        old_handoffs = dict(bot.STEERING_HANDOFFS)
+        try:
+            bot.STEERING_HANDOFFS.clear()
+            bot.resolve_target_ref = lambda target_thread_id: (target_thread_id, "taxlab:1")
+
+            def fake_run_ask_stream(prompt, relay, *, force_while_busy=False, wait=True, target_thread_id=None):
+                bot.mark_steering_handoff(target_thread_id)
+                relay.feed_line("[commentary]")
+                relay.feed_line("checking live relay")
+                relay.feed_line("[ready]")
+                relay.finish()
+                return 0, "[commentary]\nchecking live relay\n\n[ready]"
+
+            bot.run_ask_stream = fake_run_ask_stream
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                message = FakeMessage()
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    await bot.run_prompt_and_send(
+                        message.channel,
+                        "please steer",
+                        ack_sent=True,
+                        source_message=message,
+                        target_thread_id="thread-1",
+                    )
+                log_text = log_path.read_text(encoding="utf-8")
+
+            sent = [content for content, _view in message.channel.messages]
+            self.assertEqual(sent, ["In progress\n\nchecking live relay"])
+            self.assertNotIn("discord_relay_suppressed_after_steering target=thread-1 mode=commentary", log_text)
+            self.assertIn("ask_stream_suppressed_after_steering target=thread-1 sent_live=True", log_text)
         finally:
             bot.STEERING_HANDOFFS.clear()
             bot.STEERING_HANDOFFS.update(old_handoffs)
@@ -2827,6 +3017,50 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.run_steering_watch_stream = original_run_watch
 
+    async def test_post_approval_watch_streams_final_after_steering_handoff(self) -> None:
+        original_run_watch = bot.run_steering_watch_stream
+        old_handoffs = dict(bot.STEERING_HANDOFFS)
+        try:
+            bot.STEERING_HANDOFFS.clear()
+
+            def fake_run_watch(watch_result, relay, *, timeout_sec=0):
+                bot.mark_steering_handoff("thread-1")
+                relay.feed_line("[final_answer]")
+                relay.feed_line("approved follow-up")
+                relay.feed_line("[ready]")
+                relay.finish()
+                return 0, "[final_answer]\napproved follow-up\n\n[ready]"
+
+            bot.run_steering_watch_stream = fake_run_watch
+            target = FakeTarget()
+            watch_result = bot.SteeringPromptResult(
+                0,
+                "[approval_submitted]",
+                target_thread_id="thread-1",
+                target_ref="project:1",
+                session_path="session.jsonl",
+                start_offset=10,
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                log_path = Path(temp_dir) / "discord-smoke.log"
+                with EnvPatch("CODEX_DISCORD_LOG_PATH", str(log_path)):
+                    streamed = await bot.stream_post_approval_result_to_channel(
+                        target,
+                        watch_result,
+                        "thread-1",
+                    )
+                log_text = log_path.read_text(encoding="utf-8")
+
+            self.assertTrue(streamed)
+            self.assertEqual(target.messages, [("approved follow-up", None)])
+            self.assertIn("approval_followup_watch_done exit=0 target=thread-1", log_text)
+            self.assertNotIn("discord_relay_suppressed_after_steering", log_text)
+        finally:
+            bot.STEERING_HANDOFFS.clear()
+            bot.STEERING_HANDOFFS.update(old_handoffs)
+            bot.run_steering_watch_stream = original_run_watch
+
     async def test_steering_watch_suppresses_timeout_failure(self) -> None:
         original_run_watch = bot.run_steering_watch_stream
         try:
@@ -3074,6 +3308,53 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.submit_approval_reply = original_submit_approval_reply
 
+    async def test_approval_button_starts_post_approval_watch(self) -> None:
+        original_submit_approval_reply = bot.submit_approval_reply
+        original_make_watch = bot.make_post_approval_watch_result
+        original_stream_watch = bot.stream_post_approval_result_for_interaction
+        calls: list[tuple[str, object, object | None]] = []
+        watch_result = bot.SteeringPromptResult(
+            0,
+            "[approval_submitted]",
+            target_thread_id="thread-1",
+            target_ref="project:1",
+            session_path="session.jsonl",
+            start_offset=10,
+        )
+        try:
+            def fake_submit_approval_reply(target_thread_id, answer):
+                return 0, "approved"
+
+            def fake_make_watch(target_thread_id):
+                calls.append(("make", target_thread_id, None))
+                return watch_result
+
+            async def fake_stream_watch(interaction, watch, target_thread_id):
+                calls.append(("stream", target_thread_id, watch))
+                return True
+
+            bot.submit_approval_reply = fake_submit_approval_reply
+            bot.make_post_approval_watch_result = fake_make_watch
+            bot.stream_post_approval_result_for_interaction = fake_stream_watch
+            interaction = FakeInteraction(command_name="approval", channel_id=222)
+            view = bot.ApprovalView("thread-1")
+            button = next(item for item in view.children if getattr(item, "label", "") == "Approve")
+
+            await button.callback(interaction)
+
+            self.assertEqual(interaction.followup.messages, ["Approval submitted\n\napproved"])
+            self.assertEqual(
+                calls,
+                [
+                    ("make", "thread-1", None),
+                    ("stream", "thread-1", watch_result),
+                ],
+            )
+        finally:
+            bot.submit_approval_reply = original_submit_approval_reply
+            bot.make_post_approval_watch_result = original_make_watch
+            bot.stream_post_approval_result_for_interaction = original_stream_watch
+
     async def test_plain_approval_reply_log_uses_answer_length(self) -> None:
         original_submit_approval_reply = bot.submit_approval_reply
         try:
@@ -3210,6 +3491,92 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.build_context_warning = original_build_context_warning
             bot.enqueue_thread_ask = original_enqueue_thread_ask
 
+    async def test_run_prompt_flow_sends_ask_start_repeatback(self) -> None:
+        original_get_thread_runner = bot.get_thread_runner
+        original_build_context_warning = bot.build_context_warning
+        original_enqueue_thread_ask = bot.enqueue_thread_ask
+        calls: list[tuple[str, str | None, bool]] = []
+        try:
+            async def fake_get_thread_runner(target_thread_id):
+                return {"active": False, "queue": asyncio.Queue()}
+
+            async def fake_enqueue_thread_ask(
+                channel,
+                prompt,
+                target_thread_id,
+                *,
+                queued=False,
+                ack_sent=False,
+                source_message=None,
+            ):
+                calls.append((prompt, target_thread_id, ack_sent))
+                return 1
+
+            bot.get_thread_runner = fake_get_thread_runner
+            bot.build_context_warning = lambda target_thread_id: ""
+            bot.enqueue_thread_ask = fake_enqueue_thread_ask
+            channel = FakeTarget()
+
+            await bot.run_prompt_flow(
+                channel,
+                "First sentence. second sentence\nthird line",
+                target_thread_id="thread-1",
+            )
+
+            self.assertEqual(
+                channel.messages,
+                [("Ask started.\nheard: First sentence.", None)],
+            )
+            self.assertEqual(calls, [("First sentence. second sentence\nthird line", "thread-1", True)])
+        finally:
+            bot.get_thread_runner = original_get_thread_runner
+            bot.build_context_warning = original_build_context_warning
+            bot.enqueue_thread_ask = original_enqueue_thread_ask
+
+    async def test_thread_runner_accepts_send_capable_channel(self) -> None:
+        original_run_prompt_and_send = bot.run_prompt_and_send
+        calls: list[tuple[object, str, str | None, bool]] = []
+        target_thread_id = "duck-channel-thread"
+        try:
+            async def fake_run_prompt_and_send(
+                channel,
+                prompt,
+                *,
+                queued=False,
+                ack_sent=False,
+                source_message=None,
+                target_thread_id=None,
+            ):
+                calls.append((channel, prompt, target_thread_id, ack_sent))
+
+            bot.run_prompt_and_send = fake_run_prompt_and_send
+            channel = FakeTarget()
+
+            await bot.enqueue_thread_ask(
+                channel,
+                "hello",
+                target_thread_id,
+                ack_sent=True,
+            )
+            runner = await bot.get_thread_runner(target_thread_id)
+            queue = runner["queue"]
+            self.assertIsInstance(queue, asyncio.Queue)
+            await asyncio.wait_for(queue.join(), timeout=1)
+
+            self.assertEqual(calls, [(channel, "hello", target_thread_id, True)])
+        finally:
+            bot.run_prompt_and_send = original_run_prompt_and_send
+            runner = await bot.get_thread_runner(target_thread_id)
+            task = runner.get("task")
+            if isinstance(task, asyncio.Task) and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            async with bot.THREAD_RUNNERS_LOCK:
+                bot.THREAD_RUNNERS.pop(bot.normalize_runner_key(target_thread_id), None)
+
     async def test_interactive_approval_prompt_with_view_is_truncated(self) -> None:
         channel = FakeTarget()
         await bot.send_interactive_prompt(
@@ -3239,6 +3606,44 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.build_context_warning = original_build_context_warning
 
+    def test_prefix_bridge_action_builds_shared_argv(self) -> None:
+        def fake_resolve(channel_id, ref):
+            return ["--target", f"{channel_id}:{ref or '-'}"]
+
+        status = commands.build_prefix_bridge_action(
+            "status",
+            "abc",
+            222,
+            resolve_target_args_func=fake_resolve,
+        )
+        open_abort = commands.build_prefix_bridge_action(
+            "open_abort",
+            "taxlab:1",
+            222,
+            resolve_target_args_func=fake_resolve,
+        )
+        missing_use = commands.build_prefix_bridge_action(
+            "use",
+            "",
+            222,
+            resolve_target_args_func=fake_resolve,
+        )
+        confirm_delete = commands.build_prefix_bridge_action(
+            "confirm_delete_archive",
+            "thread-1",
+            222,
+            resolve_target_args_func=fake_resolve,
+        )
+
+        self.assertEqual(status.argv, ["status", "--target", "222:abc"])
+        self.assertEqual(open_abort.argv, ["open", "--abort", "taxlab:1"])
+        self.assertEqual(missing_use.usage, "Usage: !use <ref>")
+        self.assertEqual(confirm_delete.argv, ["delete_archive", "--confirm", "thread-1"])
+        self.assertEqual(commands.parse_usage_days("bad").usage, "Usage: !usage [days]")
+        self.assertEqual(commands.parse_bridge_sync_limit("bridge", "bad 1").usage, "Usage: !bridge sync [limit]")
+        self.assertEqual(commands.parse_mirror_action("sync bad").usage, "Usage: !mirror sync [limit]")
+        self.assertEqual(commands.parse_mirror_action("doctor").subcommand, "check")
+
     async def test_archive_list_alias_routes_to_archived_list(self) -> None:
         original_run_bridge_and_send = bot.run_bridge_and_send
         calls: list[tuple[list[str], str]] = []
@@ -3254,6 +3659,25 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             await bot.handle_prefix_command(None, message, "archive_list 5")
 
             self.assertEqual(calls, [(["archived_list", "--limit", "5"], "Archived list")])
+            self.assertEqual(message.channel.messages, [("ok", None)])
+        finally:
+            bot.run_bridge_and_send = original_run_bridge_and_send
+
+    async def test_prefix_open_abort_routes_to_shared_bridge_action(self) -> None:
+        original_run_bridge_and_send = bot.run_bridge_and_send
+        calls: list[tuple[list[str], str]] = []
+
+        async def fake_run_bridge_and_send(target, argv, title, failure_title=None):
+            calls.append((argv, title))
+            await target.send("ok")
+            return 0, "ok"
+
+        try:
+            bot.run_bridge_and_send = fake_run_bridge_and_send
+            message = FakeMessage()
+            await bot.handle_prefix_command(None, message, "open_abort taxlab:1")
+
+            self.assertEqual(calls, [(["open", "--abort", "taxlab:1"], "Open")])
             self.assertEqual(message.channel.messages, [("ok", None)])
         finally:
             bot.run_bridge_and_send = original_run_bridge_and_send
@@ -3374,6 +3798,84 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
             bot.resolve_discord_new_thread_cwd = original_resolve_cwd
             bot.run_bridge_command = original_run_bridge_command
             bot.mirror_single_codex_thread = original_mirror_single
+
+    def test_bridge_new_default_timeout_handles_slow_local_state_persistence(self) -> None:
+        original_load_recent_threads = bridge.load_recent_threads
+        original_spawn_runner = bridge.spawn_background_new_thread_runner
+        original_resolve_cwd = bridge.resolve_new_thread_cwd
+        original_wait_delivery = bridge.wait_for_prompt_delivery
+        original_set_selected = bridge.set_selected_thread_id
+        original_sync_session_index = bridge.sync_session_index_with_state
+        original_time = bridge.time.time
+        original_sleep = bridge.time.sleep
+
+        class FakeRunner:
+            pid = 1234
+
+            def poll(self) -> None:
+                return None
+
+        selected_ids: list[str] = []
+        clock = {"now": 0.0}
+        old_thread = bridge.ThreadInfo(
+            id="old-thread",
+            title="old",
+            cwd=r"C:\project",
+            updated_at=1,
+            rollout_path="",
+            model="",
+            reasoning_effort="",
+            tokens_used=0,
+        )
+
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+                session_path = Path(temp_dir) / "session.jsonl"
+                session_path.write_text("", encoding="utf-8")
+                new_thread = bridge.ThreadInfo(
+                    id="new-thread",
+                    title="new",
+                    cwd=str(Path(temp_dir)),
+                    updated_at=2,
+                    rollout_path=str(session_path),
+                    model="",
+                    reasoning_effort="",
+                    tokens_used=0,
+                )
+
+                def fake_load_recent_threads(limit=20):
+                    if clock["now"] >= 9.0:
+                        return [new_thread, old_thread]
+                    return [old_thread]
+
+                bridge.load_recent_threads = fake_load_recent_threads
+                bridge.spawn_background_new_thread_runner = lambda prompt, cwd: FakeRunner()
+                bridge.resolve_new_thread_cwd = lambda cwd: str(Path(temp_dir))
+                bridge.wait_for_prompt_delivery = lambda session_offsets, prompt, timeout_sec=4.0: new_thread
+                bridge.set_selected_thread_id = selected_ids.append
+                bridge.sync_session_index_with_state = lambda: 2
+                bridge.time.time = lambda: clock["now"]
+                bridge.time.sleep = lambda seconds: clock.__setitem__("now", clock["now"] + seconds)
+
+                args = bridge.build_parser().parse_args(["new", "--cwd", str(Path(temp_dir)), "start here"])
+                self.assertEqual(args.create_timeout, 30.0)
+
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    exit_code = bridge.command_new(args)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(selected_ids, ["new-thread"])
+            self.assertIn("target_thread: new-thread", stdout.getvalue())
+        finally:
+            bridge.load_recent_threads = original_load_recent_threads
+            bridge.spawn_background_new_thread_runner = original_spawn_runner
+            bridge.resolve_new_thread_cwd = original_resolve_cwd
+            bridge.wait_for_prompt_delivery = original_wait_delivery
+            bridge.set_selected_thread_id = original_set_selected
+            bridge.sync_session_index_with_state = original_sync_session_index
+            bridge.time.time = original_time
+            bridge.time.sleep = original_sleep
 
     async def test_slash_new_dispatch_logs_and_sends_response(self) -> None:
         original_run_discord_new_thread = bot.run_discord_new_thread
@@ -3825,6 +4327,38 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(relay.quiet_notice_sent)
         self.assertTrue(relay.sent_live)
 
+    async def test_discord_ask_relay_preserves_send_order(self) -> None:
+        original_send_chunks = bot.send_chunks
+        sent: list[str] = []
+        try:
+            async def fake_send_chunks(channel, text):
+                if str(text).startswith("In progress"):
+                    await asyncio.sleep(0.05)
+                sent.append(text)
+
+            bot.send_chunks = fake_send_chunks
+            target = FakeTarget()
+            relay = bot.DiscordAskRelay(
+                asyncio.get_running_loop(),
+                target,
+                "thread-1",
+                "project:1",
+                quiet_notice_delay_sec=-1,
+            )
+
+            relay.feed_line("[commentary]")
+            relay.feed_line("checking order")
+            relay.feed_line("[final_answer]")
+            relay.feed_line("done")
+            relay.feed_line("[ready]")
+            await asyncio.to_thread(relay.finish)
+
+            self.assertEqual(sent, ["In progress\n\nchecking order", "done"])
+            self.assertTrue(relay.sent_live)
+            self.assertTrue(relay.saw_final)
+        finally:
+            bot.send_chunks = original_send_chunks
+
     async def test_steering_watch_streams_final_to_discord_relay(self) -> None:
         original_watch_for_final_answer = bridge.watch_for_final_answer
         try:
@@ -3835,7 +4369,11 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
                 include_commentary,
                 stream_live=False,
                 stream_label="",
+                stream_callback=None,
             ):
+                if stream_live and stream_callback is not None:
+                    for line in ["[final_answer]", "steered done", ""]:
+                        stream_callback(line)
                 return {
                     "status": "final",
                     "commentary": [],
@@ -3871,6 +4409,64 @@ class DiscordBotHelperTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(target.messages, [("steered done", None)])
+            self.assertTrue(relay.sent_live)
+            self.assertTrue(relay.saw_final)
+        finally:
+            bridge.watch_for_final_answer = original_watch_for_final_answer
+
+    async def test_steering_watch_streams_commentary_to_discord_relay(self) -> None:
+        original_watch_for_final_answer = bridge.watch_for_final_answer
+        try:
+            def fake_watch_for_final_answer(
+                session_path,
+                start_offset,
+                timeout_sec,
+                include_commentary,
+                stream_live=False,
+                stream_label="",
+                stream_callback=None,
+            ):
+                if stream_live and stream_callback is not None:
+                    for line in ["[commentary]", "checking files", "", "[final_answer]", "done", ""]:
+                        stream_callback(line)
+                return {
+                    "status": "final",
+                    "commentary": ["checking files"],
+                    "final_answer": "done",
+                    "streamed_live": True,
+                    "final_streamed_live": True,
+                }
+
+            bridge.watch_for_final_answer = fake_watch_for_final_answer
+            target = FakeTarget()
+            relay = bot.DiscordAskRelay(
+                asyncio.get_running_loop(),
+                target,
+                "thread-1",
+                "project:1",
+                quiet_notice_delay_sec=0.05,
+            )
+            steering_result = bot.SteeringPromptResult(
+                0,
+                "Steering sent",
+                target_thread_id="thread-1",
+                target_ref="project:1",
+                session_path="session.jsonl",
+                start_offset=10,
+            )
+
+            exit_code, _output = await asyncio.to_thread(
+                bot.run_steering_watch_stream,
+                steering_result,
+                relay,
+                timeout_sec=1,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                target.messages,
+                [("In progress\n\nchecking files", None), ("done", None)],
+            )
             self.assertTrue(relay.sent_live)
             self.assertTrue(relay.saw_final)
         finally:

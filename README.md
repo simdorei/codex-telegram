@@ -212,7 +212,7 @@ Useful Discord commands:
 
 Registered Discord slash commands:
 
-- `/help`, `/list`, `/archived_list`, `/use`, `/status`, `/doctor`, `/where`, `/context`, `/usage`, `/runners`, `/mirror_check`, `/new`, `/ask`, `/ask_ipc`
+- `/help`, `/list`, `/archived_list`, `/use`, `/status`, `/doctor`, `/where`, `/context`, `/usage`, `/runners`, `/mirror_check`, `/bridge_sync`, `/new`, `/ask`, `/ask_ipc`
 
 Optional Discord QA commands:
 

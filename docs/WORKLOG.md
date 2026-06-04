@@ -2349,3 +2349,44 @@
 - Remaining live check:
   - With `DISCORD_ENABLE_QA_COMMANDS=1` in a test environment, send `!steer <prompt>` through the focused Discord composer to verify the text steering path end-to-end.
   - The main product path remains plain Discord message -> busy choice -> `Steer now` button. The text command is only a QA/diagnostic fallback.
+
+## 2026-06-04 03:28 +09:00 - Chrome extension live Discord QA completed
+- Goal: prove the normal Discord frontend path works through the user's logged-in Chrome Discord session, not a synthetic server-only path.
+- Live findings:
+  - The Codex Chrome Extension backend is usable with the logged-in Chrome profile `현주`.
+  - Claimed the live Discord web tab for mirrored thread `1511713799386693695`.
+  - EXT-1 sent a real user-account Discord message, clicked `Steer now`, and received final `EXT-1`.
+  - EXT-2 clicked `Steer now` twice quickly; logs showed one component interaction and one steering handoff, with final `EXT-2`.
+  - EXT-3 sent a post-restart busy message and clicked `Ignore`; Discord showed `Ignored.`.
+  - EXT-4 created a busy-choice message, restarted the bot, then clicked the pre-restart `Ignore` button; logs showed `busy_choice_persistent_ignore` and component cleanup.
+- Changes:
+  - Hardened busy-choice handling so rejected non-allowed `Steer now` attempts do not claim the record before `Queue next` can be used.
+  - Added/kept regression coverage for duplicate persistent `Steer now`, disabled steering that preserves queue, persistent approval/input single-use claims, and restart stale-view handlers.
+  - Restart cleanup removes stale busy-choice components only when no active DB record remains.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (111 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - `git diff --check` returned no whitespace errors; only CRLF conversion warnings for Windows files.
+  - Restarted the `Codex Discord Bot` scheduled task; final state was `Running`.
+  - Committed as `749ce15 Stabilize Discord Codex wrapper QA`.
+- Remaining risk:
+  - Real approval/input prompt UX was not live-triggered because `DISCORD_ENABLE_QA_COMMANDS` is disabled in the current runtime, but the persistent approval/input restart and duplicate-click paths are covered by unit tests.
+  - `dev` is one commit ahead of `origin/dev`; push/PR is still pending.
+
+## 2026-06-04 13:22 +09:00 - Remaining Discord QA risk closed
+- Goal: close the remaining approval/input live UX risk without leaving QA commands enabled in the normal runtime.
+- Live findings:
+  - Approval UX already had real component evidence in the runtime log:
+    `socket_interaction_create ... command=codex_approval:019e8ebf-08b1-7f00-8187-2eaef1b9cb3b:1` followed by `approval_button_done exit=0`.
+  - Tried to create a true `request_user_input` prompt on idle mirrored thread `019e8ebf-08b1-7f00-8187-2eaef1b9cb3b`; Codex stayed in Default mode and answered with plain text instead of entering `waiting-input`.
+  - Ran the bot once with temporary `DISCORD_ENABLE_QA_COMMANDS=1`, sent `!qa buttons` from the logged-in Discord Chrome tab in mirrored thread `1511713799386693695`, and verified `button_qa_done ... result=ok`.
+  - The same live QA run covered persistent approval and input handlers:
+    `approval_persistent_done exit=0 target=qa-thread` and `input_choice_persistent_done exit=0 target=qa-thread`.
+  - Stopped the temporary QA bot and restarted the scheduled `Codex Discord Bot`; normal startup synced commands without `qa_buttons`, confirming QA commands were disabled again.
+- Verification:
+  - `py -3 -m unittest tests.test_codex_discord_bot` (126 tests)
+  - `py -3 -m py_compile codex_discord_bot.py codex_desktop_bridge.py tests\test_codex_discord_bot.py`
+  - `git diff --check`
+  - Live Discord Chrome QA command: `!qa buttons`
+- Remaining risk:
+  - Push/PR publication is still pending for the current local branch and uncommitted refactor slice.
