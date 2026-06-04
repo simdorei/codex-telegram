@@ -2389,4 +2389,15 @@
   - `git diff --check`
   - Live Discord Chrome QA command: `!qa buttons`
 - Remaining risk:
-  - Push/PR publication is still pending for the current local branch and uncommitted refactor slice.
+  - PR creation is blocked by local GitHub auth/tooling: `dev` was pushed, but the GitHub app returned 403 for PR creation, `gh` is not installed, and the Chrome GitHub page is signed out.
+
+## 2026-06-04 13:25 +09:00 - Discord refactor branch pushed
+- Goal: remove the local-only publication risk after the Discord refactor and live QA checks.
+- Changes:
+  - Committed the current Discord helper split and QA documentation as `f03279b Modularize Discord bridge helpers`.
+  - Pushed `dev` to `origin/dev`; local `dev` is no longer ahead of the remote.
+- Verification:
+  - `git push origin dev` succeeded (`853d9f2..f03279b`).
+  - GitHub compare page for `main...dev` reports the branches are mergeable.
+- Remaining risk:
+  - Draft PR creation still requires a signed-in GitHub browser session, installed/authenticated `gh`, or broader GitHub app write permission.
