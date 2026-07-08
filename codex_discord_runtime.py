@@ -26,7 +26,7 @@ def had_steering_handoff_since(
     target_thread_id: str | None,
     started_at: float,
 ) -> bool:
-    return handoffs.get(normalize_runner_key(target_thread_id), 0.0) >= started_at
+    return handoffs.get(normalize_runner_key(target_thread_id), 0.0) > started_at
 
 
 def register_discord_relay(generations: dict[str, int], target_thread_id: str | None) -> int:

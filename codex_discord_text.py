@@ -106,12 +106,12 @@ def extract_prompt_first_sentence(prompt: str, *, limit: int = 240) -> str:
 
 
 def build_ask_start_message(prompt: str, *, queued: bool = False) -> str:
-    label = "Queued ask started." if queued else "Ask started."
+    label = "Discord ask queued." if queued else "Discord ask submitted."
     return fit_single_message(
         "\n".join(
             [
                 label,
-                f"heard: {extract_prompt_first_sentence(prompt)}",
+                f"message: {extract_prompt_first_sentence(prompt)}",
             ]
         )
     )

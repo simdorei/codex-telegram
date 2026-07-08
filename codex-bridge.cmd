@@ -5,9 +5,10 @@ set "SCRIPT_DIR=%~dp0"
 set "SCRIPT=%SCRIPT_DIR%codex_desktop_bridge.py"
 set "TELEGRAM_PY=%SCRIPT_DIR%codex_telegram_bot.py"
 set "ENV_FILE=%SCRIPT_DIR%.env"
-set "AUTO_START_TELEGRAM=1"
+set "AUTO_START_TELEGRAM=0"
 set "TELEGRAM_PYTHON_EXE="
 
+if /I "%CODEX_BRIDGE_AUTO_START_TELEGRAM%"=="1" set "AUTO_START_TELEGRAM=1"
 if /I "%CODEX_BRIDGE_AUTO_START_TELEGRAM%"=="0" set "AUTO_START_TELEGRAM=0"
 
 if /I "%~1"=="--no-bot" (

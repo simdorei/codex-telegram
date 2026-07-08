@@ -223,6 +223,29 @@ def claim_persistent_discord_message_id(db_path: Path, message_id: int, now: flo
         return result.rowcount == 1
 
 
+def is_processed_discord_message_id(db_path: Path, message_id: int) -> bool:
+    init_mirror_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM discord_processed_messages WHERE message_id = ?",
+            (int(message_id),),
+        ).fetchone()
+        return row is not None
+
+
+def mark_processed_discord_message_id(db_path: Path, message_id: int, now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    init_mirror_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO discord_processed_messages (message_id, seen_at)
+            VALUES (?, ?)
+            """,
+            (int(message_id), current),
+        )
+
+
 def get_startup_probe_targets(
     db_path: Path,
     allowed_channel_ids: set[int],

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ import sys
 import threading
 import time
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ import codex_discord_steering as discord_steering
 import codex_discord_store as discord_store
 import codex_discord_stream as discord_stream
 import codex_discord_thread_state as discord_thread_state
+import codex_windows_harness as windows_harness
 from codex_discord_components import (
     format_approval_custom_id,
     format_busy_choice_custom_id,
@@ -82,10 +84,14 @@ from codex_discord_text import (
     truncate_discord_title,
 )
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 LOG_PATH = SCRIPT_DIR / "codex_discord_bot.log"
+RUNTIME_LOCK_PATH = SCRIPT_DIR / ".codex_discord_bot.runtime.lock"
+RUNTIME_MUTEX_NAME = (
+    "Local\\CodexDiscordBot_"
+    + hashlib.sha256(str(SCRIPT_DIR).lower().encode("utf-8")).hexdigest()[:16]
+)
 MIRROR_DB_PATH = SCRIPT_DIR / "discord_mirror.sqlite"
 THREAD_RUNNERS_LOCK = discord_runner.THREAD_RUNNERS_LOCK
 THREAD_RUNNERS = discord_runner.THREAD_RUNNERS
@@ -111,9 +117,19 @@ HISTORY_POLL_HISTORY_LIMIT = 10
 HISTORY_POLL_BOOTSTRAP_LOOKBACK_DEFAULT_SECONDS = 120.0
 PROCESSED_MESSAGE_ID_LIMIT = 2000
 PROCESSED_MESSAGE_RETENTION_SECONDS = 86400.0
+SOCKET_EVENT_LOG_ID_LIMIT = 2000
 QUIET_PROGRESS_NOTICE_DELAY_SECONDS = -1.0
 STEERING_DELIVERY_CONFIRM_TIMEOUT_SECONDS = 25.0
-STEERING_PENDING_WATCH_TIMEOUT_SECONDS = 120.0
+STEERING_PENDING_WATCH_TIMEOUT_SECONDS = 600.0
+STALE_BUSY_STEER_BLOCK_SECONDS = 600.0
+ASK_BUSY_RETRY_ATTEMPTS = 3.0
+ASK_BUSY_RETRY_DELAY_SECONDS = 8.0
+DISCORD_USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+DEFAULT_PLAIN_ASK_CONTEXT_KEYWORDS = (
+    "codex,코덱스,bridge,브릿지,discord,디스코드,디코,bot,봇,응답,"
+    "message,메시지,메세지,채팅,thread,스레드,queue,큐,steer,스티어,"
+    "patch,패치,qa,하네스,harness,잘아타스"
+)
 
 
 def load_local_env(path: Path) -> None:
@@ -130,8 +146,125 @@ def load_local_env(path: Path) -> None:
             os.environ[key] = value
 
 
+@contextmanager
+def acquire_runtime_instance_lock(mutex_name: str = RUNTIME_MUTEX_NAME):
+    if os.name != "nt":
+        yield True
+        return
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.GetLastError.restype = ctypes.c_ulong
+    kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel32.ReleaseMutex.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+
+    mutex = kernel32.CreateMutexW(None, True, mutex_name)
+    if not mutex:
+        raise ctypes.WinError()
+    if kernel32.GetLastError() == 183:
+        kernel32.CloseHandle(mutex)
+        log_line(f"main_duplicate_instance_blocked mutex={mutex_name}")
+        yield False
+        return
+
+    writes_runtime_lock = mutex_name == RUNTIME_MUTEX_NAME
+    current_pid = str(os.getpid())
+    if writes_runtime_lock:
+        try:
+            RUNTIME_LOCK_PATH.write_text(current_pid, encoding="ascii")
+            log_line(f"runtime_lock_written path={RUNTIME_LOCK_PATH} pid={current_pid}")
+        except OSError as exc:
+            log_line(
+                f"runtime_lock_write_failed path={RUNTIME_LOCK_PATH} "
+                f"pid={current_pid} error_type={type(exc).__name__}"
+            )
+
+    try:
+        yield True
+    finally:
+        if writes_runtime_lock:
+            try:
+                if RUNTIME_LOCK_PATH.read_text(encoding="ascii").strip() == current_pid:
+                    RUNTIME_LOCK_PATH.unlink()
+                    log_line(f"runtime_lock_removed path={RUNTIME_LOCK_PATH} pid={current_pid}")
+            except OSError:
+                pass
+        kernel32.ReleaseMutex(mutex)
+        kernel32.CloseHandle(mutex)
+
+
 def discord_qa_commands_enabled() -> bool:
     return env_flag("DISCORD_ENABLE_QA_COMMANDS", default=False)
+
+
+def strip_required_plain_ask_mentions(
+    content: str,
+    required_user_ids: set[int],
+) -> tuple[str, bool]:
+    if not required_user_ids:
+        return content, True
+    required_id_text = {str(user_id) for user_id in required_user_ids}
+    matched = False
+
+    def replace_mention(match: re.Match[str]) -> str:
+        nonlocal matched
+        if match.group(1) in required_id_text:
+            matched = True
+            return " "
+        return match.group(0)
+
+    stripped = DISCORD_USER_MENTION_RE.sub(replace_mention, content)
+    stripped = re.sub(r"[ \t]{2,}", " ", stripped).strip()
+    return stripped, matched
+
+
+def get_discord_message_mention_ids(message: object) -> set[int]:
+    mention_ids: set[int] = set()
+    for raw_id in getattr(message, "raw_mentions", []) or []:
+        try:
+            mention_ids.add(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+    for user in getattr(message, "mentions", []) or []:
+        user_id = getattr(user, "id", None)
+        try:
+            mention_ids.add(int(user_id))
+        except (TypeError, ValueError):
+            continue
+    return mention_ids
+
+
+def message_mentions_required_plain_ask_user(
+    message: object,
+    required_user_ids: set[int],
+) -> bool:
+    return bool(required_user_ids.intersection(get_discord_message_mention_ids(message)))
+
+
+def plain_ask_context_fallback_enabled() -> bool:
+    return env_flag("DISCORD_PLAIN_ASK_CONTEXT_FALLBACK", default=False)
+
+
+def get_plain_ask_context_keywords() -> list[str]:
+    raw = os.environ.get(
+        "DISCORD_PLAIN_ASK_CONTEXT_KEYWORDS",
+        DEFAULT_PLAIN_ASK_CONTEXT_KEYWORDS,
+    )
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+
+def plain_ask_context_matches(content: str) -> bool:
+    normalized = content.lower()
+    return any(keyword in normalized for keyword in get_plain_ask_context_keywords())
+
+
+def should_accept_plain_ask_without_required_mention(message: object, content: str) -> bool:
+    if not plain_ask_context_fallback_enabled():
+        return False
+    return plain_ask_context_matches(content)
 
 
 def is_discord_user_allowed(user_id: int | None) -> bool:
@@ -139,6 +272,16 @@ def is_discord_user_allowed(user_id: int | None) -> bool:
     if not allowed_user_ids:
         return True
     return user_id in allowed_user_ids
+
+
+def is_interaction_already_acknowledged_error(exc: BaseException) -> bool:
+    if getattr(exc, "code", None) == 40060:
+        return True
+    interaction_responded = getattr(discord.errors, "InteractionResponded", None)
+    if interaction_responded is not None and isinstance(exc, interaction_responded):
+        return True
+    message = str(exc).lower()
+    return "already been acknowledged" in message or "already been responded" in message
 
 
 def get_required_env(name: str) -> str:
@@ -163,6 +306,35 @@ def get_steering_pending_watch_timeout() -> float:
         default=STEERING_PENDING_WATCH_TIMEOUT_SECONDS,
         minimum=10.0,
         maximum=600.0,
+    )
+
+
+def get_stale_busy_steer_block_seconds() -> float:
+    return parse_bounded_float_env(
+        "DISCORD_STALE_BUSY_STEER_BLOCK_SECONDS",
+        default=STALE_BUSY_STEER_BLOCK_SECONDS,
+        minimum=60.0,
+        maximum=3600.0,
+    )
+
+
+def get_ask_busy_retry_attempts() -> int:
+    return int(
+        parse_bounded_float_env(
+            "DISCORD_ASK_BUSY_RETRY_ATTEMPTS",
+            default=ASK_BUSY_RETRY_ATTEMPTS,
+            minimum=0.0,
+            maximum=10.0,
+        )
+    )
+
+
+def get_ask_busy_retry_delay_seconds() -> float:
+    return parse_bounded_float_env(
+        "DISCORD_ASK_BUSY_RETRY_DELAY_SECONDS",
+        default=ASK_BUSY_RETRY_DELAY_SECONDS,
+        minimum=1.0,
+        maximum=60.0,
     )
 
 
@@ -491,6 +663,13 @@ def claim_persistent_discord_message_id(message_id: int, now: float | None = Non
         return True
 
 
+def mark_persistent_discord_message_processed(message_id: int, now: float | None = None) -> None:
+    try:
+        discord_store.mark_processed_discord_message_id(MIRROR_DB_PATH, message_id, now=now)
+    except Exception as exc:
+        log_line(f"processed_message_mark_failed message={message_id} error_type={type(exc).__name__}")
+
+
 def claim_discord_message(owner: object, message: object) -> bool:
     message_id = get_discord_message_id(message)
     if message_id is None:
@@ -515,6 +694,16 @@ def claim_discord_message(owner: object, message: object) -> bool:
     return True
 
 
+def mark_discord_message_processed(owner: object, message: object) -> None:
+    message_id = get_discord_message_id(message)
+    if message_id is None:
+        return
+    processed = getattr(owner, "_processed_message_ids", None)
+    if isinstance(processed, dict):
+        processed[message_id] = time.monotonic()
+    mark_persistent_discord_message_processed(message_id)
+
+
 def is_history_bootstrap_user_message(owner: object, message: object) -> bool:
     if getattr(getattr(message, "author", None), "bot", False):
         return False
@@ -527,6 +716,43 @@ def is_history_bootstrap_user_message(owner: object, message: object) -> bool:
     if cutoff.tzinfo is None:
         cutoff = cutoff.replace(tzinfo=timezone.utc)
     return created_at >= cutoff
+
+
+def get_socket_event_log_key(payload: dict[str, object]) -> str | None:
+    event_type = str(payload.get("t") or "").strip()
+    if not event_type:
+        return None
+    sequence = payload.get("s")
+    if sequence is not None:
+        return f"{event_type}:s:{sequence}"
+    data = payload.get("d")
+    if isinstance(data, dict):
+        event_id = data.get("id")
+        if event_id is not None:
+            return f"{event_type}:id:{event_id}"
+    return None
+
+
+def claim_socket_event_log(owner: object, payload: dict[str, object]) -> bool:
+    event_key = get_socket_event_log_key(payload)
+    if event_key is None:
+        return True
+    seen = getattr(owner, "_logged_socket_event_ids", None)
+    if not isinstance(seen, dict):
+        seen = {}
+        try:
+            setattr(owner, "_logged_socket_event_ids", seen)
+        except Exception:
+            return True
+    if event_key in seen:
+        return False
+    seen[event_key] = time.monotonic()
+    if len(seen) > SOCKET_EVENT_LOG_ID_LIMIT:
+        for stale_key, _seen_at in sorted(seen.items(), key=lambda item: item[1])[
+            : len(seen) - SOCKET_EVENT_LOG_ID_LIMIT
+        ]:
+            seen.pop(stale_key, None)
+    return True
 
 
 LineStream = bridge_process.LineStream
@@ -556,14 +782,16 @@ def run_ask(
     force_while_busy: bool = False,
     wait: bool = True,
     target_thread_id: str | None = None,
+    timeout_sec: float | None = None,
 ) -> tuple[int, str]:
+    timeout_value = "0" if timeout_sec is None else str(max(1, int(timeout_sec)))
     argv = [
         "ask",
         "--ipc",
         "--ipc-recover-ui",
         "--foreground",
         "--timeout",
-        "0",
+        timeout_value,
     ]
     if target_thread_id:
         argv.extend(["--thread-id", target_thread_id])
@@ -579,6 +807,7 @@ def run_ask(
             target_thread_id=target_thread_id,
             force_while_busy=True,
             wait=wait,
+            timeout_sec=timeout_sec,
         )
         with UI_FALLBACK_LOCK:
             ui_exit_code, ui_output = run_bridge_command(ui_argv)
@@ -611,14 +840,16 @@ def build_ui_ask_argv(
     target_thread_id: str | None,
     force_while_busy: bool,
     wait: bool,
+    timeout_sec: float | None = None,
 ) -> list[str]:
+    timeout_value = "0" if timeout_sec is None else str(max(1, int(timeout_sec)))
     argv = [
         "ask",
         "--ui",
         "--switch-thread",
         "--foreground",
         "--timeout",
-        "0",
+        timeout_value,
     ]
     if target_thread_id:
         argv.extend(["--thread-id", target_thread_id])
@@ -680,6 +911,26 @@ def is_ipc_delivery_confirmation_timeout(output: str) -> bool:
 
 def format_pending_ipc_delivery_output(output: str) -> str:
     return discord_steering.format_pending_ipc_delivery_output(output)
+
+
+def format_pending_ipc_ask_output(output: str) -> str:
+    metadata_lines = [
+        line
+        for line in (output or "").splitlines()
+        if line.strip()
+        and not line.lstrip().upper().startswith("ERROR:")
+        and "Prompt delivery could not be confirmed" not in line
+        and "transport reported success" not in line
+    ]
+    return "\n".join(
+        part
+        for part in [
+            "[delivery_pending] Codex IPC accepted the ask, but local session recording is delayed.",
+            "Your message may already be running in Codex. Do not resend it yet.",
+            "\n".join(metadata_lines),
+        ]
+        if part
+    )
 
 
 def run_steering_prompt(prompt: str, target_thread_id: str | None) -> SteeringPromptResult:
@@ -811,9 +1062,19 @@ async def stream_steering_prompt_result_to_channel(
         return True
     if exit_code != 0 and relay.saw_timeout:
         log_line(
-            f"steer_watch_timeout_suppressed target={target_thread_id or '-'} "
+            f"steer_watch_timeout_reported target={target_thread_id or '-'} "
             f"exit={exit_code} pending={steering_result.delivery_pending} "
             f"output_len={format_log_text_len(output)}"
+        )
+        await send_chunks(
+            channel,
+            "\n".join(
+                [
+                    "Steering is still running in Codex.",
+                    "",
+                    "No final answer was captured before the Discord watch timeout. Do not resend the same steering message yet; check the Codex thread or wait for the next relay.",
+                ]
+            ),
         )
         return True
     if exit_code != 0 and not output:
@@ -987,6 +1248,7 @@ class CodexDiscordBot(discord.Client):
         startup_channel_id: int | None,
         guild_id: int | None,
         enable_prefix_commands: bool,
+        plain_ask_mention_user_ids: set[int] | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = enable_prefix_commands
@@ -997,6 +1259,7 @@ class CodexDiscordBot(discord.Client):
         self.startup_channel_id = startup_channel_id
         self.guild_id = guild_id
         self.enable_prefix_commands = enable_prefix_commands
+        self.plain_ask_mention_user_ids = set(plain_ask_mention_user_ids or set())
         self.history_poll_seconds = parse_bounded_float_env(
             "DISCORD_HISTORY_POLL_SECONDS",
             default=HISTORY_POLL_DEFAULT_SECONDS,
@@ -1016,6 +1279,7 @@ class CodexDiscordBot(discord.Client):
             seconds=self.history_poll_bootstrap_lookback_seconds
         )
         self._processed_message_ids: dict[int, float] = {}
+        self._logged_socket_event_ids: dict[str, float] = {}
         self._slash_sync_last_at = "-"
         self._slash_sync_status = "-"
         self._slash_sync_commands = "-"
@@ -1225,6 +1489,7 @@ class CodexDiscordBot(discord.Client):
             f"content_len={format_log_text_len(getattr(message, 'content', '') or '')}"
         )
         await self.process_discord_message(message, source="history_poll")
+        mark_discord_message_processed(self, message)
 
     async def on_ready(self) -> None:
         log_line(f"ready user_id={format_discord_user_id_for_log(self.user)} guilds={len(self.guilds)}")
@@ -1319,6 +1584,8 @@ class CodexDiscordBot(discord.Client):
         data = payload.get("d")
         if not isinstance(data, dict):
             return
+        if not claim_socket_event_log(self, payload):
+            return
         if event_type == "MESSAGE_CREATE":
             channel_id_raw = data.get("channel_id")
             try:
@@ -1374,6 +1641,7 @@ class CodexDiscordBot(discord.Client):
             )
             return
         await CodexDiscordBot.process_discord_message(self, message, source="gateway")
+        mark_discord_message_processed(self, message)
 
     async def process_discord_message(self, message: discord.Message, *, source: str) -> None:
         try:
@@ -1407,6 +1675,40 @@ class CodexDiscordBot(discord.Client):
                 )
                 await maybe_send_empty_content_notice(message)
                 return
+            if not content.startswith("!"):
+                plain_ask_mention_user_ids = set(getattr(self, "plain_ask_mention_user_ids", set()))
+                if plain_ask_mention_user_ids:
+                    content, matched_mention = strip_required_plain_ask_mentions(
+                        content,
+                        plain_ask_mention_user_ids,
+                    )
+                    if not matched_mention:
+                        matched_mention = message_mentions_required_plain_ask_user(
+                            message,
+                            plain_ask_mention_user_ids,
+                        )
+                    if not matched_mention and should_accept_plain_ask_without_required_mention(
+                        message,
+                        content,
+                    ):
+                        log_line(
+                            f"plain_ask_context_fallback chat={message.channel.id} "
+                            f"user={message.author.id}"
+                        )
+                        matched_mention = True
+                    if not matched_mention:
+                        log_line(
+                            f"ignored_message reason=required_mention_missing chat={message.channel.id} "
+                            f"user={message.author.id}"
+                        )
+                        return
+                    if not content:
+                        log_line(
+                            f"ignored_message reason=mention_only_content chat={message.channel.id} "
+                            f"user={message.author.id}"
+                        )
+                        await send_chunks(message.channel, "Add a prompt after the mention.")
+                        return
             target_thread_id = get_mirrored_codex_thread_id(message.channel.id)
             target_source = "mirror" if target_thread_id else "selected"
             runner_busy = await is_thread_runner_busy(target_thread_id)
@@ -1556,7 +1858,14 @@ async def report_unhandled_component_interaction(
             return
         if await handle_persistent_busy_choice_interaction(interaction, custom_id):
             return
-    except Exception:
+    except Exception as exc:
+        if is_interaction_already_acknowledged_error(exc):
+            log_line(
+                f"component_interaction_persistent_handler_already_acknowledged "
+                f"custom_id={custom_id} channel={interaction.channel_id} "
+                f"user={getattr(interaction.user, 'id', '-')}"
+            )
+            return
         log_line("component_interaction_persistent_handler_failed\n" + traceback.format_exc())
         if interaction.response.is_done():
             return
@@ -1570,7 +1879,14 @@ async def report_unhandled_component_interaction(
             f"component_interaction_unhandled_reported custom_id={custom_id} "
             f"channel={interaction.channel_id} user={getattr(interaction.user, 'id', '-')}"
         )
-    except Exception:
+    except Exception as exc:
+        if is_interaction_already_acknowledged_error(exc):
+            log_line(
+                f"component_interaction_unhandled_report_already_acknowledged "
+                f"custom_id={custom_id} channel={interaction.channel_id} "
+                f"user={getattr(interaction.user, 'id', '-')}"
+            )
+            return
         log_line("component_interaction_unhandled_report_failed\n" + traceback.format_exc())
 
 
@@ -1773,6 +2089,22 @@ async def handle_persistent_busy_choice_interaction(
             f"busy_choice_persistent_steer user={user_id} choice={choice_id} "
             f"target={target_thread_id or '-'} prompt_len={format_log_text_len(prompt)}"
         )
+        if await send_stale_busy_steer_block_message(
+            channel,
+            prompt,
+            target_thread_id,
+            reason="persistent_steer_now",
+        ):
+            await send_followup_chunks(
+                interaction,
+                "Steering was not sent because this Codex thread appears stuck. See the public channel notice.",
+                title="Steering",
+                exit_code=0,
+                log_prefix="button_response",
+                ephemeral=True,
+            )
+            return True
+        await send_steering_start_ack(channel, prompt, target_thread_id)
         started_at = time.monotonic()
         async with channel_typing(channel, context="persistent_steer_now"):
             steering_result = await asyncio.to_thread(steering_runner, prompt, target_thread_id)
@@ -1785,20 +2117,49 @@ async def handle_persistent_busy_choice_interaction(
             f"output_len={format_log_text_len(output)}"
         )
         if is_selected_thread_busy_error(exit_code, output):
-            content, view = make_busy_choice_payload(
-                source_message,
+            if await send_codex_app_menu_if_available(
+                channel,
+                target_thread_id,
+                output,
+                reason="persistent_steer_busy_failure",
+            ):
+                await send_followup_chunks(
+                    interaction,
+                    "Codex app menu was refreshed in this Discord thread.",
+                    title="Steering",
+                    exit_code=0,
+                    log_prefix="button_response",
+                    ephemeral=True,
+                )
+                return True
+            if await send_stale_busy_steer_block_message(
+                channel,
                 prompt,
-                target_thread_id=target_thread_id,
-                allow_steer=True,
-            )
-            await send_direct_followup(
+                target_thread_id,
+                reason="persistent_steer_busy_failure",
+            ):
+                await send_followup_chunks(
+                    interaction,
+                    "Steering was not sent because this Codex thread appears stuck. See the public channel notice.",
+                    title="Steering",
+                    exit_code=0,
+                    log_prefix="button_response",
+                    ephemeral=True,
+                )
+                return True
+            _resolved_thread_id, target_ref = resolve_target_ref(target_thread_id)
+            await send_followup_chunks(
                 interaction,
-                content,
-                view=view,
-                log_prefix="button_followup",
-                context="persistent_steer_busy_failure",
+                build_codex_app_steering_not_accepted_message(target_ref),
+                title="Steering",
+                exit_code=0,
+                log_prefix="button_response",
+                ephemeral=True,
             )
-            log_busy_choice_sent("persistent_steer_busy_failure", target_thread_id, prompt)
+            log_line(
+                f"steer_busy_status_sent reason=persistent_steer_busy_failure "
+                f"target={target_thread_id or '-'}"
+            )
             return True
         title = "Steering sent" if exit_code == 0 else f"Steering failed (exit {exit_code})"
         await send_followup_chunks(
@@ -2026,6 +2387,38 @@ async def send_direct_followup(
     except Exception:
         log_line(f"{log_prefix}_fallback_failed\n" + traceback.format_exc())
         raise
+
+
+def build_steering_start_message(prompt: str) -> str:
+    return fit_single_message(
+        "\n".join(
+            [
+                "Discord steering submitted.",
+                f"message: {extract_prompt_first_sentence(prompt)}",
+            ]
+        )
+    )
+
+
+async def send_steering_start_ack(
+    channel: discord.abc.Messageable,
+    prompt: str,
+    target_thread_id: str | None,
+) -> bool:
+    try:
+        await channel.send(build_steering_start_message(prompt))
+        log_line(
+            f"steering_start_ack_sent target={target_thread_id or '-'} "
+            f"prompt_len={format_log_text_len(prompt)}"
+        )
+        return True
+    except Exception:
+        log_line(
+            f"steering_start_ack_failed target={target_thread_id or '-'} "
+            f"prompt_len={format_log_text_len(prompt)}\n"
+            + traceback.format_exc()
+        )
+        return False
 
 
 class SyntheticQAResponse:
@@ -3012,6 +3405,81 @@ def build_context_message(channel_id: int | None = None, *, all_threads: bool = 
     )
 
 
+def get_stale_busy_steer_block_info(target_thread_id: str | None) -> tuple[str, str, float] | None:
+    try:
+        resolved_thread_id, target_ref = resolve_target_ref(target_thread_id)
+        if not resolved_thread_id:
+            return None
+        thread = bridge.choose_thread(resolved_thread_id, None)
+        session_path = Path(thread.rollout_path)
+        if not session_path.exists() or not bridge.is_thread_busy(session_path):
+            return None
+        if bridge.get_pending_interactive_state_from_session(session_path):
+            return None
+        age_seconds = bridge.session_file_age_seconds(session_path)
+        if age_seconds is None or age_seconds < get_stale_busy_steer_block_seconds():
+            return None
+        return resolved_thread_id, target_ref or bridge.get_thread_workspace_ref(thread), age_seconds
+    except Exception as exc:
+        log_line(f"stale_busy_steer_check_unavailable target={target_thread_id or '-'} error={exc}")
+        return None
+
+
+def is_stale_busy_thread_for_steering(target_thread_id: str | None) -> bool:
+    return get_stale_busy_steer_block_info(target_thread_id) is not None
+
+
+def build_stale_busy_steer_block_message(
+    prompt: str,
+    *,
+    target_ref: str,
+    age_seconds: float,
+) -> str:
+    age_minutes = max(1, int(age_seconds // 60))
+    prompt_text = str(prompt or "").strip()
+    return fit_single_message(
+        "\n".join(
+            [
+                "This Codex thread is busy but has not produced new output recently.",
+                f"thread: {target_ref or 'selected'}",
+                f"last Codex activity: about {age_minutes} min ago",
+                "",
+                "Your message was not sent as another steering prompt, to avoid stacking work into a stuck Codex turn.",
+                "",
+                f"message: {prompt_text}",
+                "",
+                "Open the Codex app thread, use `!open_abort <thread-ref>` to cancel/reopen it, or use `!new <prompt>` to continue in a fresh mirrored thread.",
+            ]
+        )
+    )
+
+
+async def send_stale_busy_steer_block_message(
+    channel: discord.abc.Messageable,
+    prompt: str,
+    target_thread_id: str | None,
+    *,
+    reason: str,
+) -> bool:
+    info = get_stale_busy_steer_block_info(target_thread_id)
+    if info is None:
+        return False
+    resolved_thread_id, target_ref, age_seconds = info
+    await send_chunks(
+        channel,
+        build_stale_busy_steer_block_message(
+            prompt,
+            target_ref=target_ref,
+            age_seconds=age_seconds,
+        ),
+    )
+    log_line(
+        f"stale_busy_steer_blocked reason={reason} target={resolved_thread_id} "
+        f"age_sec={age_seconds:.1f} prompt_len={format_log_text_len(prompt)}"
+    )
+    return True
+
+
 def parse_event_timestamp(value: object) -> datetime | None:
     return discord_context.parse_event_timestamp(value)
 
@@ -3312,6 +3780,7 @@ async def run_prompt_and_send(
             run_ask_stream,
             prompt,
             relay,
+            force_while_busy=True,
             target_thread_id=target_thread_id,
         )
     log_line(
@@ -3319,32 +3788,83 @@ async def run_prompt_and_send(
         f"sent_live={relay.sent_live} final={relay.saw_final} aborted={relay.saw_aborted} "
         f"timeout={relay.saw_timeout} output_len={format_log_text_len(output)}"
     )
-    if is_selected_thread_busy_error(exit_code, output):
+    if is_ipc_delivery_confirmation_timeout(output):
         log_line(
-            f"ask_stream_busy_failure target={target_thread_id or '-'} "
+            f"ask_stream_ipc_delivery_pending exit={exit_code} target={target_thread_id or '-'} "
+            f"sent_live={relay.sent_live} output_len={format_log_text_len(output)}"
+        )
+        await send_chunks(channel, format_pending_ipc_ask_output(output))
+        return
+    busy_failure_kind = ""
+    if is_global_codex_busy_error(exit_code, output):
+        busy_failure_kind = "global"
+    elif is_selected_thread_busy_error(exit_code, output):
+        busy_failure_kind = "target"
+    if busy_failure_kind:
+        log_line(
+            f"ask_stream_busy_transport_failure kind={busy_failure_kind} target={target_thread_id or '-'} "
             f"source_message={'yes' if has_busy_choice_source(source_message) else 'no'}"
         )
-        if has_busy_choice_source(source_message):
-            await send_busy_choice_message(
-                channel,
-                source_message,
-                prompt,
-                target_thread_id=target_thread_id,
-                allow_steer=True,
-                reason="late_busy_failure",
-            )
-            return
-        await send_chunks(
+        if await send_codex_app_menu_if_available(
             channel,
-            "\n".join(
-                [
-                    "This Codex thread is already working.",
-                    "",
-                    "Send the message again when the thread is idle, or use the mapped Discord thread so I can show steering controls.",
-                ]
-            ),
-        )
-        return
+            target_thread_id,
+            output,
+            reason=f"ask_{busy_failure_kind}_busy_failure",
+        ):
+            return
+        retry_attempts = get_ask_busy_retry_attempts()
+        retry_delay = get_ask_busy_retry_delay_seconds()
+        if retry_attempts > 0:
+            await send_chunks(
+                channel,
+                f"Codex app did not accept this Discord message yet. Retrying mapped-thread delivery up to {retry_attempts} time(s).",
+            )
+        for retry_index in range(1, retry_attempts + 1):
+            await asyncio.sleep(retry_delay)
+            retry_relay = DiscordAskRelay(
+                asyncio.get_running_loop(),
+                channel,
+                target_thread_id,
+                target_ref,
+                suppress_after_steering_since=started_at,
+            )
+            async with channel_typing(channel, context="ask_stream_retry"):
+                exit_code, output = await asyncio.to_thread(
+                    run_ask_stream,
+                    prompt,
+                    retry_relay,
+                    force_while_busy=True,
+                    target_thread_id=target_thread_id,
+                )
+            relay = retry_relay
+            log_line(
+                f"ask_stream_retry_done attempt={retry_index} exit={exit_code} "
+                f"target={target_thread_id or '-'} sent_live={relay.sent_live} "
+                f"final={relay.saw_final} aborted={relay.saw_aborted} timeout={relay.saw_timeout} "
+                f"output_len={format_log_text_len(output)}"
+            )
+            if is_ipc_delivery_confirmation_timeout(output):
+                await send_chunks(channel, format_pending_ipc_ask_output(output))
+                return
+            if not (
+                is_global_codex_busy_error(exit_code, output)
+                or is_selected_thread_busy_error(exit_code, output)
+            ):
+                break
+            if await send_codex_app_menu_if_available(
+                channel,
+                target_thread_id,
+                output,
+                reason=f"ask_busy_retry_{retry_index}",
+            ):
+                return
+        if is_global_codex_busy_error(exit_code, output) or is_selected_thread_busy_error(exit_code, output):
+            log_line(
+                f"ask_stream_busy_retry_exhausted target={target_thread_id or '-'} "
+                f"attempts={retry_attempts} output_len={format_log_text_len(output)}"
+            )
+            await send_chunks(channel, build_codex_app_busy_retry_message(target_ref, retry_attempts))
+            return
     if (
         exit_code == 0
         and not relay.saw_final
@@ -3360,7 +3880,7 @@ async def run_prompt_and_send(
     if relay.sent_live:
         if exit_code == 0 and not relay.saw_aborted:
             if relay.saw_final:
-                await channel.send("Done.")
+                await channel.send("Codex turn finished.")
             else:
                 log_line(
                     f"ask_stream_no_final_fallback target={target_thread_id or '-'} "
@@ -3378,8 +3898,136 @@ def is_selected_thread_busy_error(exit_code: int, output: str) -> bool:
     return discord_busy.is_selected_thread_busy_error(exit_code, output)
 
 
+def is_global_codex_busy_error(exit_code: int, output: str) -> bool:
+    return discord_busy.is_global_codex_busy_error(exit_code, output)
+
+
+def get_global_busy_threads_for_target(target_thread_id: str | None) -> list[object]:
+    try:
+        preflight = windows_harness.preflight_ask(target_thread_id)
+    except Exception as exc:
+        log_line(f"global_busy_check_failed target={target_thread_id or '-'} error={exc}")
+        return []
+    if preflight.route != "global_busy":
+        return []
+    return list(preflight.global_busy_threads)
+
+
+def get_busy_thread_id(thread: object) -> str:
+    return str(getattr(thread, "id", "") or "")
+
+
+def get_busy_thread_label(thread: object) -> str:
+    ref = str(getattr(thread, "ref", "") or "").strip()
+    if ref:
+        return ref
+    try:
+        return bridge.get_thread_label(thread)
+    except Exception:
+        thread_id = get_busy_thread_id(thread)
+        return thread_id[:8] if thread_id else "unknown"
+
+
+def build_global_busy_message(busy_threads: list[object]) -> str:
+    parts = [
+        "Codex app is already processing a turn.",
+        "",
+        "This is a Codex app transport state, not a Discord global lock. Use the mapped Discord thread again after the current Codex output, or wait for an approval/input menu to appear here.",
+    ]
+    if busy_threads:
+        labels = ", ".join(get_busy_thread_label(thread) for thread in busy_threads[:3])
+        remaining = len(busy_threads) - 3
+        if remaining > 0:
+            labels = f"{labels}, +{remaining} more"
+        parts.extend(["", f"Busy thread(s): {labels}"])
+    return "\n".join(parts)
+
+
+async def send_global_busy_message(
+    channel: discord.abc.Messageable,
+    busy_threads: list[object],
+    *,
+    target_thread_id: str | None,
+    reason: str,
+) -> None:
+    log_line(
+        f"global_busy_preflight reason={reason} target={target_thread_id or '-'} "
+        f"busy={','.join(get_busy_thread_id(thread) for thread in busy_threads[:5])}"
+    )
+    await send_chunks(channel, build_global_busy_message(busy_threads))
+
+
 def has_busy_choice_source(source_message: object) -> bool:
     return discord_busy.has_busy_choice_source(source_message)
+
+
+def infer_interactive_state_from_error(output: str) -> str:
+    text = (output or "").lower()
+    if "waiting on an approval prompt" in text or "waiting for approval" in text:
+        return INTERACTIVE_STATE_APPROVAL
+    if (
+        "waiting on a follow-up choice or input" in text
+        or "waiting on user input" in text
+        or "choice or input" in text
+    ):
+        return INTERACTIVE_STATE_INPUT
+    return INTERACTIVE_STATE_NONE
+
+
+async def send_codex_app_menu_if_available(
+    channel: discord.abc.Messageable,
+    target_thread_id: str | None,
+    output: str,
+    *,
+    reason: str,
+) -> bool:
+    state, resolved_thread_id, target_ref = get_interactive_state_for_thread(target_thread_id)
+    if not state:
+        state = infer_interactive_state_from_error(output)
+        if state:
+            resolved_thread_id, target_ref = resolve_target_ref(target_thread_id)
+    if not state or not resolved_thread_id:
+        return False
+
+    prompt_text = "Pending approval" if state == INTERACTIVE_STATE_APPROVAL else "Pending input"
+    await send_interactive_prompt(
+        channel,
+        resolved_thread_id,
+        target_ref,
+        state,
+        prompt_text,
+        [],
+    )
+    log_line(
+        f"codex_app_menu_sent reason={reason} target={resolved_thread_id or '-'} "
+        f"state={state}"
+    )
+    return True
+
+
+def build_codex_app_busy_retry_message(target_ref: str, attempts: int) -> str:
+    lines = [
+        "Codex app did not accept this Discord message yet.",
+        "",
+        f"target: `{target_ref or 'selected'}`",
+        f"retry_attempts: {attempts}",
+        "",
+        "No approval/input menu was exposed by the Codex app for this turn.",
+        "The Discord message stayed in this thread; no steering menu was created without a Codex app menu to mirror.",
+    ]
+    return "\n".join(lines)
+
+
+def build_codex_app_steering_not_accepted_message(target_ref: str) -> str:
+    lines = [
+        "Codex app did not accept this steering message yet.",
+        "",
+        f"target: `{target_ref or 'selected'}`",
+        "",
+        "No approval/input menu was exposed by the Codex app for this turn.",
+        "The original Discord controls were cleared; send a new message in the mapped thread after Codex output or an app menu appears.",
+    ]
+    return "\n".join(lines)
 
 
 async def run_prompt_flow(
@@ -3563,47 +4211,34 @@ async def handle_plain_ask(
         )
         return
 
-    busy_state, busy_thread_id, busy_ref = get_busy_state_for_thread(target_thread_id)
+    busy_state, _busy_thread_id, busy_ref = await asyncio.to_thread(
+        get_busy_state_for_thread,
+        target_thread_id,
+    )
     if busy_state != "idle":
-        if busy_state == INTERACTIVE_STATE_INPUT and busy_thread_id:
-            await send_interactive_prompt(
-                message.channel,
-                busy_thread_id,
-                busy_ref,
-                INTERACTIVE_STATE_INPUT,
-                "Pending input",
-                [],
-            )
-            return
-        if busy_state == INTERACTIVE_STATE_APPROVAL and busy_thread_id:
-            await send_interactive_prompt(
-                message.channel,
-                busy_thread_id,
-                busy_ref,
-                INTERACTIVE_STATE_APPROVAL,
-                "Pending approval",
-                [],
-            )
-            return
-        await send_busy_choice_message(
+        position = await enqueue_thread_ask(
             message.channel,
-            message,
             prompt,
-            target_thread_id=target_thread_id,
-            allow_steer=True,
-            reason="codex_busy_preflight",
+            target_thread_id,
+            queued=True,
+            source_message=message,
         )
-        return
-
-    if await is_thread_runner_busy(target_thread_id):
-        allow_steer = True
-        await send_busy_choice_message(
+        warning = build_context_warning(target_thread_id)
+        await send_chunks(
             message.channel,
-            message,
-            prompt,
-            target_thread_id=target_thread_id,
-            allow_steer=allow_steer,
-            reason="runner_busy_preflight",
+            "\n\n".join(
+                part
+                for part in [
+                    f"Queued in this Codex thread at position {position}.",
+                    f"Current target state: {busy_state}.",
+                    warning,
+                ]
+                if part
+            ),
+        )
+        log_line(
+            f"target_busy_auto_queued target={target_thread_id or '-'} "
+            f"state={busy_state} ref={busy_ref or '-'} position={position}"
         )
         return
 
@@ -3865,7 +4500,7 @@ class BusyChoiceView(discord.ui.View):
                 f"target={self.target_thread_id or '-'} reason=not_allowed"
             )
             return
-        if not self.claim():
+        if self.claimed:
             log_line(
                 f"busy_choice_already_handled action=steer_now user={interaction.user.id} "
                 f"target={self.target_thread_id or '-'}"
@@ -3873,14 +4508,39 @@ class BusyChoiceView(discord.ui.View):
             await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
+        if not self.claim():
+            log_line(
+                f"busy_choice_already_handled action=steer_now user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'}"
+            )
+            await send_direct_followup(
+                interaction,
+                "This busy choice was already handled.",
+                log_prefix="button_followup",
+                context="steer_now_already_handled",
+            )
+            return
+        await clear_interaction_message_components(interaction, context="busy_choice_steer")
         log_line(
             f"steer_now user={interaction.user.id} target={self.target_thread_id or '-'} "
             f"prompt_len={format_log_text_len(self.prompt)}"
         )
+        if await send_stale_busy_steer_block_message(
+            self.message.channel,
+            self.prompt,
+            self.target_thread_id,
+            reason="steer_now",
+        ):
+            await send_followup_chunks(
+                interaction,
+                "Steering was not sent because this Codex thread appears stuck. See the public channel notice.",
+                title="Steering",
+                exit_code=0,
+                log_prefix="button_response",
+                ephemeral=True,
+            )
+            return
+        await send_steering_start_ack(self.message.channel, self.prompt, self.target_thread_id)
         started_at = time.monotonic()
         async with channel_typing(self.message.channel, context="steer_now"):
             steering_result = await asyncio.to_thread(
@@ -3896,22 +4556,47 @@ class BusyChoiceView(discord.ui.View):
             f"elapsed_sec={time.monotonic() - started_at:.2f} output_len={format_log_text_len(output)}"
         )
         if is_selected_thread_busy_error(exit_code, output):
-            content, view = make_busy_choice_payload(
-                self.message,
+            if await send_codex_app_menu_if_available(
+                self.message.channel,
+                self.target_thread_id,
+                output,
+                reason="steer_busy_failure",
+            ):
+                await send_followup_chunks(
+                    interaction,
+                    "Codex app menu was refreshed in this Discord thread.",
+                    title="Steering",
+                    exit_code=0,
+                    log_prefix="button_response",
+                    ephemeral=True,
+                )
+                return
+            if await send_stale_busy_steer_block_message(
+                self.message.channel,
                 self.prompt,
-                target_thread_id=self.target_thread_id,
-                allow_steer=True,
-            )
-            await send_direct_followup(
+                self.target_thread_id,
+                reason="steer_busy_failure",
+            ):
+                await send_followup_chunks(
+                    interaction,
+                    "Steering was not sent because this Codex thread appears stuck. See the public channel notice.",
+                    title="Steering",
+                    exit_code=0,
+                    log_prefix="button_response",
+                    ephemeral=True,
+                )
+                return
+            _resolved_thread_id, target_ref = resolve_target_ref(self.target_thread_id)
+            await send_followup_chunks(
                 interaction,
-                content,
-                view=view,
-                log_prefix="button_followup",
-                context="steer_busy_failure",
+                build_codex_app_steering_not_accepted_message(target_ref),
+                title="Steering",
+                exit_code=0,
+                log_prefix="button_response",
+                ephemeral=True,
             )
-            log_busy_choice_sent("steer_busy_failure", self.target_thread_id, self.prompt)
             log_line(
-                f"steer_now_busy_choice_resent exit={exit_code} "
+                f"steer_busy_status_sent reason=steer_busy_failure exit={exit_code} "
                 f"target={self.target_thread_id or '-'}"
             )
             return
@@ -3934,7 +4619,7 @@ class BusyChoiceView(discord.ui.View):
 
     @discord.ui.button(label="Queue next", style=discord.ButtonStyle.secondary)
     async def queue_next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self.claim():
+        if self.claimed:
             log_line(
                 f"busy_choice_already_handled action=queue_next user={interaction.user.id} "
                 f"target={self.target_thread_id or '-'}"
@@ -3942,10 +4627,19 @@ class BusyChoiceView(discord.ui.View):
             await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
+        if not self.claim():
+            log_line(
+                f"busy_choice_already_handled action=queue_next user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'}"
+            )
+            await send_direct_followup(
+                interaction,
+                "This busy choice was already handled.",
+                log_prefix="button_followup",
+                context="queue_next_already_handled",
+            )
+            return
+        await clear_interaction_message_components(interaction, context="busy_choice_queue")
         busy_state, _busy_thread_id, _busy_ref = await asyncio.to_thread(
             get_busy_state_for_thread,
             self.target_thread_id,
@@ -4004,26 +4698,41 @@ class BusyChoiceView(discord.ui.View):
 
     @discord.ui.button(label="Ignore", style=discord.ButtonStyle.danger)
     async def ignore(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self.claim():
+        if self.claimed:
             log_line(
                 f"busy_choice_already_handled action=ignore user={interaction.user.id} "
                 f"target={self.target_thread_id or '-'}"
             )
             await interaction.response.send_message("This busy choice was already handled.", ephemeral=True)
             return
+        await interaction.response.defer(thinking=True)
+        if not self.claim():
+            log_line(
+                f"busy_choice_already_handled action=ignore user={interaction.user.id} "
+                f"target={self.target_thread_id or '-'}"
+            )
+            await send_direct_followup(
+                interaction,
+                "This busy choice was already handled.",
+                log_prefix="button_followup",
+                context="ignore_already_handled",
+            )
+            return
         log_line(
             f"ignore_busy_prompt user={interaction.user.id} "
             f"target={self.target_thread_id or '-'}"
         )
-        await interaction.response.send_message("Ignored.")
+        await clear_interaction_message_components(interaction, context="busy_choice_ignore")
+        await send_direct_followup(
+            interaction,
+            "Ignored.",
+            log_prefix="button_followup",
+            context="ignore",
+        )
         log_line(
             f"ignore_busy_prompt_sent user={interaction.user.id} "
             f"target={self.target_thread_id or '-'}"
         )
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
 
     def disable_all_items(self) -> None:
         for item in self.children:
@@ -4456,6 +5165,9 @@ def main() -> int:
     guild_id_raw = os.environ.get("DISCORD_GUILD_ID", "").strip()
     channel_ids = parse_int_set(os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS", ""))
     user_ids = parse_int_set(os.environ.get("DISCORD_ALLOWED_USER_IDS", ""))
+    plain_ask_mention_user_ids = parse_int_set(
+        os.environ.get("DISCORD_PLAIN_ASK_MENTION_USER_IDS", "")
+    )
     allow_all_channels = env_flag("DISCORD_ALLOW_ALL_CHANNELS", default=False)
     if not channel_ids and not allow_all_channels:
         log_line("main_config_error reason=missing_allowed_channels")
@@ -4472,20 +5184,28 @@ def main() -> int:
         env_flag("DISCORD_ENABLE_MESSAGE_CONTENT", default=True)
         and not args.no_message_content
     )
-    bot = CodexDiscordBot(
-        allowed_channel_ids=channel_ids,
-        allowed_user_ids=user_ids,
-        startup_channel_id=startup_channel_id,
-        guild_id=guild_id,
-        enable_prefix_commands=enable_prefix_commands,
-    )
-    log_line(
-        "main_start "
-        f"guild_id={guild_id or '-'} channels={sorted(channel_ids) if channel_ids else 'ALL_EXPLICIT'} "
-        f"users={sorted(user_ids) if user_ids else 'ALL'} "
-        f"message_content={enable_prefix_commands}"
-    )
-    bot.run(token, log_handler=None)
+    with acquire_runtime_instance_lock() as runtime_lock_acquired:
+        if not runtime_lock_acquired:
+            print("ERROR: Codex Discord bot is already running.")
+            return 2
+        bot = CodexDiscordBot(
+            allowed_channel_ids=channel_ids,
+            allowed_user_ids=user_ids,
+            startup_channel_id=startup_channel_id,
+            guild_id=guild_id,
+            enable_prefix_commands=enable_prefix_commands,
+            plain_ask_mention_user_ids=plain_ask_mention_user_ids,
+        )
+        log_line(
+            "main_start "
+            f"guild_id={guild_id or '-'} channels={sorted(channel_ids) if channel_ids else 'ALL_EXPLICIT'} "
+            f"users={sorted(user_ids) if user_ids else 'ALL'} "
+            f"message_content={enable_prefix_commands} "
+            f"plain_ask_mentions={sorted(plain_ask_mention_user_ids) if plain_ask_mention_user_ids else '-'} "
+            f"plain_ask_context_fallback={plain_ask_context_fallback_enabled()} "
+            f"qa_commands={discord_qa_commands_enabled()}"
+        )
+        bot.run(token, log_handler=None)
     return 0
 
 

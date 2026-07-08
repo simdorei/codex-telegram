@@ -79,6 +79,17 @@ def get_optional_env_file_path(name: str) -> Path | None:
     return None
 
 
+def get_float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
 def normalize_executable_candidate(raw: str) -> Path | None:
     cleaned = str(raw or "").strip().strip('"').strip("'")
     if not cleaned:
@@ -1391,11 +1402,41 @@ def should_recommend_archive(thread: ThreadInfo, context_usage: ThreadContextUsa
     )
 
 
+def get_orphan_task_started_grace_seconds() -> float:
+    return get_float_env(
+        "CODEX_BRIDGE_ORPHAN_TASK_STARTED_GRACE_SECONDS",
+        60.0,
+        minimum=5.0,
+        maximum=3600.0,
+    )
+
+
+def get_stale_busy_session_seconds() -> float:
+    return get_float_env(
+        "CODEX_BRIDGE_STALE_BUSY_SESSION_SECONDS",
+        1800.0,
+        minimum=60.0,
+        maximum=86400.0,
+    )
+
+
+def session_file_age_seconds(session_path: Path, *, now: float | None = None) -> float | None:
+    try:
+        mtime = session_path.stat().st_mtime
+    except OSError:
+        return None
+    current = time.time() if now is None else now
+    return max(0.0, current - mtime)
+
+
 def is_thread_busy(session_path: Path) -> bool:
     last_started = -1
     last_complete = -1
     last_final = -1
     last_aborted = -1
+    last_user = -1
+    last_assistant = -1
+    last_activity = -1
 
     for index, event in enumerate(iter_session_events(session_path)):
         payload = event.get("payload") or {}
@@ -1410,28 +1451,73 @@ def is_thread_busy(session_path: Path) -> bool:
                 last_complete = index
             elif event_type in {"turn_aborted", "task_aborted", "task_cancelled"}:
                 last_aborted = index
+            elif event_type == "user_message":
+                last_user = index
+                last_activity = index
+            elif event_type == "agent_message":
+                last_assistant = index
+                last_activity = index
+                if payload.get("phase") == "final_answer":
+                    last_final = index
             continue
 
         if event.get("type") != "response_item":
             continue
-        if payload.get("type") != "message":
+        payload_type = payload.get("type")
+        if payload_type not in {"message", "function_call", "custom_tool_call"}:
             continue
-        if payload.get("role") != "assistant":
+        if payload_type != "message":
+            last_activity = index
             continue
-        if payload.get("phase") == "final_answer":
+        role = payload.get("role")
+        if role == "user":
+            last_user = index
+            last_activity = index
+        elif role == "assistant":
+            last_assistant = index
+            last_activity = index
+        if role == "assistant" and payload.get("phase") == "final_answer":
             last_final = index
 
-    return last_started > max(last_complete, last_final, last_aborted)
+    last_done = max(last_complete, last_final, last_aborted)
+    if last_started <= last_done:
+        return False
+
+    age_seconds = session_file_age_seconds(session_path)
+    if last_activity < last_started:
+        if age_seconds is not None and age_seconds >= get_orphan_task_started_grace_seconds():
+            if get_pending_interactive_state_from_session(session_path):
+                return True
+            return False
+    elif age_seconds is not None and age_seconds >= get_stale_busy_session_seconds():
+        if get_pending_interactive_state_from_session(session_path):
+            return True
+        return False
+
+    return True
 
 
 def get_busy_threads(limit: int = 50) -> list[ThreadInfo]:
     busy_threads: list[ThreadInfo] = []
-    for thread in load_recent_threads(limit=limit):
-        session_path = Path(thread.rollout_path)
-        if not session_path.exists():
-            continue
-        if is_thread_busy(session_path):
-            busy_threads.append(thread)
+    client: CodexAppServerSidecar | None = None
+    try:
+        try:
+            client = CodexAppServerSidecar()
+        except Exception:
+            client = None
+        for thread in load_recent_threads(limit=limit):
+            session_path = Path(thread.rollout_path)
+            if not session_path.exists():
+                continue
+            if client is not None:
+                if get_thread_busy_state(thread, client=client, allow_resume=True) != "idle":
+                    busy_threads.append(thread)
+                continue
+            if is_thread_busy(session_path):
+                busy_threads.append(thread)
+    finally:
+        if client is not None:
+            client.close()
     return busy_threads
 
 
@@ -1466,6 +1552,7 @@ def get_thread_busy_state(
     if not session_path.exists() or not is_thread_busy(session_path):
         return "idle"
 
+    interactive_state = get_pending_interactive_state_from_session(session_path)
     own_client = False
     if client is None:
         try:
@@ -1479,16 +1566,18 @@ def get_thread_busy_state(
             thread_payload = (client.read_thread(thread.id, include_turns=False).get("thread") or {})
             if get_sidecar_thread_status_type(thread_payload) == "notLoaded" and allow_resume:
                 thread_payload = ensure_thread_loaded_via_sidecar(client, thread.id)
+            status_type = get_sidecar_thread_status_type(thread_payload)
             classified = classify_thread_status(thread_payload.get("status") if isinstance(thread_payload, dict) else None)
             if classified:
                 return classified
+            if status_type in {"idle", "notLoaded"} and not interactive_state:
+                return "idle"
     except Exception:
         pass
     finally:
         if own_client and client is not None:
             client.close()
 
-    interactive_state = get_pending_interactive_state_from_session(session_path)
     if interactive_state:
         return interactive_state
 
@@ -5462,8 +5551,9 @@ def command_archive(args: argparse.Namespace) -> int:
         thread = choose_thread(args.thread_id, args.cwd)
 
     session_path = Path(thread.rollout_path)
-    if session_path.exists() and is_thread_busy(session_path):
-        raise RuntimeError(describe_thread_busy_state(get_thread_busy_state(thread, allow_resume=True)))
+    busy_state = get_thread_busy_state(thread, allow_resume=True)
+    if busy_state != "idle":
+        raise RuntimeError(describe_thread_busy_state(busy_state))
 
     with CodexAppServerSidecar() as client:
         client.archive_thread(thread.id)
@@ -5704,16 +5794,18 @@ def command_ask(args: argparse.Namespace) -> int:
         print(prompt)
         return 0
 
+    busy_state = get_thread_busy_state(thread, allow_resume=True)
+    if busy_state != "idle" and not args.force_while_busy:
+        raise RuntimeError(describe_thread_busy_state(busy_state))
+
     busy_threads = get_busy_threads(limit=50)
-    if busy_threads and not args.force_while_busy and not args.ipc:
+    busy_thread_ids = {item.id for item in busy_threads}
+    if busy_threads and not args.force_while_busy and thread.id not in busy_thread_ids:
         labels = ", ".join(get_thread_label(item) for item in busy_threads[:3])
         raise RuntimeError(
             "A Codex reply is still in progress. You can `open` other threads, but `ask` is blocked until it finishes. "
             f"Busy thread(s): {labels}. Pass --force-while-busy to override."
         )
-
-    if is_thread_busy(session_path) and not args.force_while_busy:
-        raise RuntimeError(describe_thread_busy_state(get_thread_busy_state(thread, allow_resume=True)))
 
     start_offset = session_path.stat().st_size
     recent_offsets = snapshot_recent_session_offsets(limit=10, include_threads=[thread])
@@ -5744,16 +5836,18 @@ def command_ask(args: argparse.Namespace) -> int:
                 ipc_result["fallback_transport"] = "local-sidecar"
             delivered_thread = wait_for_prompt_delivery(recent_offsets, prompt, timeout_sec=6.0)
             if delivered_thread is None:
-                raise RuntimeError(
-                    "Prompt delivery could not be confirmed in any recent Codex thread after IPC delivery. "
-                    "The transport reported success, but no matching user message was recorded."
+                print("[delivery_pending]")
+                print(
+                    "Codex IPC reported success, but local session recording was not confirmed before the deadline."
                 )
-            if delivered_thread.id != thread.id:
+                print("Continuing to watch for the next Codex reply.")
+            elif delivered_thread.id != thread.id:
                 raise RuntimeError(
                     "Prompt landed in a different thread after IPC delivery. "
                     f"Expected {get_thread_label(thread)}, but it was recorded in {get_thread_label(delivered_thread)}."
                 )
-            print(f"[delivery_verified] {get_thread_label(thread)}")
+            else:
+                print(f"[delivery_verified] {get_thread_label(thread)}")
             if ipc_result.get("fallback_transport"):
                 print(
                     f"[ipc_fallback] transport={ipc_result['fallback_transport']} "

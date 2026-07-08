@@ -104,6 +104,7 @@ def run_steering_prompt(
         force_while_busy=True,
         wait=False,
         target_thread_id=target_thread_id,
+        timeout_sec=get_steering_delivery_confirm_timeout_func(),
     )
     if exit_code == 0:
         return make_steering_prompt_result(

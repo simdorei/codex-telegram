@@ -1,6 +1,8 @@
 # Codex Desktop Bridge
 
-Unofficial Windows bridge for controlling the Codex Desktop app without using Codex CLI.
+Unofficial Windows-only local bridge for controlling the Codex Desktop app without using Codex CLI.
+
+This document covers the local Windows bridge layer. The main repository README describes the Discord-first wrapper that sits on top of this bridge.
 
 It works by combining:
 
@@ -41,7 +43,7 @@ cd C:\ai\codex
 .\codex-bridge.cmd
 ```
 
-If `TELEGRAM_BOT_TOKEN` is configured, `codex-bridge.cmd` also starts the Telegram adapter in a separate minimized console.
+`codex-bridge.cmd` starts only the local bridge by default. Start the Discord adapter with `codex-discord-bot.cmd`; set `CODEX_BRIDGE_AUTO_START_TELEGRAM=1` only if you explicitly want the optional Telegram adapter to start too.
 
 Optional launcher flags:
 
@@ -104,7 +106,7 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_CHAT_IDS=123456789
 CODEX_HOME=C:\Users\your_user\.codex
 PYTHON_EXE=C:\python\python.exe
-CODEX_BRIDGE_AUTO_START_TELEGRAM=1
+CODEX_BRIDGE_AUTO_START_TELEGRAM=0
 ```
 
 After editing `.env`, restart the running bridge/bot process so the new values are loaded.
@@ -124,7 +126,7 @@ After editing `.env`, restart the running bridge/bot process so the new values a
 - `tail --only-new`: watch raw session events
 - `doctor`: print environment and detection diagnostics
 
-## Telegram Adapter
+## Optional Telegram Adapter
 
 Files:
 

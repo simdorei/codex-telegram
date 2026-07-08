@@ -4,6 +4,8 @@ codex_telegram_bot.log.bak
 codex_discord_bot.log.bak
 discord_mirror.sqlite
 .codex_discord_bot.lock/
+.codex_discord_bot.runtime.lock
+.codex_discord_bot.restart
 _ipc_probe_log.jsonl
 _ipc_probe_log.jsonl.bak
 WORKLOAD_HANDOFF_*.md

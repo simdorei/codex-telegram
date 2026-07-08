@@ -10,10 +10,18 @@ def is_selected_thread_busy_error(exit_code: int, output: str) -> bool:
     return (
         "selected thread is still busy" in text
         or "target thread is still busy" in text
+        or "a codex reply is still in progress" in text
         or "--force-while-busy" in text and "still busy" in text
         or "selected thread is waiting on a follow-up choice or input" in text
         or "selected thread is waiting on an approval prompt" in text
+        or "timed out waiting for ipc data" in text and "codex-ipc" in text
     )
+
+
+def is_global_codex_busy_error(exit_code: int, output: str) -> bool:
+    if exit_code == 0:
+        return False
+    return "a codex reply is still in progress" in (output or "").lower()
 
 
 def has_busy_choice_source(source_message: object) -> bool:
@@ -31,8 +39,8 @@ def build_busy_choice_message(
     discord_max_len: int,
     fit_single_message_func,
 ) -> str:
-    lines = ["This Codex thread is already working.", ""]
-    footer = "\n\nChoose how to handle this message for this thread."
+    lines = ["Codex app is still processing this mapped thread.", ""]
+    footer = "\n\nChoose the Discord action for this message."
     prefix = "\n".join(lines)
     prompt_text = str(prompt or "")
     prompt_budget = max(0, discord_max_len - len(prefix) - len(footer))
