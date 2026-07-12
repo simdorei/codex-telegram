@@ -41,39 +41,19 @@ ASK_WAITERS_LOCK = threading.Lock()
 ASK_WAITERS: dict[int, dict[str, object]] = {}
 FOLLOW_WATCHERS_LOCK = threading.Lock()
 FOLLOW_WATCHERS: dict[int, dict[str, object]] = {}
-SINGLE_INSTANCE_MUTEX = None
-RESTART_LOCK = threading.Lock()
-RESTART_SCHEDULED = False
+single_instance_mutex = None
 LOG_FILE_LOCK = threading.Lock()
 
 ERROR_ALREADY_EXISTS = 183
 TELEGRAM_HELP_LINES = [
-    "Commands / 명령",
+    "Codex Telegram recovery commands",
     "/list [limit]",
-    "/archived_list [limit]",
-    "/new <prompt>",
-    "/archive [ref]",
-    "/delete_archive <ref>",
-    "/confirm_delete_archive <ref>",
-    "/open <ref>",
-    "/open_abort <ref>",
     "/use <ref>",
     "/status [ref]",
-    "/doctor",
-    "/discover_codex",
     "/ask <prompt>",
-    "/ask_ipc <prompt> (alias)",
-    "/restart_bot",
-    "/restart_codex",
-    "/chatid",
     "",
     "Plain text works like /ask <message>.",
-    "If the selected thread is waiting-input, plain text replies to that prompt.",
-    "If the selected thread is waiting-approval, follow the shown options.",
-    "일반 텍스트 메시지는 /ask <message>처럼 동작합니다.",
-    "",
-    "Thread refs follow the bridge format:",
-    "ai:1, ai:2, taxlab, other, 1, 2",
+    "Use a number or reference shown by /list.",
 ]
 LIST_THREAD_LINE_RE = re.compile(
     r"^(\s*\*?\s*\d+\s*\|\s*[^|]+\|\s*)(waiting-input|waiting-approval|busy|idle)(\s*\|.*)$"
@@ -86,7 +66,7 @@ INTERACTIVE_STATE_APPROVAL = "waiting-approval"
 
 
 def acquire_single_instance_mutex(token: str | None = None) -> bool:
-    global SINGLE_INSTANCE_MUTEX
+    global single_instance_mutex
 
     mutex_source = (token or "").strip() or str(SCRIPT_DIR)
     mutex_key = hashlib.sha1(mutex_source.encode("utf-8")).hexdigest()
@@ -101,26 +81,26 @@ def acquire_single_instance_mutex(token: str | None = None) -> bool:
     if not handle:
         return True
 
-    SINGLE_INSTANCE_MUTEX = handle
+    single_instance_mutex = handle
     return kernel32.GetLastError() != ERROR_ALREADY_EXISTS
 
 
 def release_single_instance_mutex() -> None:
-    global SINGLE_INSTANCE_MUTEX
-    handle = SINGLE_INSTANCE_MUTEX
+    global single_instance_mutex
+    handle = single_instance_mutex
     if not handle:
         return
     try:
         ctypes.windll.kernel32.CloseHandle(handle)
     except Exception:
         pass
-    SINGLE_INSTANCE_MUTEX = None
+    single_instance_mutex = None
 
 
 def load_local_env(path: Path) -> None:
     if not path.exists():
         return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -178,7 +158,11 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw.lower() not in {"0", "false", "no", "off"}
 
 
-def telegram_api(method: str, token: str, params: dict | None = None) -> dict:
+def telegram_api(
+    method: str,
+    token: str,
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = None
     if params is not None:
@@ -188,6 +172,17 @@ def telegram_api(method: str, token: str, params: dict | None = None) -> dict:
     if not payload.get("ok"):
         raise RuntimeError(f"Telegram API error for {method}: {payload}")
     return payload
+
+
+def get_updates(payload: dict[str, object]) -> list[dict[str, object]]:
+    raw_updates = payload.get("result")
+    if not isinstance(raw_updates, list):
+        return []
+    return [
+        {str(key): value for key, value in item.items()}
+        for item in raw_updates
+        if isinstance(item, dict)
+    ]
 
 
 def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
@@ -390,49 +385,6 @@ def rewrite_list_output_for_telegram(output: str) -> str:
     return "\n".join(rewritten)
 
 
-def resolve_restart_python_exe() -> Path:
-    current = Path(sys.executable).resolve()
-    if current.name.lower() == "pythonw.exe":
-        python_exe = current.with_name("python.exe")
-        if python_exe.exists():
-            return python_exe
-    return current
-
-
-def _exit_after_restart_delay(delay_sec: float) -> None:
-    time.sleep(delay_sec)
-    os._exit(0)
-
-
-def schedule_bot_restart() -> tuple[bool, str]:
-    global RESTART_SCHEDULED
-    with RESTART_LOCK:
-        if RESTART_SCHEDULED:
-            return False, "Restart already scheduled."
-        restart_exe = resolve_restart_python_exe()
-        script_path = SCRIPT_DIR / "codex_telegram_bot.py"
-        creationflags = 0
-        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
-        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        release_single_instance_mutex()
-        subprocess.Popen(
-            [str(restart_exe), str(script_path), "--skip-old-updates"],
-            cwd=str(SCRIPT_DIR),
-            creationflags=creationflags,
-            close_fds=True,
-        )
-        RESTART_SCHEDULED = True
-        log_line(
-            f"restart_scheduled exe={restart_exe} script={script_path} args=--skip-old-updates"
-        )
-        threading.Thread(
-            target=_exit_after_restart_delay,
-            args=(0.5,),
-            daemon=True,
-            name="codex-telegram-restart",
-        ).start()
-        return True, "Restart scheduled."
-
 
 class LineStream(io.TextIOBase):
     def __init__(self, on_line):
@@ -603,7 +555,7 @@ def run_bridge_command(argv: list[str]) -> tuple[int, str]:
 
 def run_bridge_script_subprocess(argv: list[str], timeout_sec: float) -> tuple[int, str]:
     bridge_script = SCRIPT_DIR / "codex_desktop_bridge.py"
-    python_exe = resolve_restart_python_exe()
+    python_exe = Path(os.environ.get("PYTHON_EXE") or sys.executable)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         completed = subprocess.run(
@@ -979,6 +931,37 @@ def maybe_submit_waiting_input_reply(
     return True
 
 
+def maybe_route_interactive_reply(
+    token: str,
+    chat_id: int,
+    prompt: str,
+    reply_to_message_id: int | None,
+    selected_thread_id: str | None,
+    selected_ref: str,
+    selected_label: str,
+) -> bool:
+    interactive_thread_id, interactive_ref, _interactive_label = resolve_interactive_reply_target(
+        chat_id,
+        prompt,
+        selected_thread_id,
+        selected_ref,
+        selected_label,
+    )
+    if looks_like_approval_reply(prompt) and not interactive_thread_id:
+        log_line(
+            f"approval_like_message_without_interactive_target chat_id={chat_id} "
+            f"selected_ref={selected_ref or '-'} prompt={prompt[:80]}"
+        )
+    return maybe_submit_waiting_input_reply(
+        token,
+        chat_id,
+        prompt,
+        reply_to_message_id,
+        interactive_thread_id or selected_thread_id,
+        interactive_ref or selected_ref,
+    )
+
+
 def start_or_queue_ask(
     token: str,
     chat_id: int,
@@ -1091,7 +1074,10 @@ def start_next_pending_ask(token: str) -> bool:
     pending = pop_pending_ask()
     if not pending:
         return False
-    chat_id = int(pending["chat_id"])
+    raw_chat_id = pending["chat_id"]
+    if not isinstance(raw_chat_id, int | str):
+        return False
+    chat_id = int(raw_chat_id)
     prompt = str(pending["prompt"])
     reply_to_message_id = pending.get("reply_to_message_id")
     target_thread_id = str(pending.get("target_thread_id") or "").strip() or None
@@ -1585,9 +1571,8 @@ def run_ask_job(
         elif exit_code != 0 and "IPC owner client for the selected thread was not discovered" in output:
             note = (
                 "\n\nIPC recovery tip / IPC 복구 안내"
-                "\n- Restart the Telegram bot and try again."
-                "\n- 텔레그램 봇을 재시작한 뒤 다시 시도해보세요."
-                "\n- Restart command / 재시작 명령: /restart_bot"
+                "\n- Restart the local Telegram bot process and try again."
+                "\n- PC에서 Telegram 봇 프로세스를 재시작한 뒤 다시 시도해보세요."
             )
         relay.finish()
         if relay.sent_live:
@@ -1617,11 +1602,24 @@ def run_ask_job(
         start_next_pending_ask(token)
 
 
-def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> None:
-    chat = message.get("chat") or {}
-    chat_id = int(chat.get("id"))
-    text = (message.get("text") or "").strip()
-    reply_to_message_id = message.get("message_id")
+
+def handle_message(
+    token: str,
+    message: dict[str, object],
+    allowed_chat_ids: set[int],
+) -> None:
+    raw_chat = message.get("chat")
+    if not isinstance(raw_chat, dict):
+        return
+    chat = {str(key): value for key, value in raw_chat.items()}
+    raw_chat_id = chat.get("id")
+    if not isinstance(raw_chat_id, int | str):
+        return
+    chat_id = int(raw_chat_id)
+    raw_text = message.get("text")
+    text = raw_text.strip() if isinstance(raw_text, str) else ""
+    raw_reply_id = message.get("message_id")
+    reply_to_message_id = raw_reply_id if isinstance(raw_reply_id, int) else None
 
     log_line(
         f"handle_message chat_id={chat_id} allowed={sorted(allowed_chat_ids) if allowed_chat_ids else 'ALL'} "
@@ -1639,331 +1637,14 @@ def _legacy_handle_message(token: str, message: dict, allowed_chat_ids: set[int]
     target_thread_id, target_ref, target_label = resolve_selected_target()
 
     if not text.startswith("/"):
-        if active_summary:
-            position = enqueue_pending_ask(
-                chat_id,
-                text,
-                reply_to_message_id,
-                target_thread_id=target_thread_id,
-                target_ref=target_ref,
-                target_label=target_label,
-            )
-            send_text(
-                token,
-                chat_id,
-                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.",
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
-        start_ask_worker(
+        if maybe_route_interactive_reply(
             token,
             chat_id,
             text,
             reply_to_message_id,
-            target_thread_id=target_thread_id,
-            target_ref=target_ref,
-            target_label=target_label,
-        )
-        return
-
-    parts = text.split(maxsplit=1)
-    command = parts[0].split("@", 1)[0].lower()
-    arg = parts[1].strip() if len(parts) > 1 else ""
-
-    if command in {"/start", "/help"}:
-        send_text(
-            token,
-            chat_id,
-            "\n".join(
-                [
-                    "Commands:",
-                    "/list [limit]",
-                    "/archived_list [limit]",
-                    "/new <prompt>",
-                    "/archive [ref]",
-                    "/delete_archive <ref>",
-                    "/confirm_delete_archive <ref>",
-                    "/open <ref>",
-                    "/open_abort <ref>",
-                    "/use <ref>",
-                    "/status [ref]",
-                    "/doctor",
-                    "/ask <prompt>",
-                    "/ask_ipc <prompt> (alias)",
-                    "/restart_bot",
-                    "/chatid",
-                    "",
-                    "Thread refs use the same format as the bridge, for example:",
-                    "ai:1, ai:2, taxlab, other, 1, 2",
-                ]
-            ),
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    if command == "/restart_bot":
-        try:
-            started, detail = schedule_bot_restart()
-        except Exception:
-            log_line("restart_command_error\n" + traceback.format_exc())
-            send_text(
-                token,
-                chat_id,
-                "Bot restart failed.\n봇 재시작에 실패했습니다.\n\n" + traceback.format_exc(),
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
-        message = (
-            "Restarting Telegram bot.\n"
-            "텔레그램 봇을 재시작합니다.\n\n"
-            "Retry the last IPC ask after the bot comes back.\n"
-            "봇이 다시 올라온 뒤 마지막 IPC 요청을 다시 보내세요."
-        )
-        if not started and detail:
-            message += f"\n\n{detail}"
-        send_text(token, chat_id, message, reply_to_message_id=reply_to_message_id)
-        return
-
-    if command in {"/chatid", "/whoami"}:
-        send_text(
-            token,
-            chat_id,
-            "\n".join(
-                [
-                    f"chat_id: {chat_id}",
-                    f"chat_type: {chat.get('type', '-')}",
-                    f"chat_title: {chat.get('title') or '-'}",
-                    "",
-                    f"Copy into .env:",
-                    f"TELEGRAM_ALLOWED_CHAT_IDS={chat_id}",
-                ]
-            ),
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    if command == "/list":
-        limit = 10
-        if arg:
-            try:
-                limit = max(1, min(30, int(arg)))
-            except ValueError:
-                pass
-        exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
-        prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
-        display_output = rewrite_list_output_for_telegram(output or "(no output)")
-        waiting_suffix = build_waiting_list_suffix(active_summary)
-        send_text(
-            token,
-            chat_id,
-            f"{prefix}\n\n{display_output}{waiting_suffix}",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    if command == "/archived_list":
-        limit = 10
-        if arg:
-            try:
-                limit = max(1, min(50, int(arg)))
-            except ValueError:
-                pass
-        exit_code, output = run_bridge_command(["archived_list", "--limit", str(limit)])
-        prefix = "Archived list" if exit_code == 0 else f"Archived list failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/new":
-        if not arg:
-            send_text(token, chat_id, "Usage: /new <prompt>", reply_to_message_id=reply_to_message_id)
-            return
-        exit_code, output = run_bridge_command(["new", arg])
-        prefix = "New ok" if exit_code == 0 else f"New failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/archive":
-        argv = ["archive"]
-        if arg:
-            argv.append(arg)
-        exit_code, output = run_bridge_command(argv)
-        prefix = "Archive ok" if exit_code == 0 else f"Archive failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/delete_archive":
-        if not arg:
-            send_text(token, chat_id, "Usage: /delete_archive <ref>", reply_to_message_id=reply_to_message_id)
-            return
-        exit_code, output = run_bridge_command(["delete_archive", arg])
-        prefix = "Delete archive preview" if exit_code == 0 else f"Delete archive failed (exit {exit_code})"
-        message = (
-            f"{prefix}\n\n{output or '(no output)'}"
-            "\n\nTo actually delete it, run /confirm_delete_archive <thread_id>."
-        )
-        send_text(token, chat_id, message, reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/confirm_delete_archive":
-        if not arg:
-            send_text(token, chat_id, "Usage: /confirm_delete_archive <ref>", reply_to_message_id=reply_to_message_id)
-            return
-        exit_code, output = run_bridge_command(["delete_archive", "--confirm", arg])
-        prefix = "Delete archive ok" if exit_code == 0 else f"Delete archive failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/doctor":
-        exit_code, output = run_bridge_command(["doctor"])
-        prefix = "Doctor" if exit_code == 0 else f"Doctor failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/status":
-        argv = resolve_status_args(arg or None)
-        exit_code, output = run_bridge_command(argv)
-        prefix = "Status" if exit_code == 0 else f"Status failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/use":
-        if not arg:
-            send_text(token, chat_id, "Usage: /use <ref>", reply_to_message_id=reply_to_message_id)
-            return
-        exit_code, output = run_bridge_command(["use", arg])
-        prefix = "Use ok" if exit_code == 0 else f"Use failed (exit {exit_code})"
-        send_text(token, chat_id, f"{prefix}\n\n{output or '(no output)'}", reply_to_message_id=reply_to_message_id)
-        if exit_code == 0 and should_attach_follow_after_command(output, active_summary):
-            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
-        return
-
-    if command in {"/open", "/open_abort"}:
-        if not arg:
-            send_text(token, chat_id, f"Usage: {command} <ref>", reply_to_message_id=reply_to_message_id)
-            return
-        argv = ["open"]
-        if command == "/open_abort":
-            argv.append("--abort")
-        argv.append(arg)
-        exit_code, output = run_bridge_command(argv)
-        prefix = "Open ok" if exit_code == 0 else f"Open failed (exit {exit_code})"
-        send_text(
-            token,
-            chat_id,
-            f"{prefix}\n\n{output or '(no output)'}",
-            reply_to_message_id=reply_to_message_id,
-        )
-        if exit_code == 0 and should_attach_follow_after_command("", active_summary):
-            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
-        return
-
-    if command == "/ask":
-        if not arg:
-            send_text(token, chat_id, "Usage: /ask <prompt>", reply_to_message_id=reply_to_message_id)
-            return
-        if active_summary:
-            position = enqueue_pending_ask(
-                chat_id,
-                arg,
-                reply_to_message_id,
-                target_thread_id=target_thread_id,
-                target_ref=target_ref,
-                target_label=target_label,
-            )
-            send_text(
-                token,
-                chat_id,
-                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.",
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
-        start_ask_worker(
-            token,
-            chat_id,
-            arg,
-            reply_to_message_id,
-            target_thread_id=target_thread_id,
-            target_ref=target_ref,
-            target_label=target_label,
-        )
-        return
-
-    if command == "/ask_ipc":
-        if not arg:
-            send_text(token, chat_id, "Usage: /ask_ipc <prompt>", reply_to_message_id=reply_to_message_id)
-            return
-        if active_summary:
-            position = enqueue_pending_ask(
-                chat_id,
-                arg,
-                reply_to_message_id,
-                target_thread_id=target_thread_id,
-                target_ref=target_ref,
-                target_label=target_label,
-            )
-            send_text(
-                token,
-                chat_id,
-                f"Busy.\n\n{active_summary}\n\n대기열에 추가했습니다. ({position})\n현재 답변이 끝나면 자동으로 이어서 보냅니다.",
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
-        start_ask_worker(
-            token,
-            chat_id,
-            arg,
-            reply_to_message_id,
-            target_thread_id=target_thread_id,
-            target_ref=target_ref,
-            target_label=target_label,
-        )
-        return
-
-    send_text(token, chat_id, f"Unknown command: {command}", reply_to_message_id=reply_to_message_id)
-
-
-def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> None:
-    chat = message.get("chat") or {}
-    chat_id = int(chat.get("id"))
-    text = (message.get("text") or "").strip()
-    reply_to_message_id = message.get("message_id")
-
-    log_line(
-        f"handle_message chat_id={chat_id} allowed={sorted(allowed_chat_ids) if allowed_chat_ids else 'ALL'} "
-        f"text={text[:160].replace(chr(10), ' ')}"
-    )
-
-    if allowed_chat_ids and chat_id not in allowed_chat_ids:
-        log_line(f"ignored_message chat_id={chat_id} reason=not_allowed")
-        return
-    if not text:
-        log_line(f"ignored_message chat_id={chat_id} reason=no_text")
-        return
-
-    active_summary = get_active_job_summary()
-    target_thread_id, target_ref, target_label = resolve_selected_target()
-
-    if not text.startswith("/"):
-        interactive_thread_id, interactive_ref, _interactive_label = resolve_interactive_reply_target(
-            chat_id,
-            text,
             target_thread_id,
             target_ref,
             target_label,
-        )
-        if looks_like_approval_reply(text) and not interactive_thread_id:
-            log_line(
-                f"approval_like_message_without_interactive_target chat_id={chat_id} "
-                f"selected_ref={target_ref or '-'} active_summary={'yes' if active_summary else 'no'} "
-                f"prompt={text[:80]}"
-            )
-        if maybe_submit_waiting_input_reply(
-            token,
-            chat_id,
-            text,
-            reply_to_message_id,
-            interactive_thread_id or target_thread_id,
-            interactive_ref or target_ref,
         ):
             return
         start_or_queue_ask(
@@ -1982,245 +1663,71 @@ def handle_message(token: str, message: dict, allowed_chat_ids: set[int]) -> Non
     command = parts[0].split("@", 1)[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if command in {"/start", "/help"}:
-        send_text(token, chat_id, build_help_message(), reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/restart_bot":
-        try:
-            started, detail = schedule_bot_restart()
-        except Exception:
-            log_line("restart_command_error\n" + traceback.format_exc())
+    match command:
+        case "/start" | "/help":
+            send_text(token, chat_id, build_help_message(), reply_to_message_id=reply_to_message_id)
+        case "/list":
+            limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30)
+            exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
+            prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
+            display_output = rewrite_list_output_for_telegram(output or "(no output)")
+            waiting_suffix = build_waiting_list_suffix(active_summary)
             send_text(
                 token,
                 chat_id,
-                "Bot restart failed.\n\n" + traceback.format_exc(),
+                f"{prefix}\n\n{display_output}{waiting_suffix}",
                 reply_to_message_id=reply_to_message_id,
             )
-            return
-        message_text = (
-            "Restarting Telegram bot.\n"
-            "텔레그램 봇을 재시작합니다.\n\n"
-            "Retry the last IPC ask after the bot comes back.\n"
-            "봇이 다시 올라오면 마지막 IPC 요청을 다시 보내세요."
-        )
-        if not started and detail:
-            message_text += f"\n\n{detail}"
-        send_text(token, chat_id, message_text, reply_to_message_id=reply_to_message_id)
-        return
+        case "/status":
+            send_bridge_command_result(
+                token,
+                chat_id,
+                reply_to_message_id,
+                resolve_status_args(arg or None),
+                "Status",
+                "Status failed",
+            )
+        case "/use":
+            if not arg:
+                send_usage(token, chat_id, reply_to_message_id, "/use <ref>")
+                return
+            exit_code, output = send_bridge_command_result(
+                token,
+                chat_id,
+                reply_to_message_id,
+                ["use", arg],
+                "Use ok",
+                "Use failed",
+            )
+            if exit_code == 0 and should_attach_follow_after_command(output, active_summary):
+                maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
+        case "/ask":
+            if not arg:
+                send_usage(token, chat_id, reply_to_message_id, "/ask <prompt>")
+                return
+            if maybe_route_interactive_reply(
+                token,
+                chat_id,
+                arg,
+                reply_to_message_id,
+                target_thread_id,
+                target_ref,
+                target_label,
+            ):
+                return
+            start_or_queue_ask(
+                token,
+                chat_id,
+                arg,
+                reply_to_message_id,
+                active_summary,
+                target_thread_id,
+                target_ref,
+                target_label,
+            )
+        case _:
+            send_text(token, chat_id, f"Unknown command: {command}", reply_to_message_id=reply_to_message_id)
 
-    if command == "/restart_codex":
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            ["restart_codex"],
-            "Codex restart ok",
-            "Codex restart failed",
-        )
-        return
-
-    if command in {"/chatid", "/whoami"}:
-        send_text(
-            token,
-            chat_id,
-            "\n".join(
-                [
-                    f"chat_id: {chat_id}",
-                    f"chat_type: {chat.get('type', '-')}",
-                    f"chat_title: {chat.get('title') or '-'}",
-                    "",
-                    "Copy into .env:",
-                    f"TELEGRAM_ALLOWED_CHAT_IDS={chat_id}",
-                ]
-            ),
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    if command == "/list":
-        limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=30)
-        exit_code, output = run_bridge_command(["list", "--limit", str(limit)])
-        prefix = "List" if exit_code == 0 else f"List failed (exit {exit_code})"
-        display_output = rewrite_list_output_for_telegram(output or "(no output)")
-        waiting_suffix = build_waiting_list_suffix(active_summary)
-        send_text(
-            token,
-            chat_id,
-            f"{prefix}\n\n{display_output}{waiting_suffix}",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    if command == "/archived_list":
-        limit = parse_bounded_int_arg(arg, default=10, minimum=1, maximum=50)
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            ["archived_list", "--limit", str(limit)],
-            "Archived list",
-            "Archived list failed",
-        )
-        return
-
-    if command == "/new":
-        if not arg:
-            send_usage(token, chat_id, reply_to_message_id, "/new <prompt>")
-            return
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            ["new", arg],
-            "New ok",
-            "New failed",
-        )
-        return
-
-    if command == "/archive":
-        argv = ["archive"]
-        if arg:
-            argv.append(arg)
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            argv,
-            "Archive ok",
-            "Archive failed",
-        )
-        return
-
-    if command == "/delete_archive":
-        if not arg:
-            send_usage(token, chat_id, reply_to_message_id, "/delete_archive <ref>")
-            return
-        exit_code, output = run_bridge_command(["delete_archive", arg])
-        prefix = "Delete archive preview" if exit_code == 0 else f"Delete archive failed (exit {exit_code})"
-        message_text = (
-            f"{prefix}\n\n{output or '(no output)'}"
-            "\n\nTo actually delete it, run /confirm_delete_archive <thread_id>."
-        )
-        send_text(token, chat_id, message_text, reply_to_message_id=reply_to_message_id)
-        return
-
-    if command == "/confirm_delete_archive":
-        if not arg:
-            send_usage(token, chat_id, reply_to_message_id, "/confirm_delete_archive <ref>")
-            return
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            ["delete_archive", "--confirm", arg],
-            "Delete archive ok",
-            "Delete archive failed",
-        )
-        return
-
-    if command == "/doctor":
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            ["doctor"],
-            "Doctor",
-            "Doctor failed",
-        )
-        return
-
-    if command == "/discover_codex":
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            ["discover_codex"],
-            "Codex path ok",
-            "Codex path failed",
-        )
-        return
-
-    if command == "/status":
-        send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            resolve_status_args(arg or None),
-            "Status",
-            "Status failed",
-        )
-        return
-
-    if command == "/use":
-        if not arg:
-            send_usage(token, chat_id, reply_to_message_id, "/use <ref>")
-            return
-        exit_code, output = send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            ["use", arg],
-            "Use ok",
-            "Use failed",
-        )
-        if exit_code == 0 and should_attach_follow_after_command(output, active_summary):
-            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
-        return
-
-    if command in {"/open", "/open_abort"}:
-        if not arg:
-            send_usage(token, chat_id, reply_to_message_id, f"{command} <ref>")
-            return
-        argv = ["open"]
-        if command == "/open_abort":
-            argv.append("--abort")
-        argv.append(arg)
-        exit_code, _output = send_bridge_command_result(
-            token,
-            chat_id,
-            reply_to_message_id,
-            argv,
-            "Open ok",
-            "Open failed",
-        )
-        if exit_code == 0 and should_attach_follow_after_command("", active_summary):
-            maybe_follow_selected_thread(token, chat_id, reply_to_message_id)
-        return
-
-    if command in {"/ask", "/ask_ipc"}:
-        if not arg:
-            send_usage(token, chat_id, reply_to_message_id, f"{command} <prompt>")
-            return
-        interactive_thread_id, interactive_ref, _interactive_label = resolve_interactive_reply_target(
-            chat_id,
-            arg,
-            target_thread_id,
-            target_ref,
-            target_label,
-        )
-        if maybe_submit_waiting_input_reply(
-            token,
-            chat_id,
-            arg,
-            reply_to_message_id,
-            interactive_thread_id or target_thread_id,
-            interactive_ref or target_ref,
-        ):
-            return
-        start_or_queue_ask(
-            token,
-            chat_id,
-            arg,
-            reply_to_message_id,
-            active_summary,
-            target_thread_id,
-            target_ref,
-            target_label,
-        )
-        return
-
-    send_text(token, chat_id, f"Unknown command: {command}", reply_to_message_id=reply_to_message_id)
 
 
 def bootstrap_offset(token: str, skip_old_updates: bool) -> int | None:
@@ -2228,11 +1735,15 @@ def bootstrap_offset(token: str, skip_old_updates: bool) -> int | None:
         log_line("bootstrap_offset skip_old_updates=False")
         return None
     payload = telegram_api("getUpdates", token, params={"timeout": "1"})
-    results = payload.get("result") or []
+    results = get_updates(payload)
     if not results:
         log_line("bootstrap_offset no_existing_updates")
         return None
-    offset = int(results[-1]["update_id"]) + 1
+    raw_update_id = results[-1].get("update_id")
+    if not isinstance(raw_update_id, int | str):
+        log_line("bootstrap_offset invalid_update_id")
+        return None
+    offset = int(raw_update_id) + 1
     log_line(f"bootstrap_offset skipped_to={offset}")
     return offset
 
@@ -2249,15 +1760,20 @@ def run_polling(token: str, allowed_chat_ids: set[int], poll_timeout: int, skip_
             if offset is not None:
                 params["offset"] = str(offset)
             payload = telegram_api("getUpdates", token, params=params)
-            results = payload.get("result") or []
+            results = get_updates(payload)
             if results:
                 log_line(f"poll_batch updates={len(results)} first={results[0].get('update_id')} last={results[-1].get('update_id')}")
             for update in results:
-                offset = int(update["update_id"]) + 1
-                message = update.get("message")
-                if not message:
+                raw_update_id = update.get("update_id")
+                if not isinstance(raw_update_id, int | str):
+                    log_line("skip_update reason=invalid_update_id")
+                    continue
+                offset = int(raw_update_id) + 1
+                raw_message = update.get("message")
+                if not isinstance(raw_message, dict):
                     log_line(f"skip_update update_id={update.get('update_id')} reason=no_message_keys={','.join(sorted(update.keys()))}")
                     continue
+                message = {str(key): value for key, value in raw_message.items()}
                 try:
                     handle_message(token, message, allowed_chat_ids)
                 except Exception:

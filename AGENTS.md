@@ -16,7 +16,7 @@ Make the smallest safe change that solves the requested problem without breaking
 - Keep feature cohesion high: code that changes together should live together.
 - Keep coupling low: avoid making unrelated features depend on each other's internals.
 - Keep one module/function responsible for one clear job whenever practical.
-- Prefer explicit boundaries between Discord UI handling, Codex bridge/session logic, persistence, and QA helpers.
+- Prefer explicit boundaries between Telegram UI handling, Codex bridge/session logic, persistence, and QA helpers.
 - Do not trade away existing behavior for a new feature; every patch should preserve or improve the current user-facing flow.
 - When a larger rewrite is justified, move in reviewable slices with tests that protect the old behavior before replacing it.
 
